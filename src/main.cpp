@@ -29,7 +29,7 @@ bool is_fingers_down;                   // COIL R   Are the workpiece holding fi
 bool is_homed;                          // COIL R   Has the axis been homed
 bool is_fault;                          // COIL R   Software fault detection. Indicates an unexpected condition
 bool is_ready_for_cycle;                // COIL R   Is the clearcore ready to execute its program
-bool is_e_stop;                         // COIL R   Is the Emergency Stop currently active
+volatile bool is_e_stop;                // COIL R   Is the Emergency Stop currently active
 bool is_job_active;                     // COIL R   Is the clearcore executing its program
 bool is_ready_for_manual_control;       // COIL R   Is the clearcore ready for manual control commands
 bool is_roller_down;                    // COIL R   Is the roller down/engaged
@@ -55,9 +55,12 @@ uint16_t max_pos;                 // Hreg R   maximum absolute position of the a
 uint16_t jog_speed;               // Hreg R/W target speed while jogging manually or during disengaged portions of the job sequence
 uint16_t planish_speed;           // Hreg R/W target speed during engaged portions of the job sequence
 uint16_t fault_code;              // Hreg R   fault code; 0 indicates normal operation
+uint16_t heartbeat_in;            // Hreg W   Contains an arbitrary value set by the HMI
+uint16_t heartbeat_out;           // Hreg R   This should always be equal to `(heartbeat_in*2)%65536`
 
 
-#define ESTOP_SW ConnectorA12
+#define ESTOP_SW ConnectorA12 /// These should match \/
+#define ESTOP_PIN CLEARCORE_PIN_A12 /// ^ should be set to the same semantic connector pin as ESTOP_SW
 #define CYCLE_START_SW ConnectorA11
 #define CYCLE_START_LIGHT ConnectorIO2
 #define FINGER_ACTUATION ConnectorIO0
@@ -65,11 +68,13 @@ uint16_t fault_code;              // Hreg R   fault code; 0 indicates normal ope
 #define CARRIAGE_MOTOR ConnectorM0
 
 #define HMI_CONNECTION_TRIES_BEFORE_ERROR 5
+#define CARRIAGE_MOTOR_MAX_ACCEL 50000
 
 void configure_io();
 void e_stop_handler();
 bool read_coils();
 bool read_registers();
+bool motor_movement_checks();
 
 
 void setup() {
@@ -82,6 +87,15 @@ void setup() {
   ESTOP_SW.InterruptHandlerSet(e_stop_handler);
 
   Ethernet.begin(mac, ip);
+
+  // TODO: https://teknic-inc.github.io/ClearCore-library/_move_position_absolute_8cpp-example.html
+
+  MotorMgr.MotorInputClocking(MotorManager::CLOCK_RATE_NORMAL);
+  MotorMgr.MotorModeSet(MotorManager::MOTOR_ALL, Connector::CPM_MODE_STEP_AND_DIR);
+  CARRIAGE_MOTOR.VelMax(500);
+  CARRIAGE_MOTOR.AccelMax(CARRIAGE_MOTOR_MAX_ACCEL);
+  CARRIAGE_MOTOR.EnableRequest(true); // TODO: Some checks need to happen before this
+  // TODO: Does homing go both ways? Can I change the direction it starts homing?
 
   // Make sure the physical link is up before continuing.
   while (Ethernet.linkStatus() == LinkOFF) {
@@ -104,7 +118,7 @@ uint32_t showLast = 0;
 uint16_t sum = 0;
 
 void loop() {
-  if (ESTOP_SW.State()) {
+  if (is_e_stop) {
     Serial.println("Emergency Stop");
   } else {
     Serial.println("Normal Operation");
@@ -137,9 +151,12 @@ void configure_io() {
   CYCLE_START_LIGHT.Mode(Connector::OUTPUT_DIGITAL);
   FINGER_ACTUATION.Mode(Connector::OUTPUT_DIGITAL);
   ROLLER_ACTUATION.Mode(Connector::OUTPUT_DIGITAL);
+  CARRIAGE_MOTOR.EStopConnector(ESTOP_PIN); // TODO: https://teknic-inc.github.io/ClearCore-library/class_clear_core_1_1_motor_driver.html#a7294f84ac78e9ea31ad6cedab585ec03
 }
 
 void e_stop_handler() {
+  is_e_stop = true;
+  CARRIAGE_MOTOR.MoveStopAbrupt();
   Serial.println("Emergency Stop");
 }
 
@@ -185,5 +202,55 @@ bool read_registers() {
   mb.readHreg(remote, COMMANDED_POSITION_REG_ADDR, &commanded_position);
   mb.readHreg(remote, JOG_SPEED_REG_ADDR, &jog_speed);
   mb.readHreg(remote, PLANISH_SPEED_REG_ADDR, &planish_speed);
+  mb.readHreg(remote, HEARTBEAT_IN_REG_ADDR, &heartbeat_in);
+  heartbeat_out = (heartbeat_in*2)%65536;
+  mb.writeHreg(remote, HEARTBEAT_OUT_REG_ADDR, &heartbeat_out);
   return true;
+}
+
+
+bool move_to_position(uint16_t new_position) {
+  if (new_position > max_pos) {
+    new_position = max_pos;
+  } else if (new_position < min_pos) {
+    new_position = min_pos;
+  }
+  if (new_position == actual_position) {
+    return true;
+  }
+  commanded_position = new_position;
+  if(motor_movement_checks()) {
+    CARRIAGE_MOTOR.Move(commanded_position, StepGenerator::MOVE_TARGET_ABSOLUTE);
+    // TODO: Move() returns a bool and docs don't say why. use it if it's a failure flag
+  }
+}
+
+/**
+ *
+ * @return true for success
+ */
+bool handle_axis_home_button() {
+  is_homed = false;
+  if (!is_e_stop &&
+    !ESTOP_SW.State() && // Ideally this is redundant, but really would hate to miss an interrupt and fail to ESTOP
+    is_mandrel_latch_closed) { // TODO: should mandrel latch need to be closed for motor movement?
+    CARRIAGE_MOTOR.EnableRequest(false);
+    CARRIAGE_MOTOR.ClearFaults(25,0);
+    CARRIAGE_MOTOR.ClearAlerts();
+    CARRIAGE_MOTOR.EnableRequest(true);
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * helper function for motor safety checks
+ * @return true if motor movement checks pass
+ */
+bool motor_movement_checks() {
+  return !is_e_stop &&
+    !ESTOP_SW.State() && // Ideally this is redundant, but really would hate to miss an interrupt and fail to ESTOP
+    is_mandrel_latch_closed &&
+    is_homed;
 }

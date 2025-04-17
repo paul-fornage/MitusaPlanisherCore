@@ -41,3 +41,5 @@ ALL u16
 | 32    | jog_speed          | R/W            | target speed while jogging manually or in disengaged portion of job sequence                                                                                     |
 | 33    | planish_speed      | R/W            | target speed while in engaged portion of job sequence                                                                                                            |
 | 40    | fault_code         | R              | Fault code. 0 is normal operation                                                                                                                                |
+| 50    | heartbeat_in       | W              | Contains an arbitrary value set by the HMI                                                                                                                       |
+| 51    | heartbeat_out      | R              | This should always be equal to `(heartbeat_in*2)%65536`                                                                                                          |

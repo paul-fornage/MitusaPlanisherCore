@@ -38,5 +38,7 @@
 #define JOG_SPEED_REG_ADDR                          32    // R/W  target speed while jogging manually or in disengaged portion of job sequence
 #define PLANISH_SPEED_REG_ADDR                      33    // R/W  target speed while in engaged portion of job sequence
 #define FAULT_CODE_REG_ADDR                         40    // R    Fault code. 0 is normal operation
+#define HEARTBEAT_IN_REG_ADDR                       50    // W    Contains an arbitrary value set by the HMI
+#define HEARTBEAT_OUT_REG_ADDR                      51    // R    This should always be equal to `(heartbeat_in*2)%65536`
 
 #endif // REGISTERDEFINITIONS_H
