@@ -69,12 +69,14 @@ uint16_t heartbeat_out;           // Hreg R   This should always be equal to `(h
 
 #define HMI_CONNECTION_TRIES_BEFORE_ERROR 5
 #define CARRIAGE_MOTOR_MAX_ACCEL 50000
+#define CARRIAGE_MOTOR_MAX_VEL 5000
 
 void configure_io();
 void e_stop_handler();
 bool read_coils();
 bool read_registers();
 bool motor_movement_checks();
+void print_motor_alerts();
 
 
 void setup() {
@@ -92,10 +94,16 @@ void setup() {
 
   MotorMgr.MotorInputClocking(MotorManager::CLOCK_RATE_NORMAL);
   MotorMgr.MotorModeSet(MotorManager::MOTOR_ALL, Connector::CPM_MODE_STEP_AND_DIR);
-  CARRIAGE_MOTOR.VelMax(500);
+
+  // Set the motor's HLFB mode to bipolar PWM
+  CARRIAGE_MOTOR.HlfbMode(MotorDriver::HLFB_MODE_HAS_BIPOLAR_PWM);
+  // Set the HFLB carrier frequency to 482 Hz
+  CARRIAGE_MOTOR.HlfbCarrier(MotorDriver::HLFB_CARRIER_482_HZ);
+
+
+  CARRIAGE_MOTOR.VelMax(CARRIAGE_MOTOR_MAX_VEL);
   CARRIAGE_MOTOR.AccelMax(CARRIAGE_MOTOR_MAX_ACCEL);
-  CARRIAGE_MOTOR.EnableRequest(true); // TODO: Some checks need to happen before this
-  // TODO: Does homing go both ways? Can I change the direction it starts homing?
+
 
   // Make sure the physical link is up before continuing.
   while (Ethernet.linkStatus() == LinkOFF) {
@@ -235,9 +243,20 @@ bool handle_axis_home_button() {
     !ESTOP_SW.State() && // Ideally this is redundant, but really would hate to miss an interrupt and fail to ESTOP
     is_mandrel_latch_closed) { // TODO: should mandrel latch need to be closed for motor movement?
     CARRIAGE_MOTOR.EnableRequest(false);
-    CARRIAGE_MOTOR.ClearFaults(25,0);
-    CARRIAGE_MOTOR.ClearAlerts();
+
     CARRIAGE_MOTOR.EnableRequest(true);
+    // TODO: Does homing go both ways? Can I change the direction it starts homing?
+
+    while (CARRIAGE_MOTOR.HlfbState() != MotorDriver::HLFB_ASSERTED &&
+            !CARRIAGE_MOTOR.StatusReg().bit.AlertsPresent) {}
+    // Check if motor alert occurred during enabling
+    // Clear alert if configured to do so
+    if (CARRIAGE_MOTOR.StatusReg().bit.AlertsPresent) {
+      Serial.println("Motor alert detected.");
+      print_motor_alerts();
+    } else {
+      Serial.println("Motor Ready");
+    }
     return true;
   }
 
@@ -253,4 +272,82 @@ bool motor_movement_checks() {
     !ESTOP_SW.State() && // Ideally this is redundant, but really would hate to miss an interrupt and fail to ESTOP
     is_mandrel_latch_closed &&
     is_homed;
+}
+
+
+/*------------------------------------------------------------------------------
+ * PrintAlerts
+ *
+ *    Prints active alerts.
+ *
+ * Parameters:
+ *    requires "motor" to be defined as a ClearCore motor connector
+ *
+ * Returns: 
+ *    none
+ */
+void print_motor_alerts(){
+  // report status of alerts
+  Serial.println("ClearPath Alerts present: ");
+  if(CARRIAGE_MOTOR.AlertReg().bit.MotionCanceledInAlert){
+    Serial.println("    MotionCanceledInAlert "); }
+  if(CARRIAGE_MOTOR.AlertReg().bit.MotionCanceledPositiveLimit){
+    Serial.println("    MotionCanceledPositiveLimit "); }
+  if(CARRIAGE_MOTOR.AlertReg().bit.MotionCanceledNegativeLimit){
+    Serial.println("    MotionCanceledNegativeLimit "); }
+  if(CARRIAGE_MOTOR.AlertReg().bit.MotionCanceledSensorEStop){
+    Serial.println("    MotionCanceledSensorEStop "); }
+  if(CARRIAGE_MOTOR.AlertReg().bit.MotionCanceledMotorDisabled){
+    Serial.println("    MotionCanceledMotorDisabled "); }
+  if(CARRIAGE_MOTOR.AlertReg().bit.MotorFaulted){
+    Serial.println("    MotorFaulted ");
+  }
+}
+
+/*------------------------------------------------------------------------------
+ * MoveAbsolutePosition
+ *
+ *    Command step pulses to move the motor's current position to the absolute
+ *    position specified by "position"
+ *    Prints the move status to the USB serial port
+ *    Returns when HLFB asserts (indicating the motor has reached the commanded
+ *    position)
+ *
+ * Parameters:
+ *    int position  - The absolute position, in step pulses, to move to
+ *
+ * Returns: True/False depending on whether the move was successfully triggered.
+ */
+bool MoveAbsolutePosition(int32_t position) {
+    // Check if a motor alert is currently preventing motion
+    // Clear alert if configured to do so 
+    if (CARRIAGE_MOTOR.StatusReg().bit.AlertsPresent) {
+        Serial.println("Motor alert detected.");       
+        print_motor_alerts();
+        Serial.println("Move canceled.");
+        Serial.println();
+        return false;
+    }
+
+    Serial.print("Moving to absolute position: ");
+    Serial.println(position);
+
+    // Command the move of absolute distance
+    CARRIAGE_MOTOR.Move(position, MotorDriver::MOVE_TARGET_ABSOLUTE);
+
+    // Waits for HLFB to assert (signaling the move has successfully completed)
+    Serial.println("Moving.. Waiting for HLFB");
+    while ( (!CARRIAGE_MOTOR.StepsComplete() || CARRIAGE_MOTOR.HlfbState() != MotorDriver::HLFB_ASSERTED) &&
+            !CARRIAGE_MOTOR.StatusReg().bit.AlertsPresent) {}
+    // Check if motor alert occurred during move
+    // Clear alert if configured to do so
+    if (CARRIAGE_MOTOR.StatusReg().bit.AlertsPresent) {
+        Serial.println("Motor alert detected.");
+        print_motor_alerts();
+        Serial.println("Motion may not have completed as expected. Proceed with caution.");
+        Serial.println();
+        return false;
+    }
+    Serial.println("Move Done");
+    return true;
 }
