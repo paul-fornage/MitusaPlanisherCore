@@ -30,20 +30,7 @@ bool commanded_fingers;                 // Finger state commanded by the HMI, tr
 bool commanded_roller;                  // Roller state commanded by the HMI, true means engaged, false means disengaged
 
 
-uint16_t actual_position;         // actual position of the axis measured in hundredths of an inch
-uint16_t commanded_position;      // commanded position of the axis measured in hundredths of an inch;
 
-uint16_t job_progress;            // progress of the current job: (job_progress / 65536) * 100%
-uint16_t job_start_pos;           // saved start position of the axis measured in hundredths of an inch
-uint16_t job_end_pos;             // saved end position of the axis measured in hundredths of an inch
-uint16_t job_park_pos;            // saved park position of the axis measured in hundredths of an inch
-uint16_t min_pos;                 // minimum absolute position of the axis measured in hundredths of an inch
-uint16_t max_pos;                 // maximum absolute position of the axis measured in hundredths of an inch
-uint16_t jog_speed;               // target speed while jogging manually or during disengaged portions of the job sequence
-uint16_t planish_speed;           // target speed during engaged portions of the job sequence
-uint16_t fault_code;              // fault code; 0 indicates normal operation
-uint16_t heartbeat_in;            // Contains an arbitrary value set by the HMI
-uint16_t heartbeat_out;           // This should always be equal to `(heartbeat_in*2)%65536`
 
 
 enum PlanishStates {
@@ -53,7 +40,7 @@ enum PlanishStates {
   idle,                   // Idle await instructions
   manual_jog,             // manually commanded jog
   e_stop,                 // E-stop currently active
-  error,                  // Unrecoverable error has occurred and machine needs to reboot. should be a dead end state
+  error,                  // unrecoverable error has occurred and machine needs to reboot. should be a dead end state
 
   job_start,              // Job started, move to saved start pos
   job_planish,            // Start position reached, engage roller and move to end pos
@@ -72,18 +59,27 @@ volatile PlanishStates machine_state;
 #define ESTOP_SW ConnectorDI6
 #define CYCLE_START_SW ConnectorA11
 #define CYCLE_START_LIGHT ConnectorIO2
-#define FINGER_ACTUATION ConnectorIO0
-#define ROLLER_ACTUATION ConnectorIO1
+
+// CCIO pin definitions. these are not interchangeable with native io ports.
+// please see `configure_io()` to change assignment between ccio and native pins
+#define FINGER_ACTUATION CCIOA6 // CCIO pin for finger actuation
+#define HEAD_ACTUATION CCIOA4
+#define HOME_BUTTON_LIGHT CCIOA0
+#define LEARN_BUTTON_LIGHT CCIOA3
 #define CARRIAGE_MOTOR ConnectorM0
 
-#define HMI_CONNECTION_TRIES_BEFORE_ERROR 5
+#define CCIO1 ConnectorCOM1
+#define EXPECTED_NUM_CCIO 1
+#define CCIO_TIMEOUT_MS 10000 // Number of ms to wait for CCIO to connect before failing POST
+
 #define CARRIAGE_MOTOR_MAX_ACCEL 50000
 #define CARRIAGE_MOTOR_MAX_VEL 5000
 
-void configure_io();
+bool configure_io();
 void e_stop_handler();
 bool motor_movement_checks();
 void print_motor_alerts();
+void config_ccio_pin(ClearCorePins target_pin, Connector::ConnectorModes mode, bool initial_state = false);
 
 
 void setup() {
@@ -111,8 +107,12 @@ void loop() {
   switch (machine_state) {
     case post:
       Serial.println("Power on self test");
-      configure_io();
-      machine_state = begin_homing;
+      const bool io_configure_result = configure_io();
+      if (!io_configure_result) {
+        machine_state = error;
+        break;
+      }
+      machine_state = idle;
       break;
     case begin_homing:
       if (!is_e_stop) { // TODO: More checks
@@ -142,6 +142,11 @@ void loop() {
       }
       break;
     case idle:
+      if (is_axis_homing_button_latched) {
+        machine_state = begin_homing;
+        is_axis_homing_button_latched = false;
+        break;
+      }
       while (true) {
         Serial.println("ready in idle");
         delay(1000);
@@ -180,20 +185,49 @@ void loop() {
   }
 }
 
-
-void configure_io() {
+/**
+ * Configures IO, go figure
+ * @return True for success
+ */
+bool configure_io() {
   CYCLE_START_SW.Mode(Connector::INPUT_DIGITAL);
   CYCLE_START_LIGHT.Mode(Connector::OUTPUT_DIGITAL);
-  FINGER_ACTUATION.Mode(Connector::OUTPUT_DIGITAL);
-  ROLLER_ACTUATION.Mode(Connector::OUTPUT_DIGITAL);
 
   ESTOP_SW.Mode(Connector::INPUT_DIGITAL);
   ESTOP_SW.InterruptHandlerSet(e_stop_handler);
 
   ESTOP_SW.FilterLength(16, DigitalIn::FILTER_UNIT_SAMPLES);
 
+  CCIO1.Mode(Connector::CCIO);
+  CCIO1.PortOpen();
 
-  // TODO: https://teknic-inc.github.io/ClearCore-library/_move_position_absolute_8cpp-example.html
+  if (CcioMgr.LinkBroken()) {
+    uint32_t lastStatusTime = Milliseconds();
+    Serial.println("The CCIO-8 link is broken!");
+
+    while (CcioMgr.LinkBroken() && Milliseconds() - lastStatusTime < CCIO_TIMEOUT_MS) {
+      if (Milliseconds() - lastStatusTime > 1000) {
+        Serial.println("The CCIO-8 link is still broken!");
+        lastStatusTime = Milliseconds();
+      }
+    }
+    if (CcioMgr.LinkBroken()) {
+      Serial.println("Timed out waiting for CCIO");
+      return false;
+    }
+    Serial.println("The CCIO-8 link is online again!");
+  }
+
+  if (CcioMgr.CcioCount() != EXPECTED_NUM_CCIO) {
+    Serial.print("Expected to find exactly one CCIO connector, found ");
+    Serial.println(CcioMgr.CcioCount());
+    return false;
+  }
+
+  config_ccio_pin(FINGER_ACTUATION, Connector::OUTPUT_DIGITAL);
+  config_ccio_pin(HEAD_ACTUATION, Connector::OUTPUT_DIGITAL);
+  config_ccio_pin(HOME_BUTTON_LIGHT, Connector::OUTPUT_DIGITAL);
+  config_ccio_pin(LEARN_BUTTON_LIGHT, Connector::OUTPUT_DIGITAL);
 
   MotorMgr.MotorInputClocking(MotorManager::CLOCK_RATE_NORMAL);
   MotorMgr.MotorModeSet(MotorManager::MOTOR_ALL, Connector::CPM_MODE_STEP_AND_DIR);
@@ -206,7 +240,19 @@ void configure_io() {
 
   CARRIAGE_MOTOR.VelMax(CARRIAGE_MOTOR_MAX_VEL);
   CARRIAGE_MOTOR.AccelMax(CARRIAGE_MOTOR_MAX_ACCEL);
+  return true;
+}
 
+void config_ccio_pin(
+  const ClearCorePins target_pin,
+  const Connector::ConnectorModes mode,
+  const bool initial_state)
+{
+  CcioPin *pin_pointer = CcioMgr.PinByIndex(target_pin);
+  if (pin_pointer != nullptr) {
+    pin_pointer->Mode(mode);
+    pin_pointer->State(initial_state);
+  }
 }
 
 void e_stop_handler() {
@@ -214,8 +260,6 @@ void e_stop_handler() {
   CARRIAGE_MOTOR.MoveStopAbrupt();
   Serial.println("Emergency Stop");
 }
-
-
 
 bool home_axis() {
   CARRIAGE_MOTOR.EnableRequest(true);
@@ -230,7 +274,6 @@ bool home_axis() {
   }
   return true;
 }
-
 
 
 
@@ -320,4 +363,14 @@ bool MoveAbsolutePosition(int32_t position) {
     }
     Serial.println("Move Done");
     return true;
+}
+
+/**
+ * For a given blink period, get the state that the light should currently be at.
+ * For a period of `n` ms, the light will be on for `n` ms, and off for `n` ms.
+ * @param period the time in ms for the on time/off time of the light.
+ * @return The calculated state the light should currently be at
+ */
+bool blink_state(const uint32_t period) {
+  return (millis() % (2*period)) < period;
 }
