@@ -14,7 +14,7 @@
 
 bool is_mandrel_latch_closed;           // Mandrel latch sensor reading. True for closed and safe
 bool is_fingers_down;                   // Are the workpiece holding fingers commanded down
-bool is_homed;                          // Has the axis been homed
+bool is_homed = false;                  // Has the axis been homed
 bool is_fault;                          // Software fault detection. Indicates an unexpected condition
 bool is_ready_for_cycle;                // Is the clearcore ready to execute its program
 volatile bool is_e_stop;                // Is the Emergency Stop currently active
@@ -30,34 +30,46 @@ bool commanded_fingers;                 // Finger state commanded by the HMI, tr
 bool commanded_roller;                  // Roller state commanded by the HMI, true means engaged, false means disengaged
 
 
-uint16_t actual_position;         // Hreg R   actual position of the axis measured in hundredths of an inch
-uint16_t commanded_position;      // Hreg R/W commanded position of the axis measured in hundredths of an inch;
-                                    // will not be acted upon if is_commanded_pos is not set
-uint16_t job_progress;            // Hreg R   progress of the current job: (job_progress / 65536) * 100%
-uint16_t job_start_pos;           // Hreg R   saved start position of the axis measured in hundredths of an inch
-uint16_t job_end_pos;             // Hreg R   saved end position of the axis measured in hundredths of an inch
-uint16_t job_park_pos;            // Hreg R   saved park position of the axis measured in hundredths of an inch
-uint16_t min_pos;                 // Hreg R   minimum absolute position of the axis measured in hundredths of an inch
-uint16_t max_pos;                 // Hreg R   maximum absolute position of the axis measured in hundredths of an inch
-uint16_t jog_speed;               // Hreg R/W target speed while jogging manually or during disengaged portions of the job sequence
-uint16_t planish_speed;           // Hreg R/W target speed during engaged portions of the job sequence
-uint16_t fault_code;              // Hreg R   fault code; 0 indicates normal operation
-uint16_t heartbeat_in;            // Hreg W   Contains an arbitrary value set by the HMI
-uint16_t heartbeat_out;           // Hreg R   This should always be equal to `(heartbeat_in*2)%65536`
+uint16_t actual_position;         // actual position of the axis measured in hundredths of an inch
+uint16_t commanded_position;      // commanded position of the axis measured in hundredths of an inch;
+
+uint16_t job_progress;            // progress of the current job: (job_progress / 65536) * 100%
+uint16_t job_start_pos;           // saved start position of the axis measured in hundredths of an inch
+uint16_t job_end_pos;             // saved end position of the axis measured in hundredths of an inch
+uint16_t job_park_pos;            // saved park position of the axis measured in hundredths of an inch
+uint16_t min_pos;                 // minimum absolute position of the axis measured in hundredths of an inch
+uint16_t max_pos;                 // maximum absolute position of the axis measured in hundredths of an inch
+uint16_t jog_speed;               // target speed while jogging manually or during disengaged portions of the job sequence
+uint16_t planish_speed;           // target speed during engaged portions of the job sequence
+uint16_t fault_code;              // fault code; 0 indicates normal operation
+uint16_t heartbeat_in;            // Contains an arbitrary value set by the HMI
+uint16_t heartbeat_out;           // This should always be equal to `(heartbeat_in*2)%65536`
 
 
 enum PlanishStates {
-  post,
-  homing,
-  idle,
-  manual_jog,
-  e_stop,
+  post,                   // Power On Self Test
+  begin_homing,           // start axis homing
+  wait_for_homing,        // Wait for homing to complete
+  idle,                   // Idle await instructions
+  manual_jog,             // manually commanded jog
+  e_stop,                 // E-stop currently active
+  error,                  // Unrecoverable error has occurred and machine needs to reboot. should be a dead end state
 
+  job_start,              // Job started, move to saved start pos
+  job_planish,            // Start position reached, engage roller and move to end pos
+  job_park,               // Planish finished, disengage roller and jog to park
+
+  learn_start_pos,        // Learn has been pressed, set start point
+  learn_jog_to_end_pos,   // Manually jogging to end position
+  learn_end_pos,          // Learn was pressed again, set end position
+  learn_jog_to_park_pos,  // Manually jogging to park position
+  learn_park_pos,         // Learn was pressed again, set park position
 };
 
+volatile PlanishStates machine_state;
 
-#define ESTOP_SW ConnectorA12 /// These should match \/
-#define ESTOP_PIN CLEARCORE_PIN_A12 /// ^ should be set to the same semantic connector pin as ESTOP_SW
+
+#define ESTOP_SW ConnectorDI6
 #define CYCLE_START_SW ConnectorA11
 #define CYCLE_START_LIGHT ConnectorIO2
 #define FINGER_ACTUATION ConnectorIO0
@@ -70,8 +82,6 @@ enum PlanishStates {
 
 void configure_io();
 void e_stop_handler();
-bool read_coils();
-bool read_registers();
 bool motor_movement_checks();
 void print_motor_alerts();
 
@@ -83,7 +93,104 @@ void setup() {
   while (!Serial && millis() - startTime < timeout)
     continue;
 
+
+  uint8_t delay_cycles = 10;
+  while (delay_cycles--) {
+    delay(1000);
+    Serial.println(delay_cycles);
+  }
+
   ESTOP_SW.InterruptHandlerSet(e_stop_handler);
+
+
+  machine_state = post;
+}
+
+
+void loop() {
+  switch (machine_state) {
+    case post:
+      Serial.println("Power on self test");
+      configure_io();
+      machine_state = begin_homing;
+      break;
+    case begin_homing:
+      if (!is_e_stop && is_mandrel_latch_closed) {
+        Serial.println("begin homing");
+        CARRIAGE_MOTOR.EnableRequest(true);
+        machine_state = wait_for_homing;
+      } else {
+        Serial.println("unsafe to home");
+        delay(10);
+      }
+      break;
+    case wait_for_homing:
+      if (CARRIAGE_MOTOR.HlfbState() != MotorDriver::HLFB_ASSERTED &&
+            !CARRIAGE_MOTOR.StatusReg().bit.AlertsPresent)
+      { // motor still homing, no errors
+        delay(1);
+      } else {
+        if (CARRIAGE_MOTOR.StatusReg().bit.AlertsPresent) { // motor has an error
+          Serial.println("Motor alert detected during homing.");
+          print_motor_alerts();
+          machine_state = error;
+        } else { // homing done no errors
+          Serial.println("homing complete");
+          is_homed = true;
+          machine_state = idle;
+        }
+      }
+      break;
+    case idle:
+      while (true) {
+        Serial.println("ready in idle");
+        delay(1000);
+      }
+      break;
+    case manual_jog:
+      break;
+    case e_stop:
+      while (true) {
+        Serial.println("e-stop");
+        delay(1000);
+      }
+      break;
+    case error:
+      while (true) {
+        Serial.println("reached error state");
+        delay(1000);
+      }
+      break;
+    case job_start:
+      break;
+    case job_planish:
+      break;
+    case job_park:
+      break;
+    case learn_start_pos:
+      break;
+    case learn_jog_to_end_pos:
+      break;
+    case learn_end_pos:
+      break;
+    case learn_jog_to_park_pos:
+      break;
+    case learn_park_pos:
+      break;
+  }
+}
+
+
+void configure_io() {
+  CYCLE_START_SW.Mode(Connector::INPUT_DIGITAL);
+  CYCLE_START_LIGHT.Mode(Connector::OUTPUT_DIGITAL);
+  FINGER_ACTUATION.Mode(Connector::OUTPUT_DIGITAL);
+  ROLLER_ACTUATION.Mode(Connector::OUTPUT_DIGITAL);
+
+  ESTOP_SW.Mode(Connector::INPUT_DIGITAL);
+  ESTOP_SW.InterruptHandlerSet(e_stop_handler);
+
+  ESTOP_SW.FilterLength(16, DigitalIn::FILTER_UNIT_SAMPLES);
 
 
   // TODO: https://teknic-inc.github.io/ClearCore-library/_move_position_absolute_8cpp-example.html
@@ -99,29 +206,7 @@ void setup() {
 
   CARRIAGE_MOTOR.VelMax(CARRIAGE_MOTOR_MAX_VEL);
   CARRIAGE_MOTOR.AccelMax(CARRIAGE_MOTOR_MAX_ACCEL);
-}
 
-
-
-void loop() {
-  if (is_e_stop) {
-    Serial.println("Emergency Stop");
-  } else {
-    Serial.println("Normal Operation");
-  }
-
-  delay(10);
-
-}
-
-
-void configure_io() {
-  ESTOP_SW.Mode(Connector::INPUT_DIGITAL);
-  CYCLE_START_SW.Mode(Connector::INPUT_DIGITAL);
-  CYCLE_START_LIGHT.Mode(Connector::OUTPUT_DIGITAL);
-  FINGER_ACTUATION.Mode(Connector::OUTPUT_DIGITAL);
-  ROLLER_ACTUATION.Mode(Connector::OUTPUT_DIGITAL);
-  CARRIAGE_MOTOR.EStopConnector(ESTOP_PIN); // TODO: https://teknic-inc.github.io/ClearCore-library/class_clear_core_1_1_motor_driver.html#a7294f84ac78e9ea31ad6cedab585ec03
 }
 
 void e_stop_handler() {
@@ -132,51 +217,22 @@ void e_stop_handler() {
 
 
 
+bool home_axis() {
+  CARRIAGE_MOTOR.EnableRequest(true);
 
-bool move_to_position(uint16_t new_position) {
-  if (new_position > max_pos) {
-    new_position = max_pos;
-  } else if (new_position < min_pos) {
-    new_position = min_pos;
-  }
-  if (new_position == actual_position) {
-    return true;
-  }
-  commanded_position = new_position;
-  if(motor_movement_checks()) {
-    CARRIAGE_MOTOR.Move(commanded_position, StepGenerator::MOVE_TARGET_ABSOLUTE);
-  }
-}
-
-/**
- *
- * @return true for success
- */
-bool handle_axis_home_button() {
-  is_homed = false;
-  if (!is_e_stop &&
-    !ESTOP_SW.State() && // Ideally this is redundant, but really would hate to miss an interrupt and fail to ESTOP
-    is_mandrel_latch_closed) { // TODO: should mandrel latch need to be closed for motor movement?
-    CARRIAGE_MOTOR.EnableRequest(false);
-
-    CARRIAGE_MOTOR.EnableRequest(true);
-    // TODO: Does homing go both ways? Can I change the direction it starts homing?
-
-    while (CARRIAGE_MOTOR.HlfbState() != MotorDriver::HLFB_ASSERTED &&
+  while (CARRIAGE_MOTOR.HlfbState() != MotorDriver::HLFB_ASSERTED &&
             !CARRIAGE_MOTOR.StatusReg().bit.AlertsPresent) {}
-    // Check if motor alert occurred during enabling
-    // Clear alert if configured to do so
-    if (CARRIAGE_MOTOR.StatusReg().bit.AlertsPresent) {
-      Serial.println("Motor alert detected.");
-      print_motor_alerts();
-    } else {
-      Serial.println("Motor Ready");
-    }
-    return true;
-  }
 
-  return false;
+  if (CARRIAGE_MOTOR.StatusReg().bit.AlertsPresent) {
+    Serial.println("Motor alert detected during homing.");
+    print_motor_alerts();
+    return false;
+  }
+  return true;
 }
+
+
+
 
 /**
  * helper function for motor safety checks
@@ -184,7 +240,6 @@ bool handle_axis_home_button() {
  */
 bool motor_movement_checks() {
   return !is_e_stop &&
-    !ESTOP_SW.State() && // Ideally this is redundant, but really would hate to miss an interrupt and fail to ESTOP
     is_mandrel_latch_closed &&
     is_homed;
 }
