@@ -10,6 +10,7 @@
 #include <Arduino.h>
 
 #include "ClearCore.h"
+#include "indicator_light.h"
 
 
 bool is_mandrel_latch_closed;           // Mandrel latch sensor reading. True for closed and safe
