@@ -29,9 +29,8 @@ bool is_set_job_park_button_latched;    // 'Set park to current position' button
 bool commanded_fingers;                 // Finger state commanded by the HMI, true means engaged, false means disengaged
 bool commanded_roller;                  // Roller state commanded by the HMI, true means engaged, false means disengaged
 
-
-
-
+uint32_t last_iteration_delta;          // Time spent on the last iteration of the main loop in millis
+uint32_t last_iteration_time;           // Time of the last iteration of the main loop in millis
 
 enum PlanishStates {
   post,                   // Power On Self Test
@@ -75,35 +74,53 @@ volatile PlanishStates machine_state;
 #define CARRIAGE_MOTOR_MAX_ACCEL 50000
 #define CARRIAGE_MOTOR_MAX_VEL 5000
 
+#define ITERATION_TIME_WARNING_MS 100 // after this many milliseconds stuck on one iteration of the state machine, give a warning.
+#define ITERATION_TIME_ERROR_MS 1000  // after this many milliseconds stuck on one iteration of the state machine, declare an error
+#define SERIAL_ESTABLISH_TIMEOUT 10000 // Number of ms to wait for serial to establish before failing POST
+
 bool configure_io();
 void e_stop_handler();
 bool motor_movement_checks();
 void print_motor_alerts();
+void iteration_time_check();
 void config_ccio_pin(ClearCorePins target_pin, Connector::ConnectorModes mode, bool initial_state = false);
+void set_ccio_pin(ClearCorePins target_pin, bool state);
 
 
 void setup() {
+
+  ESTOP_SW.InterruptHandlerSet(e_stop_handler, InputManager::InterruptTrigger::RISING);
+
   Serial.begin(115200);
-  const uint32_t timeout = 5000;
+  const uint32_t timeout = SERIAL_ESTABLISH_TIMEOUT;
   const uint32_t startTime = millis();
   while (!Serial && millis() - startTime < timeout)
     continue;
 
+  if (!Serial) {
+    machine_state = error;
+    return;
+  }
 
+  // Debug delay to be able to restart motor before program starts
   uint8_t delay_cycles = 10;
   while (delay_cycles--) {
     delay(1000);
     Serial.println(delay_cycles);
   }
 
-  ESTOP_SW.InterruptHandlerSet(e_stop_handler);
 
 
+  last_iteration_time = millis();
   machine_state = post;
 }
 
 
 void loop() {
+
+  // TODO: Check and latch input button states if high
+
+  iteration_time_check();
   switch (machine_state) {
     case post:
       Serial.println("Power on self test");
@@ -183,6 +200,9 @@ void loop() {
     case learn_park_pos:
       break;
   }
+
+  // TODO: Unlatch input button states
+
 }
 
 /**
@@ -243,6 +263,27 @@ bool configure_io() {
   return true;
 }
 
+/**
+ * Check interval between calls.
+ * This should be called right before every execution of the state machine
+ */
+void iteration_time_check() {
+  last_iteration_delta = millis()-last_iteration_time;
+  last_iteration_time = millis();
+  if (last_iteration_delta >= ITERATION_TIME_ERROR_MS) {
+    Serial.println("Last iteration of the state machine took more than "
+                   "`ITERATION_TIME_ERROR_MS` (" + String(ITERATION_TIME_ERROR_MS) + "ms) to complete. "
+                   "This is likely a bug. Last iteration took " + String(last_iteration_delta) + "ms. "
+                   "Engaging E-Stop and stopping execution");
+    machine_state = e_stop;
+  } else if (last_iteration_delta >= ITERATION_TIME_WARNING_MS) {
+    Serial.println("Last iteration of the state machine took more than "
+                   "`ITERATION_TIME_WARNING_MS` (" + String(ITERATION_TIME_WARNING_MS) + "ms) to complete. "
+                   "This is likely a bug. Last iteration took " + String(last_iteration_delta) + "ms. "
+                   "Continuing execution");
+  }
+}
+
 void config_ccio_pin(
   const ClearCorePins target_pin,
   const Connector::ConnectorModes mode,
@@ -255,8 +296,19 @@ void config_ccio_pin(
   }
 }
 
+void set_ccio_pin(
+  const ClearCorePins target_pin,
+  const bool state)
+{
+  CcioPin *pin_pointer = CcioMgr.PinByIndex(target_pin);
+  if (pin_pointer != nullptr) {
+    pin_pointer->State(state);
+  }
+}
+
 void e_stop_handler() {
   is_e_stop = true;
+  machine_state = e_stop;
   CARRIAGE_MOTOR.MoveStopAbrupt();
   Serial.println("Emergency Stop");
 }
@@ -288,16 +340,10 @@ bool motor_movement_checks() {
 }
 
 
-/*------------------------------------------------------------------------------
- * PrintAlerts
+/**
+ * Prints active alerts.
  *
- *    Prints active alerts.
- *
- * Parameters:
- *    requires "motor" to be defined as a ClearCore motor connector
- *
- * Returns: 
- *    none
+ * @pre requires "CARRIAGE_MOTOR" to be defined as a ClearCore motor connector
  */
 void print_motor_alerts(){
   // report status of alerts
@@ -317,19 +363,16 @@ void print_motor_alerts(){
   }
 }
 
-/*------------------------------------------------------------------------------
- * MoveAbsolutePosition
+/**
+ * Command step pulses to move the motor's current position to the absolute
+ * position specified by "position"
+ * Prints the move status to the USB serial port
+ * Returns when HLFB asserts (indicating the motor has reached the commanded
+ * position)
  *
- *    Command step pulses to move the motor's current position to the absolute
- *    position specified by "position"
- *    Prints the move status to the USB serial port
- *    Returns when HLFB asserts (indicating the motor has reached the commanded
- *    position)
+ * @param position The absolute position, in step pulses, to move to
  *
- * Parameters:
- *    int position  - The absolute position, in step pulses, to move to
- *
- * Returns: True/False depending on whether the move was successfully triggered.
+ * @return bool: whether the move was successfully triggered.
  */
 bool MoveAbsolutePosition(int32_t position) {
     // Check if a motor alert is currently preventing motion
@@ -366,6 +409,7 @@ bool MoveAbsolutePosition(int32_t position) {
 }
 
 /**
+ * TODO: Maybe make a light manger with an enum for blink periods/on/off
  * For a given blink period, get the state that the light should currently be at.
  * For a period of `n` ms, the light will be on for `n` ms, and off for `n` ms.
  * @param period the time in ms for the on time/off time of the light.
