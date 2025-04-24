@@ -115,7 +115,7 @@ void loop() {
       machine_state = begin_homing;
       break;
     case begin_homing:
-      if (!is_e_stop && is_mandrel_latch_closed) {
+      if (!is_e_stop) { // TODO: More checks
         Serial.println("begin homing");
         CARRIAGE_MOTOR.EnableRequest(true);
         machine_state = wait_for_homing;
