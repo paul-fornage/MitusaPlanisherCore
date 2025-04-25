@@ -13,22 +13,8 @@
 #include "indicator_light.h"
 
 
-bool is_mandrel_latch_closed;           // Mandrel latch sensor reading. True for closed and safe
-bool is_fingers_down;                   // Are the workpiece holding fingers commanded down
 bool is_homed = false;                  // Has the axis been homed
-bool is_fault;                          // Software fault detection. Indicates an unexpected condition
-bool is_ready_for_cycle;                // Is the clearcore ready to execute its program
 volatile bool is_e_stop;                // Is the Emergency Stop currently active
-bool is_job_active;                     // Is the clearcore executing its program
-bool is_ready_for_manual_control;       // Is the clearcore ready for manual control commands
-bool is_roller_down;                    // Is the roller down/engaged
-bool is_commanded_pos;                  // Has the HMI requested a new commanded position?
-bool is_axis_homing_button_latched;     // 'Run axis homing sequence' button latch state
-bool is_set_job_start_button_latched;   // 'Set start to current position' button latch state
-bool is_set_job_end_button_latched;     // 'Set end to current position' button latch state
-bool is_set_job_park_button_latched;    // 'Set park to current position' button latch state
-bool commanded_fingers;                 // Finger state commanded by the HMI, true means engaged, false means disengaged
-bool commanded_roller;                  // Roller state commanded by the HMI, true means engaged, false means disengaged
 
 uint32_t last_iteration_delta;          // Time spent on the last iteration of the main loop in millis
 uint32_t last_iteration_time;           // Time of the last iteration of the main loop in millis
@@ -58,17 +44,28 @@ volatile PlanishStates machine_state;
 volatile IndicatorLight home_indicator_light;   /// Defined globally, but should not be accessed unless configure_IO has completed without errors
 volatile IndicatorLight learn_indicator_light;  /// Defined globally, but should not be accessed unless configure_IO has completed without errors
 
-#define ESTOP_SW ConnectorDI6
-#define CYCLE_START_SW ConnectorA11
-#define CYCLE_START_LIGHT ConnectorIO2
+#define ESTOP_SW ConnectorA12
+#define LASER_SW ConnectorA11
+#define LEARN_SW ConnectorA10
+#define SPEED_POT ConnectorA9
+#define MANDREL_LATCH_LMT ConnectorDI8
+#define SINGLE_CYCLE_SW ConnectorDI7
+#define HEAD_UP_LMT ConnectorDI6
+#define HOME_SW ConnectorIO0
+#define CYCLE_SW ConnectorIO1
+#define FINGER_SW ConnectorIO2
+#define JOG_FWD_SW ConnectorIO3
+#define JOG_REV_SW ConnectorIO4
+#define HEAD_SW ConnectorIO5
+
+#define CARRIAGE_MOTOR ConnectorM0
 
 // CCIO pin definitions. these are not interchangeable with native io ports.
 // please see `configure_io()` to change assignment between ccio and native pins
 #define FINGER_ACTUATION CCIOA6 // CCIO pin for finger actuation
 #define HEAD_ACTUATION CCIOA4
-#define HOME_BUTTON_LIGHT CCIOA0
-#define LEARN_BUTTON_LIGHT CCIOA3
-#define CARRIAGE_MOTOR ConnectorM0
+#define HOME_SW_LIGHT CCIOA0
+#define LEARN_SW_LIGHT CCIOA3
 
 #define CCIO1 ConnectorCOM1
 #define EXPECTED_NUM_CCIO 1
@@ -151,26 +148,23 @@ void loop() {
       }
       break;
     case wait_for_homing:
-      if (CARRIAGE_MOTOR.HlfbState() != MotorDriver::HLFB_ASSERTED &&
-            !CARRIAGE_MOTOR.StatusReg().bit.AlertsPresent)
-      { // motor still homing, no errors
-        delay(1);
+      if (CARRIAGE_MOTOR.HlfbState() == MotorDriver::HLFB_ASSERTED) {
+        // homing done no errors
+        Serial.println("homing complete");
+        is_homed = true;
+        machine_state = idle;
+      } else if (CARRIAGE_MOTOR.StatusReg().bit.AlertsPresent) {
+        // motor has an error
+        Serial.println("Motor alert detected during homing.");
+        print_motor_alerts();
+        machine_state = error;
       } else {
-        if (CARRIAGE_MOTOR.StatusReg().bit.AlertsPresent) { // motor has an error
-          Serial.println("Motor alert detected during homing.");
-          print_motor_alerts();
-          machine_state = error;
-        } else { // homing done no errors
-          Serial.println("homing complete");
-          is_homed = true;
-          machine_state = idle;
-        }
+        // still homing
       }
       break;
     case idle:
-      if (is_axis_homing_button_latched) {
+      if (HOME_SW.InputRisen()) {
         machine_state = begin_homing;
-        is_axis_homing_button_latched = false;
         break;
       }
       while (true) {
@@ -210,8 +204,9 @@ void loop() {
       break;
   }
 
-  // TODO: Unlatch input button states
-
+  // Unlatch input button states
+  LEARN_SW.InputRisen();
+  HOME_SW.InputRisen();
 }
 
 /**
@@ -219,8 +214,20 @@ void loop() {
  * @return True for success
  */
 bool configure_io() {
-  CYCLE_START_SW.Mode(Connector::INPUT_DIGITAL);
-  CYCLE_START_LIGHT.Mode(Connector::OUTPUT_DIGITAL);
+
+  LASER_SW.Mode(Connector::INPUT_DIGITAL);
+  LEARN_SW.Mode(Connector::INPUT_DIGITAL);
+  SPEED_POT.Mode(Connector::INPUT_ANALOG);
+  MANDREL_LATCH_LMT.Mode(Connector::INPUT_DIGITAL);
+  SINGLE_CYCLE_SW.Mode(Connector::INPUT_DIGITAL);
+  HEAD_UP_LMT.Mode(Connector::INPUT_DIGITAL);
+  HOME_SW.Mode(Connector::INPUT_DIGITAL);
+  CYCLE_SW.Mode(Connector::INPUT_DIGITAL);
+  FINGER_SW.Mode(Connector::INPUT_DIGITAL);
+  JOG_FWD_SW.Mode(Connector::INPUT_DIGITAL);
+  JOG_REV_SW.Mode(Connector::INPUT_DIGITAL);
+  HEAD_SW.Mode(Connector::INPUT_DIGITAL);
+
 
   ESTOP_SW.Mode(Connector::INPUT_DIGITAL);
   ESTOP_SW.InterruptHandlerSet(e_stop_handler);
@@ -255,11 +262,11 @@ bool configure_io() {
 
   config_ccio_pin(FINGER_ACTUATION, Connector::OUTPUT_DIGITAL);
   config_ccio_pin(HEAD_ACTUATION, Connector::OUTPUT_DIGITAL);
-  config_ccio_pin(HOME_BUTTON_LIGHT, Connector::OUTPUT_DIGITAL);
-  config_ccio_pin(LEARN_BUTTON_LIGHT, Connector::OUTPUT_DIGITAL);
+  config_ccio_pin(HOME_SW_LIGHT, Connector::OUTPUT_DIGITAL);
+  config_ccio_pin(LEARN_SW_LIGHT, Connector::OUTPUT_DIGITAL);
 
-  home_indicator_light.setPin(CcioMgr.PinByIndex(HOME_BUTTON_LIGHT));
-  learn_indicator_light.setPin(CcioMgr.PinByIndex(LEARN_BUTTON_LIGHT));
+  home_indicator_light.setPin(CcioMgr.PinByIndex(HOME_SW_LIGHT));
+  learn_indicator_light.setPin(CcioMgr.PinByIndex(LEARN_SW_LIGHT));
 
   MotorMgr.MotorInputClocking(MotorManager::CLOCK_RATE_NORMAL);
   MotorMgr.MotorModeSet(MotorManager::MOTOR_ALL, Connector::CPM_MODE_STEP_AND_DIR);
@@ -415,17 +422,6 @@ void e_stop_handler() {
 
 
 /**
- * helper function for motor safety checks
- * @return true if motor movement checks pass
- */
-bool motor_movement_checks() {
-  return !is_e_stop &&
-    is_mandrel_latch_closed &&
-    is_homed;
-}
-
-
-/**
  * Prints active alerts.
  *
  * @pre requires "CARRIAGE_MOTOR" to be defined as a ClearCore motor connector
@@ -459,7 +455,7 @@ void print_motor_alerts(){
  *
  * @return bool: whether the move was successfully triggered.
  */
-bool MoveAbsolutePosition(int32_t position) {
+bool MoveAbsolutePosition(const int32_t position) {
     // Check if a motor alert is currently preventing motion
     // Clear alert if configured to do so 
     if (CARRIAGE_MOTOR.StatusReg().bit.AlertsPresent) {
@@ -493,13 +489,3 @@ bool MoveAbsolutePosition(int32_t position) {
     return true;
 }
 
-/**
- * TODO: Maybe make a light manger with an enum for blink periods/on/off
- * For a given blink period, get the state that the light should currently be at.
- * For a period of `n` ms, the light will be on for `n` ms, and off for `n` ms.
- * @param period the time in ms for the on time/off time of the light.
- * @return The calculated state the light should currently be at
- */
-bool blink_state(const uint32_t period) {
-  return (millis() % (2*period)) < period;
-}
