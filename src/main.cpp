@@ -55,6 +55,8 @@ enum PlanishStates {
 
 volatile PlanishStates machine_state;
 
+volatile IndicatorLight home_indicator_light;   /// Defined globally, but should not be accessed unless configure_IO has completed without errors
+volatile IndicatorLight learn_indicator_light;  /// Defined globally, but should not be accessed unless configure_IO has completed without errors
 
 #define ESTOP_SW ConnectorDI6
 #define CYCLE_START_SW ConnectorA11
@@ -79,6 +81,9 @@ volatile PlanishStates machine_state;
 #define ITERATION_TIME_ERROR_MS 1000  // after this many milliseconds stuck on one iteration of the state machine, declare an error
 #define SERIAL_ESTABLISH_TIMEOUT 10000 // Number of ms to wait for serial to establish before failing POST
 
+/// Interrupt priority for the periodic interrupt. 0 is highest priority, 7 is lowest.
+#define PERIODIC_INTERRUPT_PRIORITY 5
+
 bool configure_io();
 void e_stop_handler();
 bool motor_movement_checks();
@@ -86,6 +91,11 @@ void print_motor_alerts();
 void iteration_time_check();
 void config_ccio_pin(ClearCorePins target_pin, Connector::ConnectorModes mode, bool initial_state = false);
 void set_ccio_pin(ClearCorePins target_pin, bool state);
+void ConfigurePeriodicInterrupt(uint32_t frequencyHz);
+
+extern "C" void TCC2_0_Handler(void) __attribute__((
+            alias("PeriodicInterrupt")));
+
 
 
 void setup() {
@@ -110,8 +120,6 @@ void setup() {
     Serial.println(delay_cycles);
   }
 
-
-
   last_iteration_time = millis();
   machine_state = post;
 }
@@ -125,7 +133,7 @@ void loop() {
   switch (machine_state) {
     case post:
       Serial.println("Power on self test");
-      const bool io_configure_result = configure_io();
+      bool io_configure_result = configure_io();
       if (!io_configure_result) {
         machine_state = error;
         break;
@@ -250,6 +258,9 @@ bool configure_io() {
   config_ccio_pin(HOME_BUTTON_LIGHT, Connector::OUTPUT_DIGITAL);
   config_ccio_pin(LEARN_BUTTON_LIGHT, Connector::OUTPUT_DIGITAL);
 
+  home_indicator_light.setPin(CcioMgr.PinByIndex(HOME_BUTTON_LIGHT));
+  learn_indicator_light.setPin(CcioMgr.PinByIndex(LEARN_BUTTON_LIGHT));
+
   MotorMgr.MotorInputClocking(MotorManager::CLOCK_RATE_NORMAL);
   MotorMgr.MotorModeSet(MotorManager::MOTOR_ALL, Connector::CPM_MODE_STEP_AND_DIR);
 
@@ -261,7 +272,24 @@ bool configure_io() {
 
   CARRIAGE_MOTOR.VelMax(CARRIAGE_MOTOR_MAX_VEL);
   CARRIAGE_MOTOR.AccelMax(CARRIAGE_MOTOR_MAX_ACCEL);
+
+  ConfigurePeriodicInterrupt(1000);
+
   return true;
+}
+
+
+/**
+ * Interrupt handler gets automatically called every ms
+ */
+extern "C" void PeriodicInterrupt(void) {
+  // These calls just update the indicator light
+  // logic so they can check if they need to be changed
+  home_indicator_light.tick();
+  learn_indicator_light.tick();
+
+  // Acknowledge the interrupt to clear the flag and wait for the next interrupt.
+  TCC2->INTFLAG.reg = TCC_INTFLAG_MASK; // This is critical
 }
 
 /**
@@ -284,6 +312,76 @@ void iteration_time_check() {
                    "Continuing execution");
   }
 }
+
+/**
+ * Only used to configure the ms interrupt.
+ * Should only be called once other IO is configured.
+ * If you are confused, don't worry, this won't make sense without knowing the
+ * internal architecture of the hardware. It was stolen from
+ * https://teknic-inc.github.io/ClearCore-library/_periodic_interrupt_8cpp-example.html
+ *
+ * @param frequencyHz
+ */
+void ConfigurePeriodicInterrupt(const uint32_t frequencyHz) {
+    // Enable the TCC2 peripheral.
+    // TCC2 and TCC3 share their clock configuration and they
+    // are already configured to be clocked at 120 MHz from GCLK0.
+    CLOCK_ENABLE(APBCMASK, TCC2_);
+
+    // Disable TCC2.
+    TCC2->CTRLA.bit.ENABLE = 0;
+    SYNCBUSY_WAIT(TCC2, TCC_SYNCBUSY_ENABLE);
+
+    // Reset the TCC module so we know we are starting from a clean state.
+    TCC2->CTRLA.bit.SWRST = 1;
+    while (TCC2->CTRLA.bit.SWRST) {}
+
+    // If the frequency requested is zero, disable the interrupt and bail out.
+    if (!frequencyHz) {
+        NVIC_DisableIRQ(TCC2_0_IRQn);
+        return;
+    }
+
+    // Determine the clock prescaler and period value needed to achieve the
+    // requested frequency.
+    uint32_t period = (CPU_CLK + frequencyHz / 2) / frequencyHz;
+    uint8_t prescale;
+    // Make sure period is >= 1.
+    period = max(period, 1U);
+
+    // Prescale values 0-4 map to prescale divisors of 1-16,
+    // dividing by 2 each increment.
+    for (prescale = TCC_CTRLA_PRESCALER_DIV1_Val;
+            prescale < TCC_CTRLA_PRESCALER_DIV16_Val && (period - 1) > UINT16_MAX;
+            prescale++) {
+        period = period >> 1;
+    }
+    // Prescale values 5-7 map to prescale divisors of 64-1024,
+    // dividing by 4 each increment.
+    for (; prescale < TCC_CTRLA_PRESCALER_DIV1024_Val && (period - 1) > UINT16_MAX;
+            prescale++) {
+        period = period >> 2;
+    }
+    // If we have maxed out the prescaler and the period is still too big,
+    // use the maximum period. This results in a ~1.788 Hz interrupt.
+    if (period > UINT16_MAX) {
+        TCC2->PER.reg = UINT16_MAX;
+    }
+    else {
+        TCC2->PER.reg = period - 1;
+    }
+    TCC2->CTRLA.bit.PRESCALER = prescale;
+
+    // Interrupt every period on counter overflow.
+    TCC2->INTENSET.bit.OVF = 1;
+    // Enable TCC2.
+    TCC2->CTRLA.bit.ENABLE = 1;
+
+    // Set the interrupt priority and enable it.
+    NVIC_SetPriority(TCC2_0_IRQn, PERIODIC_INTERRUPT_PRIORITY);
+    NVIC_EnableIRQ(TCC2_0_IRQn);
+}
+
 
 void config_ccio_pin(
   const ClearCorePins target_pin,
@@ -312,20 +410,6 @@ void e_stop_handler() {
   machine_state = e_stop;
   CARRIAGE_MOTOR.MoveStopAbrupt();
   Serial.println("Emergency Stop");
-}
-
-bool home_axis() {
-  CARRIAGE_MOTOR.EnableRequest(true);
-
-  while (CARRIAGE_MOTOR.HlfbState() != MotorDriver::HLFB_ASSERTED &&
-            !CARRIAGE_MOTOR.StatusReg().bit.AlertsPresent) {}
-
-  if (CARRIAGE_MOTOR.StatusReg().bit.AlertsPresent) {
-    Serial.println("Motor alert detected during homing.");
-    print_motor_alerts();
-    return false;
-  }
-  return true;
 }
 
 
