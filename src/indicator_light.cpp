@@ -6,7 +6,7 @@
 IndicatorLight::IndicatorLight(Connector* outputPin)
     : pin(outputPin)
     , pattern(OFF)
-    , period_ms(1000)
+    , period(100)
     , tick_counter(0)
     , output_state(false) {
 }
@@ -14,7 +14,7 @@ IndicatorLight::IndicatorLight(Connector* outputPin)
 IndicatorLight::IndicatorLight()
     : pin(nullptr)
     , pattern(OFF)
-    , period_ms(1000)
+    , period(100)
     , tick_counter(0)
     , output_state(false) {
 }
@@ -25,9 +25,13 @@ void IndicatorLight::setPin(Connector* outputPin) volatile {
 }
 
 
-void IndicatorLight::setPattern(const LightPattern newPattern, const uint32_t periodMs) {
+void IndicatorLight::setPattern(const LightPattern newPattern) volatile {
     pattern = newPattern;
-    period_ms = periodMs;
+    resetPattern();
+}
+
+void IndicatorLight::setPeriod(const uint32_t newPeriod) volatile {
+    period = newPeriod;
     resetPattern();
 }
 
@@ -40,9 +44,10 @@ void IndicatorLight::resetPattern() volatile {
 }
 
 bool IndicatorLight::calculateOutput() const volatile {
-    // Convert tick position to a percentage of the period (0-15)
-    const uint32_t position = tick_counter % (period_ms*8);
-    const uint32_t phase = position / period_ms; // should be 0-7 inclusive
+    const uint32_t position = tick_counter % (period*8);
+    const uint32_t phase = position / period; // should be 0-7 inclusive
+
+    // ConnectorUsb.SendLine(phase);
     
     switch (pattern) {
         case OFF:
@@ -61,21 +66,23 @@ bool IndicatorLight::calculateOutput() const volatile {
         case FLASH3: {
             return phase == 0 || phase == 2 || phase == 4;
         }
-            
         case BLINK:
             return !(phase % 2);
+        case STROBE:
+            return !(tick_counter % 2);
     }
     // should never happen
     return false;
 }
 
 void IndicatorLight::tick() volatile {
+    tick_counter++;
     if (!pin) return;
     
     // Calculate new output state
     output_state = calculateOutput();
     
     // Update output pin
-    pin->State(output_state);
+    pin->State(!output_state);
 
 }

@@ -12,10 +12,11 @@
 enum LightPattern {
     OFF,        // Always off
     ON,         // Always on
-    FLASH1,     // Flash once
-    FLASH2,     // Flash twice
-    FLASH3,     // Flash thrice
-    BLINK       // Blink at constant rate
+    FLASH1,     // Flash 1 / 4
+    FLASH2,     // Flash 2 / 4
+    FLASH3,     // Flash 3 / 4
+    BLINK,      // Blink at constant rate ( flash 4/4 )
+    STROBE,     // Strobes very fast, always uses a period of 2ms, regardless of what period is set to
 };
 
 class IndicatorLight {
@@ -28,13 +29,17 @@ public:
 
 
     /**
-     * Set the period and pattern.
+     * Set the pattern.
      * @param newPattern See `LightPattern` enum
-     * @param periodMs The period over which to repeat the pattern.
-     * This isn't technically a period because it's actually the "on" time for a blink,
-     * and the full pattern repeats over a period of 8*periodMs
      */
-    void setPattern(LightPattern newPattern, uint32_t periodMs);
+    void setPattern(LightPattern newPattern) volatile;
+
+    /**
+     * Set the period
+     * @param newPeriod The period over which to repeat the pattern. Measured in 8ms; eg period of 4 repeats over 32ms
+     *
+     */
+    void setPeriod(uint32_t newPeriod) volatile;
 
     /**
      * Call this function every ms
@@ -43,12 +48,12 @@ public:
     void tick() volatile;
 
     // Get current pattern
-    LightPattern getPattern() const { return pattern; }
+    LightPattern getPattern() const volatile { return pattern; }
 
 private:
     Connector* pin;
     LightPattern pattern;
-    uint32_t period_ms;
+    uint32_t period;
     uint32_t tick_counter;
     bool output_state;
 

@@ -8,16 +8,31 @@
 */
 
 #include <Arduino.h>
-
+#include "NvmManager.h"
 #include "ClearCore.h"
 #include "indicator_light.h"
 
 
 bool is_homed = false;                  // Has the axis been homed
-volatile bool is_e_stop;                // Is the Emergency Stop currently active
+volatile bool is_e_stop = false;                // Is the Emergency Stop currently active
 
 uint32_t last_iteration_delta;          // Time spent on the last iteration of the main loop in millis
 uint32_t last_iteration_time;           // Time of the last iteration of the main loop in millis
+
+uint32_t loop_num = 0;                  // Number of times the main loop has been called. WILL OVERFLOW
+uint32_t last_estop_millis = 0;         // Millis() value at time the last e-stop was pressed
+
+// Memory job values. Not saved to NVRAM until learn sequence completed
+uint32_t temp_job_start_pos = 0;           // Start position for learn mode
+uint32_t temp_job_end_pos = 0;             // End position for learn mode
+uint32_t temp_job_park_pos = 0;            // Park position for learn mode
+
+// saved job values these are retrieved from NVRAM on boot or over-ridden after a learn sequence
+uint32_t saved_job_start_pos = 0;           // Start position for learn mode
+uint32_t saved_job_end_pos = 0;             // End position for learn mode
+uint32_t saved_job_park_pos = 0;            // Park position for learn mode
+
+uint8_t NV_Ram[12];                    // NVram Max Available is `416 bytes of user data
 
 enum PlanishStates {
   post,                   // Power On Self Test
@@ -38,6 +53,7 @@ enum PlanishStates {
   learn_end_pos,          // Learn was pressed again, set end position
   learn_jog_to_park_pos,  // Manually jogging to park position
   learn_park_pos,         // Learn was pressed again, set park position
+  saving_job_to_nvram,      // Job is recorded and needs to be saved in NVRAM
 };
 
 volatile PlanishStates machine_state;
@@ -74,6 +90,7 @@ volatile IndicatorLight learn_indicator_light;  /// Defined globally, but should
 
 #define CARRIAGE_MOTOR_MAX_ACCEL 50000
 #define CARRIAGE_MOTOR_MAX_VEL 5000
+#define CARRIAGE_MOTOR_MAX_POS 12000
 
 #define ITERATION_TIME_WARNING_MS 100 // after this many milliseconds stuck on one iteration of the state machine, give a warning.
 #define ITERATION_TIME_ERROR_MS 1000  // after this many milliseconds stuck on one iteration of the state machine, declare an error
@@ -81,6 +98,14 @@ volatile IndicatorLight learn_indicator_light;  /// Defined globally, but should
 
 /// Interrupt priority for the periodic interrupt. 0 is highest priority, 7 is lowest.
 #define PERIODIC_INTERRUPT_PRIORITY 5
+
+#define ESTOP_COOLDOWN_MS 1000
+#define ESTOP_SW_SAFE_STATE 1
+
+#define JOG_FWD_SW_ACTIVE_STATE 0
+#define JOG_REV_SW_ACTIVE_STATE 0
+
+
 
 bool configure_io();
 void e_stop_handler();
@@ -90,6 +115,10 @@ void iteration_time_check();
 void config_ccio_pin(ClearCorePins target_pin, Connector::ConnectorModes mode, bool initial_state = false);
 void set_ccio_pin(ClearCorePins target_pin, bool state);
 void ConfigurePeriodicInterrupt(uint32_t frequencyHz);
+uint32_t bytes_to_u32(const uint8_t bytes[4], uint32_t offset = 0);
+void u32_to_bytes(uint32_t value, uint8_t bytes[4], uint32_t offset = 0);
+void read_job_from_nvram();
+void save_job_to_nvram();
 
 extern "C" void TCC2_0_Handler(void) __attribute__((
             alias("PeriodicInterrupt")));
@@ -98,8 +127,10 @@ extern "C" void TCC2_0_Handler(void) __attribute__((
 
 void setup() {
 
-  ESTOP_SW.InterruptHandlerSet(e_stop_handler, InputManager::InterruptTrigger::RISING);
-  if (ESTOP_SW.State()) { // make sure e-stop wasn't already depressed before interrupt was registered
+  ESTOP_SW.Mode(Connector::INPUT_DIGITAL);
+  ESTOP_SW.FilterLength(5, DigitalIn::FILTER_UNIT_SAMPLES);
+  ESTOP_SW.InterruptHandlerSet(e_stop_handler, InputManager::InterruptTrigger::CHANGE);
+  if (ESTOP_SW.State() != ESTOP_SW_SAFE_STATE) { // make sure e-stop wasn't already depressed before interrupt was registered
     e_stop_handler();
   }
 
@@ -114,18 +145,27 @@ void setup() {
   }
 
   // Debug delay to be able to restart motor before program starts
-  uint8_t delay_cycles = 10;
+  uint8_t delay_cycles = 3;
   while (delay_cycles--) {
     delay(1000);
     ConnectorUsb.SendLine(delay_cycles);
   }
 
+  read_job_from_nvram();
+
+  ConnectorUsb.SendLine("job retrieved from NVRAM");
+  ConnectorUsb.SendLine(saved_job_start_pos);
+  ConnectorUsb.SendLine(saved_job_end_pos);
+  ConnectorUsb.SendLine(saved_job_park_pos);
+
   last_iteration_time = millis();
   machine_state = post;
+
 }
 
 
 void loop() {
+  loop_num++;
 
   // TODO: Check and latch input button states if high
 
@@ -133,54 +173,82 @@ void loop() {
   switch (machine_state) {
     case post:
       ConnectorUsb.SendLine("Power on self test");
-      const bool io_configure_result = configure_io();
-      if (!io_configure_result) {
+      // Configure the IO and make sure it was successful
+      if (!configure_io()) {
         machine_state = error;
         break;
       }
       machine_state = idle;
       break;
     case begin_homing:
-      if (!is_e_stop) { // TODO: More checks
-        ConnectorUsb.SendLine("begin homing");
-        CARRIAGE_MOTOR.EnableRequest(true);
-        machine_state = wait_for_homing;
-      } else {
-        ConnectorUsb.SendLine("unsafe to home");
-        delay(10);
-      }
+      ConnectorUsb.SendLine("begin homing");
+      CARRIAGE_MOTOR.EnableRequest(false);
+      delay(10);
+      CARRIAGE_MOTOR.EnableRequest(true);
+      home_indicator_light.setPattern(LightPattern::BLINK);
+      machine_state = wait_for_homing;
       break;
     case wait_for_homing:
       if (CARRIAGE_MOTOR.HlfbState() == MotorDriver::HLFB_ASSERTED) {
         // homing done no errors
         ConnectorUsb.SendLine("homing complete");
+        CARRIAGE_MOTOR.PositionRefSet(0);
         is_homed = true;
+        home_indicator_light.setPattern(LightPattern::ON);
         machine_state = idle;
       } else if (CARRIAGE_MOTOR.StatusReg().bit.AlertsPresent) {
         // motor has an error
         ConnectorUsb.SendLine("Motor alert detected during homing.");
         print_motor_alerts();
         machine_state = error;
+        home_indicator_light.setPattern(LightPattern::STROBE);
       } else {
         // still homing
       }
       break;
     case idle:
-      if (HOME_SW.InputRisen() || HOME_SW.State()) {
-        machine_state = begin_homing;
-        break;
+      // if (loop_num%128==0) {
+      //   ConnectorUsb.Send("CARRIAGE_MOTOR.PositionRefCommanded() == ");
+      //   ConnectorUsb.SendLine(CARRIAGE_MOTOR.PositionRefCommanded());
+      // }
+      if (!is_e_stop && MANDREL_LATCH_LMT.State()) {
+        if (HOME_SW.InputRisen() || HOME_SW.State()) {
+          machine_state = begin_homing;
+          break;
+        }
+        if (is_homed) {
+          if (JOG_FWD_SW.State() == JOG_FWD_SW_ACTIVE_STATE
+              || JOG_REV_SW.State() == JOG_REV_SW_ACTIVE_STATE) {
+            machine_state = manual_jog;
+          }
+          if (LEARN_SW.InputRisen() || LEARN_SW.State()) {
+            machine_state = learn_start_pos;
+          }
+        }
       }
-      while (true) {
-        ConnectorUsb.SendLine("ready in idle");
-        delay(1000);
-      }
+
+
       break;
     case manual_jog:
+      if (!is_e_stop && MANDREL_LATCH_LMT.State() && is_homed) {
+        if (JOG_FWD_SW.State() == JOG_FWD_SW_ACTIVE_STATE) {
+          CARRIAGE_MOTOR.MoveVelocity(500);
+          break;
+        }
+        if (JOG_REV_SW.State() == JOG_REV_SW_ACTIVE_STATE) {
+          CARRIAGE_MOTOR.MoveVelocity(-500);
+          break;
+        }
+      }
+      machine_state = idle;
+      CARRIAGE_MOTOR.MoveStopDecel();
       break;
     case e_stop:
-      while (true) {
-        ConnectorUsb.SendLine("e-stop");
-        delay(1000);
+      if ((ESTOP_SW.State() == ESTOP_SW_SAFE_STATE) && (millis() - last_estop_millis > ESTOP_COOLDOWN_MS)) {
+        ConnectorUsb.SendLine("Emergency Stop Released, returning to idle");
+        machine_state = idle;
+        is_e_stop = false;
+        break;
       }
       break;
     case error:
@@ -198,14 +266,66 @@ void loop() {
     case job_park:
       break;
     case learn_start_pos:
+      learn_indicator_light.setPattern(LightPattern::FLASH1);
+      ConnectorUsb.SendLine("learn start pos");
+      temp_job_start_pos = CARRIAGE_MOTOR.PositionRefCommanded();
+      machine_state = learn_jog_to_end_pos;
       break;
     case learn_jog_to_end_pos:
+      if (!is_e_stop && MANDREL_LATCH_LMT.State() && is_homed) {
+        if (LEARN_SW.InputRisen() || LEARN_SW.State()) {
+          machine_state = learn_end_pos;
+          break;
+        }
+        if (JOG_FWD_SW.State() == JOG_FWD_SW_ACTIVE_STATE) {
+          CARRIAGE_MOTOR.MoveVelocity(500);
+          break;
+        }
+        if (JOG_REV_SW.State() == JOG_REV_SW_ACTIVE_STATE) {
+          CARRIAGE_MOTOR.MoveVelocity(-500);
+          break;
+        }
+      }
+      CARRIAGE_MOTOR.MoveStopDecel();
       break;
     case learn_end_pos:
+      learn_indicator_light.setPattern(LightPattern::FLASH2);
+      ConnectorUsb.SendLine("learn end pos");
+      temp_job_end_pos = CARRIAGE_MOTOR.PositionRefCommanded();
+      machine_state = learn_jog_to_park_pos;
       break;
     case learn_jog_to_park_pos:
+      if (!is_e_stop && MANDREL_LATCH_LMT.State() && is_homed) {
+        if (LEARN_SW.InputRisen() || LEARN_SW.State()) {
+          machine_state = learn_park_pos;
+          break;
+        }
+        if (JOG_FWD_SW.State() == JOG_FWD_SW_ACTIVE_STATE) {
+          CARRIAGE_MOTOR.MoveVelocity(500);
+          break;
+        }
+        if (JOG_REV_SW.State() == JOG_REV_SW_ACTIVE_STATE) {
+          CARRIAGE_MOTOR.MoveVelocity(-500);
+          break;
+        }
+      }
+      CARRIAGE_MOTOR.MoveStopDecel();
       break;
     case learn_park_pos:
+      learn_indicator_light.setPattern(LightPattern::FLASH3);
+      ConnectorUsb.SendLine("learn park pos");
+      temp_job_park_pos = CARRIAGE_MOTOR.PositionRefCommanded();
+      machine_state = saving_job_to_nvram;
+      break;
+    case saving_job_to_nvram:
+      ConnectorUsb.SendLine("saving job to nvram");
+      ConnectorUsb.SendLine(temp_job_start_pos);
+      ConnectorUsb.SendLine(temp_job_end_pos);
+      ConnectorUsb.SendLine(temp_job_park_pos);
+      save_job_to_nvram();
+      learn_indicator_light.setPattern(LightPattern::OFF);
+
+      machine_state = idle;
       break;
   }
 
@@ -233,11 +353,6 @@ bool configure_io() {
   JOG_REV_SW.Mode(Connector::INPUT_DIGITAL);
   HEAD_SW.Mode(Connector::INPUT_DIGITAL);
 
-
-  ESTOP_SW.Mode(Connector::INPUT_DIGITAL);
-  ESTOP_SW.InterruptHandlerSet(e_stop_handler);
-
-  ESTOP_SW.FilterLength(16, DigitalIn::FILTER_UNIT_SAMPLES);
 
   CCIO1.Mode(Connector::CCIO);
   CCIO1.PortOpen();
@@ -271,14 +386,16 @@ bool configure_io() {
   config_ccio_pin(LEARN_SW_LIGHT, Connector::OUTPUT_DIGITAL);
 
   home_indicator_light.setPin(CcioMgr.PinByIndex(HOME_SW_LIGHT));
+  home_indicator_light.setPeriod(50);
+  home_indicator_light.setPattern(LightPattern::OFF);
   learn_indicator_light.setPin(CcioMgr.PinByIndex(LEARN_SW_LIGHT));
+  learn_indicator_light.setPeriod(50);
+  learn_indicator_light.setPattern(LightPattern::OFF);
 
   MotorMgr.MotorInputClocking(MotorManager::CLOCK_RATE_NORMAL);
   MotorMgr.MotorModeSet(MotorManager::MOTOR_ALL, Connector::CPM_MODE_STEP_AND_DIR);
 
-  // Set the motor's HLFB mode to bipolar PWM
   CARRIAGE_MOTOR.HlfbMode(MotorDriver::HLFB_MODE_HAS_BIPOLAR_PWM);
-  // Set the HFLB carrier frequency to 482 Hz
   CARRIAGE_MOTOR.HlfbCarrier(MotorDriver::HLFB_CARRIER_482_HZ);
 
 
@@ -299,6 +416,7 @@ extern "C" void PeriodicInterrupt(void) {
   // logic so they can check if they need to be changed
   home_indicator_light.tick();
   learn_indicator_light.tick();
+
 
   // Acknowledge the interrupt to clear the flag and wait for the next interrupt.
   TCC2->INTFLAG.reg = TCC_INTFLAG_MASK; // This is critical
@@ -421,8 +539,18 @@ void set_ccio_pin(
 
 void e_stop_handler() {
   is_e_stop = true;
-  machine_state = e_stop;
   CARRIAGE_MOTOR.MoveStopAbrupt();
+  if (machine_state == wait_for_homing || machine_state == begin_homing) {
+    // If it was homing the only way to stop it is by disabling the motor,
+    // However disabling the motor will cause it to lose home and would therefore
+    // be unrecoverable. This is fine for the homing sequence but would ruin a
+    // part if it was mid sequence
+    CARRIAGE_MOTOR.EnableRequest(false);
+    is_homed = false;
+    home_indicator_light.setPattern(LightPattern::OFF);
+  }
+  machine_state = e_stop; // TODO: Make this recoverable
+  last_estop_millis = millis();
   ConnectorUsb.SendLine("Emergency Stop");
 }
 
@@ -496,3 +624,57 @@ bool MoveAbsolutePosition(const int32_t position) {
     return true;
 }
 
+/**
+ * Convert bytes to u32. Big endian, little endian?
+ * I don't know, but it works with `u32_to_bytes()`
+ * @param bytes Const; The bytes to turn into a u32
+ * @param offset Offset for accessing array
+ * @return the u32
+ */
+uint32_t bytes_to_u32(const uint8_t *bytes, const uint32_t offset) {
+  return
+      bytes[offset] << 24 |
+      bytes[offset + 1] << 16 |
+      bytes[offset + 2] << 8 |
+      bytes[offset + 3];
+}
+
+/**
+ * Convert uint32_t into bytes. Big endian, little endian?
+ * I don't know, but it works with `bytes_to_u32()`
+ * @param value The u32 to convert
+ * @param bytes Where that converted u32 should go
+ * @param offset Offset for writing to array
+ */
+void u32_to_bytes(const uint32_t value, uint8_t *bytes, const uint32_t offset) {
+  bytes[offset] = (value >> 24) & 0xFF;
+  bytes[offset+1] = (value >> 16) & 0xFF;
+  bytes[offset+2] = (value >> 8) & 0xFF;
+  bytes[offset+3] = value & 0xFF;
+}
+
+/**
+ * Takes the job from NVRAM and puts it into `saved_job_start_pos`, `saved_job_end_pos`, and `saved_job_park_pos`
+ */
+void read_job_from_nvram() {
+  NvmManager::Instance().BlockRead(NvmManager::NVM_LOC_USER_START, (sizeof NV_Ram), &NV_Ram[0]);
+  saved_job_start_pos = bytes_to_u32(NV_Ram, 0);
+  saved_job_end_pos = bytes_to_u32(NV_Ram, 4);
+  saved_job_park_pos = bytes_to_u32(NV_Ram, 8);
+}
+
+/**
+ * Take job from `temp_job_start_pos`, `temp_job_end_pos`, `temp_job_park_pos` and save it to NVRAM as well as
+ * `saved_job_start_pos`, `saved_job_end_pos`, and `saved_job_park_pos`
+ *
+ */
+void save_job_to_nvram() {
+  saved_job_start_pos = temp_job_start_pos;
+  saved_job_end_pos = temp_job_end_pos;
+  saved_job_park_pos = temp_job_park_pos;
+
+  u32_to_bytes(saved_job_start_pos, NV_Ram, 0);
+  u32_to_bytes(saved_job_end_pos, NV_Ram, 4);
+  u32_to_bytes(saved_job_park_pos, NV_Ram, 8);
+  NvmManager::Instance().BlockWrite(NvmManager::NVM_LOC_USER_START, (sizeof NV_Ram), &NV_Ram[0]);
+}
