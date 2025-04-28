@@ -99,13 +99,12 @@ void setup() {
 
   ESTOP_SW.InterruptHandlerSet(e_stop_handler, InputManager::InterruptTrigger::RISING);
 
-  Serial.begin(115200);
-  const uint32_t timeout = SERIAL_ESTABLISH_TIMEOUT;
+  ConnectorUsb.PortOpen();
   const uint32_t startTime = millis();
-  while (!Serial && millis() - startTime < timeout)
+  while (!ConnectorUsb && millis() - startTime < SERIAL_ESTABLISH_TIMEOUT)
     continue;
 
-  if (!Serial) {
+  if (!ConnectorUsb) {
     machine_state = error;
     return;
   }
@@ -114,7 +113,7 @@ void setup() {
   uint8_t delay_cycles = 10;
   while (delay_cycles--) {
     delay(1000);
-    Serial.println(delay_cycles);
+    ConnectorUsb.SendLine(delay_cycles);
   }
 
   last_iteration_time = millis();
@@ -129,8 +128,8 @@ void loop() {
   iteration_time_check();
   switch (machine_state) {
     case post:
-      Serial.println("Power on self test");
-      bool io_configure_result = configure_io();
+      ConnectorUsb.SendLine("Power on self test");
+      const bool io_configure_result = configure_io();
       if (!io_configure_result) {
         machine_state = error;
         break;
@@ -139,23 +138,23 @@ void loop() {
       break;
     case begin_homing:
       if (!is_e_stop) { // TODO: More checks
-        Serial.println("begin homing");
+        ConnectorUsb.SendLine("begin homing");
         CARRIAGE_MOTOR.EnableRequest(true);
         machine_state = wait_for_homing;
       } else {
-        Serial.println("unsafe to home");
+        ConnectorUsb.SendLine("unsafe to home");
         delay(10);
       }
       break;
     case wait_for_homing:
       if (CARRIAGE_MOTOR.HlfbState() == MotorDriver::HLFB_ASSERTED) {
         // homing done no errors
-        Serial.println("homing complete");
+        ConnectorUsb.SendLine("homing complete");
         is_homed = true;
         machine_state = idle;
       } else if (CARRIAGE_MOTOR.StatusReg().bit.AlertsPresent) {
         // motor has an error
-        Serial.println("Motor alert detected during homing.");
+        ConnectorUsb.SendLine("Motor alert detected during homing.");
         print_motor_alerts();
         machine_state = error;
       } else {
@@ -168,7 +167,7 @@ void loop() {
         break;
       }
       while (true) {
-        Serial.println("ready in idle");
+        ConnectorUsb.SendLine("ready in idle");
         delay(1000);
       }
       break;
@@ -176,13 +175,13 @@ void loop() {
       break;
     case e_stop:
       while (true) {
-        Serial.println("e-stop");
+        ConnectorUsb.SendLine("e-stop");
         delay(1000);
       }
       break;
     case error:
       while (true) {
-        Serial.println("reached error state");
+        ConnectorUsb.SendLine("reached error state");
         delay(1000);
       }
       break;
@@ -239,24 +238,24 @@ bool configure_io() {
 
   if (CcioMgr.LinkBroken()) {
     uint32_t lastStatusTime = Milliseconds();
-    Serial.println("The CCIO-8 link is broken!");
+    ConnectorUsb.SendLine("The CCIO-8 link is broken!");
 
     while (CcioMgr.LinkBroken() && Milliseconds() - lastStatusTime < CCIO_TIMEOUT_MS) {
       if (Milliseconds() - lastStatusTime > 1000) {
-        Serial.println("The CCIO-8 link is still broken!");
+        ConnectorUsb.SendLine("The CCIO-8 link is still broken!");
         lastStatusTime = Milliseconds();
       }
     }
     if (CcioMgr.LinkBroken()) {
-      Serial.println("Timed out waiting for CCIO");
+      ConnectorUsb.SendLine("Timed out waiting for CCIO");
       return false;
     }
-    Serial.println("The CCIO-8 link is online again!");
+    ConnectorUsb.SendLine("The CCIO-8 link is online again!");
   }
 
   if (CcioMgr.CcioCount() != EXPECTED_NUM_CCIO) {
-    Serial.print("Expected to find exactly one CCIO connector, found ");
-    Serial.println(CcioMgr.CcioCount());
+    ConnectorUsb.Send("Expected to find exactly one CCIO connector, found ");
+    ConnectorUsb.SendLine(CcioMgr.CcioCount());
     return false;
   }
 
@@ -307,16 +306,18 @@ void iteration_time_check() {
   last_iteration_delta = millis()-last_iteration_time;
   last_iteration_time = millis();
   if (last_iteration_delta >= ITERATION_TIME_ERROR_MS) {
-    Serial.println("Last iteration of the state machine took more than "
-                   "`ITERATION_TIME_ERROR_MS` (" + String(ITERATION_TIME_ERROR_MS) + "ms) to complete. "
-                   "This is likely a bug. Last iteration took " + String(last_iteration_delta) + "ms. "
-                   "Engaging E-Stop and stopping execution");
+    ConnectorUsb.Send("Last iteration of the state machine took more than `ITERATION_TIME_ERROR_MS` (");
+    ConnectorUsb.Send(ITERATION_TIME_ERROR_MS);
+    ConnectorUsb.Send("ms) to complete. This is likely a bug. Last iteration took ");
+    ConnectorUsb.Send(last_iteration_delta);
+    ConnectorUsb.Send("ms. Engaging E-Stop and stopping execution\n");
     machine_state = e_stop;
   } else if (last_iteration_delta >= ITERATION_TIME_WARNING_MS) {
-    Serial.println("Last iteration of the state machine took more than "
-                   "`ITERATION_TIME_WARNING_MS` (" + String(ITERATION_TIME_WARNING_MS) + "ms) to complete. "
-                   "This is likely a bug. Last iteration took " + String(last_iteration_delta) + "ms. "
-                   "Continuing execution");
+    ConnectorUsb.Send("Last iteration of the state machine took more than `ITERATION_TIME_WARNING_MS` (");
+    ConnectorUsb.Send(ITERATION_TIME_WARNING_MS);
+    ConnectorUsb.Send("ms) to complete. This is likely a bug. Last iteration took ");
+    ConnectorUsb.Send(last_iteration_delta);
+    ConnectorUsb.Send("ms. Continuing execution");
   }
 }
 
@@ -416,7 +417,7 @@ void e_stop_handler() {
   is_e_stop = true;
   machine_state = e_stop;
   CARRIAGE_MOTOR.MoveStopAbrupt();
-  Serial.println("Emergency Stop");
+  ConnectorUsb.SendLine("Emergency Stop");
 }
 
 
@@ -428,19 +429,19 @@ void e_stop_handler() {
  */
 void print_motor_alerts(){
   // report status of alerts
-  Serial.println("ClearPath Alerts present: ");
+  ConnectorUsb.SendLine("ClearPath Alerts present: ");
   if(CARRIAGE_MOTOR.AlertReg().bit.MotionCanceledInAlert){
-    Serial.println("    MotionCanceledInAlert "); }
+    ConnectorUsb.SendLine("    MotionCanceledInAlert "); }
   if(CARRIAGE_MOTOR.AlertReg().bit.MotionCanceledPositiveLimit){
-    Serial.println("    MotionCanceledPositiveLimit "); }
+    ConnectorUsb.SendLine("    MotionCanceledPositiveLimit "); }
   if(CARRIAGE_MOTOR.AlertReg().bit.MotionCanceledNegativeLimit){
-    Serial.println("    MotionCanceledNegativeLimit "); }
+    ConnectorUsb.SendLine("    MotionCanceledNegativeLimit "); }
   if(CARRIAGE_MOTOR.AlertReg().bit.MotionCanceledSensorEStop){
-    Serial.println("    MotionCanceledSensorEStop "); }
+    ConnectorUsb.SendLine("    MotionCanceledSensorEStop "); }
   if(CARRIAGE_MOTOR.AlertReg().bit.MotionCanceledMotorDisabled){
-    Serial.println("    MotionCanceledMotorDisabled "); }
+    ConnectorUsb.SendLine("    MotionCanceledMotorDisabled "); }
   if(CARRIAGE_MOTOR.AlertReg().bit.MotorFaulted){
-    Serial.println("    MotorFaulted ");
+    ConnectorUsb.SendLine("    MotorFaulted ");
   }
 }
 
@@ -459,33 +460,33 @@ bool MoveAbsolutePosition(const int32_t position) {
     // Check if a motor alert is currently preventing motion
     // Clear alert if configured to do so 
     if (CARRIAGE_MOTOR.StatusReg().bit.AlertsPresent) {
-        Serial.println("Motor alert detected.");       
+        ConnectorUsb.SendLine("Motor alert detected.");       
         print_motor_alerts();
-        Serial.println("Move canceled.");
-        Serial.println();
+        ConnectorUsb.SendLine("Move canceled.");
+        ConnectorUsb.SendLine();
         return false;
     }
 
-    Serial.print("Moving to absolute position: ");
-    Serial.println(position);
+    ConnectorUsb.Send("Moving to absolute position: ");
+    ConnectorUsb.SendLine(position);
 
     // Command the move of absolute distance
     CARRIAGE_MOTOR.Move(position, MotorDriver::MOVE_TARGET_ABSOLUTE);
 
     // Waits for HLFB to assert (signaling the move has successfully completed)
-    Serial.println("Moving.. Waiting for HLFB");
+    ConnectorUsb.SendLine("Moving.. Waiting for HLFB");
     while ( (!CARRIAGE_MOTOR.StepsComplete() || CARRIAGE_MOTOR.HlfbState() != MotorDriver::HLFB_ASSERTED) &&
             !CARRIAGE_MOTOR.StatusReg().bit.AlertsPresent) {}
     // Check if motor alert occurred during move
     // Clear alert if configured to do so
     if (CARRIAGE_MOTOR.StatusReg().bit.AlertsPresent) {
-        Serial.println("Motor alert detected.");
+        ConnectorUsb.SendLine("Motor alert detected.");
         print_motor_alerts();
-        Serial.println("Motion may not have completed as expected. Proceed with caution.");
-        Serial.println();
+        ConnectorUsb.SendLine("Motion may not have completed as expected. Proceed with caution.");
+        ConnectorUsb.SendLine();
         return false;
     }
-    Serial.println("Move Done");
+    ConnectorUsb.SendLine("Move Done");
     return true;
 }
 
