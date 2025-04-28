@@ -29,7 +29,8 @@ enum PlanishStates {
   error,                  // unrecoverable error has occurred and machine needs to reboot. should be a dead end state
 
   job_start,              // Job started, move to saved start pos
-  job_planish,            // Start position reached, engage roller and move to end pos
+  job_planish_1,          // Start position reached, engage roller and move to end pos
+  job_planish_2,          // In full cycle only, do another pass going back to the beginning
   job_park,               // Planish finished, disengage roller and jog to park
 
   learn_start_pos,        // Learn has been pressed, set start point
@@ -98,6 +99,9 @@ extern "C" void TCC2_0_Handler(void) __attribute__((
 void setup() {
 
   ESTOP_SW.InterruptHandlerSet(e_stop_handler, InputManager::InterruptTrigger::RISING);
+  if (ESTOP_SW.State()) { // make sure e-stop wasn't already depressed before interrupt was registered
+    e_stop_handler();
+  }
 
   ConnectorUsb.PortOpen();
   const uint32_t startTime = millis();
@@ -162,7 +166,7 @@ void loop() {
       }
       break;
     case idle:
-      if (HOME_SW.InputRisen()) {
+      if (HOME_SW.InputRisen() || HOME_SW.State()) {
         machine_state = begin_homing;
         break;
       }
@@ -187,7 +191,9 @@ void loop() {
       break;
     case job_start:
       break;
-    case job_planish:
+    case job_planish_1:
+      break;
+    case job_planish_2:
       break;
     case job_park:
       break;
