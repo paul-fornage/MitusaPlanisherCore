@@ -35,25 +35,35 @@ uint32_t saved_job_park_pos = 0;            // Park position for learn mode
 uint8_t NV_Ram[12];                    // NVram Max Available is `416 bytes of user data
 
 enum PlanishStates {
-  post,                   // Power On Self Test
-  begin_homing,           // start axis homing
-  wait_for_homing,        // Wait for homing to complete
-  idle,                   // Idle await instructions
-  manual_jog,             // manually commanded jog
-  e_stop,                 // E-stop currently active
-  error,                  // unrecoverable error has occurred and machine needs to reboot. should be a dead end state
+  post,                       // Power On Self Test
+  begin_homing,               // start axis homing
+  wait_for_homing,            // Wait for homing to complete
+  idle,                       // Idle await instructions
+  manual_jog,                 // manually commanded jog
+  e_stop,                     // E-stop currently active
+  error,                      // unrecoverable error has occurred and machine needs to reboot. should be a dead end state
 
-  job_start,              // Job started, move to saved start pos
-  job_planish_1,          // Start position reached, engage roller and move to end pos
-  job_planish_2,          // In full cycle only, do another pass going back to the beginning
-  job_park,               // Planish finished, disengage roller and jog to park
+  job_begin,                  // Job has been started, check initial configuration
+  job_begin_lifting_head,     // Job was started with head down, wait for it to lift
+  job_jog_to_start,           // Job started, move to saved start pos
+  job_jog_to_start_wait,      // Wait for carriage to arrive at start
+  job_head_down,              // Engage the planisher
+  job_head_down_wait,         // Wait for the planisher to be engaged
+  job_planish_to_end,         // Move carriage to the end position
+  job_planish_to_end_wait,    // wait for carriage to arrive at end position
+  job_planish_to_start,       // In full cycle mode, go back to the start with planisher engaged
+  job_planish_to_start_wait,  // Wait for carriage to arrive at start
+  job_head_up,                // Raise the head / disengage roller
+  job_head_up_wait,           // Wait for head to be up
+  job_jog_to_park,            // Move to park position
+  job_jog_to_park_wait,       // Wait until carriage arrives at park position
 
-  learn_start_pos,        // Learn has been pressed, set start point
-  learn_jog_to_end_pos,   // Manually jogging to end position
-  learn_end_pos,          // Learn was pressed again, set end position
-  learn_jog_to_park_pos,  // Manually jogging to park position
-  learn_park_pos,         // Learn was pressed again, set park position
-  saving_job_to_nvram,      // Job is recorded and needs to be saved in NVRAM
+  learn_start_pos,            // Learn has been pressed, set start point
+  learn_jog_to_end_pos,       // Manually jogging to end position
+  learn_end_pos,              // Learn was pressed again, set end position
+  learn_jog_to_park_pos,      // Manually jogging to park position
+  learn_park_pos,             // Learn was pressed again, set park position
+  saving_job_to_nvram,        // Job is recorded and needs to be saved in NVRAM
 };
 
 volatile PlanishStates machine_state;
@@ -66,7 +76,7 @@ volatile IndicatorLight learn_indicator_light;  /// Defined globally, but should
 #define LEARN_SW ConnectorA10
 #define SPEED_POT ConnectorA9
 #define MANDREL_LATCH_LMT ConnectorDI8
-#define SINGLE_CYCLE_SW ConnectorDI7
+#define HALF_CYCLE_SW ConnectorDI7
 #define HEAD_UP_LMT ConnectorDI6
 #define HOME_SW ConnectorIO0
 #define CYCLE_SW ConnectorIO1
@@ -91,6 +101,7 @@ volatile IndicatorLight learn_indicator_light;  /// Defined globally, but should
 #define CARRIAGE_MOTOR_MAX_ACCEL 50000
 #define CARRIAGE_MOTOR_MAX_VEL 5000
 #define CARRIAGE_MOTOR_MAX_POS 12000
+#define CARRIAGE_MOTOR_PLANISH_VEL 2000
 
 #define ITERATION_TIME_WARNING_MS 100 // after this many milliseconds stuck on one iteration of the state machine, give a warning.
 #define ITERATION_TIME_ERROR_MS 1000  // after this many milliseconds stuck on one iteration of the state machine, declare an error
@@ -119,6 +130,7 @@ uint32_t bytes_to_u32(const uint8_t bytes[4], uint32_t offset = 0);
 void u32_to_bytes(uint32_t value, uint8_t bytes[4], uint32_t offset = 0);
 void read_job_from_nvram();
 void save_job_to_nvram();
+bool wait_for_motion();
 
 extern "C" void TCC2_0_Handler(void) __attribute__((
             alias("PeriodicInterrupt")));
@@ -220,14 +232,18 @@ void loop() {
           if (JOG_FWD_SW.State() == JOG_FWD_SW_ACTIVE_STATE
               || JOG_REV_SW.State() == JOG_REV_SW_ACTIVE_STATE) {
             machine_state = manual_jog;
+            break;
           }
           if (LEARN_SW.InputRisen() || LEARN_SW.State()) {
             machine_state = learn_start_pos;
+            break;
+          }
+          if (CYCLE_SW.InputRisen() || CYCLE_SW.State()) {
+            machine_state = job_begin;
+            break;
           }
         }
       }
-
-
       break;
     case manual_jog:
       if (!is_e_stop && MANDREL_LATCH_LMT.State() && is_homed) {
@@ -257,13 +273,95 @@ void loop() {
         delay(1000);
       }
       break;
-    case job_start:
+    case job_begin:
+      set_ccio_pin(HEAD_ACTUATION, false);
+      if (HEAD_UP_LMT.State()) {
+        machine_state = job_jog_to_start;
+      } else {
+        machine_state = job_begin_lifting_head;
+      }
       break;
-    case job_planish_1:
+    case job_begin_lifting_head:
+      if (is_e_stop || !MANDREL_LATCH_LMT.State() || !is_homed) {
+        // TODO: this should be recoverable
+        ConnectorUsb.SendLine("preconditions failed since starting job");
+        machine_state = error;
+        break;
+      }
+      if (HEAD_UP_LMT.State()) {
+        machine_state = job_jog_to_start;
+      }
       break;
-    case job_planish_2:
+    case job_jog_to_start:
+      set_ccio_pin(HEAD_ACTUATION, false); // lift the head if it was down
+      CARRIAGE_MOTOR.Move(saved_job_start_pos, StepGenerator::MOVE_TARGET_ABSOLUTE);
+      machine_state = job_jog_to_start_wait;
       break;
-    case job_park:
+    case job_jog_to_start_wait:
+      if (wait_for_motion()) {
+        machine_state = job_head_down;
+      }
+      break;
+    case job_head_down:
+      set_ccio_pin(HEAD_ACTUATION, true);
+      break;
+    case job_head_down_wait:
+      if (is_e_stop || !MANDREL_LATCH_LMT.State() || !is_homed) {
+        // TODO: this should be recoverable
+        ConnectorUsb.SendLine("preconditions failed since starting job");
+        machine_state = error;
+        break;
+      }
+      if (!HEAD_UP_LMT.State()) {
+        machine_state = job_planish_to_end;
+      }
+      break;
+    case job_planish_to_end:
+      CARRIAGE_MOTOR.VelMax(CARRIAGE_MOTOR_PLANISH_VEL);
+      CARRIAGE_MOTOR.Move(saved_job_end_pos, StepGenerator::MOVE_TARGET_ABSOLUTE);
+      break;
+    case job_planish_to_end_wait:
+      if (wait_for_motion()) {
+        if (HALF_CYCLE_SW.State()) {
+          // if only doing a half-cycle, the single pass thus far is sufficient. retract head and return to park
+          machine_state = job_head_up;
+        } else {
+          // otherwise do the other pass
+          machine_state = job_planish_to_start;
+        }
+      }
+      break;
+    case job_planish_to_start:
+      CARRIAGE_MOTOR.VelMax(CARRIAGE_MOTOR_PLANISH_VEL);
+      CARRIAGE_MOTOR.Move(saved_job_start_pos, StepGenerator::MOVE_TARGET_ABSOLUTE);
+      break;
+    case job_planish_to_start_wait:
+      if (wait_for_motion()) {
+        machine_state = job_head_up;
+      }
+      break;
+    case job_head_up:
+      set_ccio_pin(HEAD_ACTUATION, false);
+      break;
+    case job_head_up_wait:
+      if (is_e_stop || !MANDREL_LATCH_LMT.State() || !is_homed) {
+        // TODO: this should be recoverable
+        ConnectorUsb.SendLine("preconditions failed since starting job");
+        machine_state = error;
+        break;
+      }
+      if (HEAD_UP_LMT.State()) {
+        machine_state = job_jog_to_park;
+      }
+      break;
+    case job_jog_to_park:
+      CARRIAGE_MOTOR.VelMax(CARRIAGE_MOTOR_MAX_VEL);
+      CARRIAGE_MOTOR.Move(saved_job_park_pos, StepGenerator::MOVE_TARGET_ABSOLUTE);
+      break;
+    case job_jog_to_park_wait:
+      if (wait_for_motion()) {
+        machine_state = idle;
+      }
       break;
     case learn_start_pos:
       learn_indicator_light.setPattern(LightPattern::FLASH1);
@@ -332,6 +430,7 @@ void loop() {
   // Unlatch input button states
   LEARN_SW.InputRisen();
   HOME_SW.InputRisen();
+  CYCLE_SW.InputRisen();
 }
 
 /**
@@ -344,7 +443,7 @@ bool configure_io() {
   LEARN_SW.Mode(Connector::INPUT_DIGITAL);
   SPEED_POT.Mode(Connector::INPUT_ANALOG);
   MANDREL_LATCH_LMT.Mode(Connector::INPUT_DIGITAL);
-  SINGLE_CYCLE_SW.Mode(Connector::INPUT_DIGITAL);
+  HALF_CYCLE_SW.Mode(Connector::INPUT_DIGITAL);
   HEAD_UP_LMT.Mode(Connector::INPUT_DIGITAL);
   HOME_SW.Mode(Connector::INPUT_DIGITAL);
   CYCLE_SW.Mode(Connector::INPUT_DIGITAL);
@@ -407,6 +506,31 @@ bool configure_io() {
   return true;
 }
 
+/**
+ * After commanding motion as part of a job, this is just a helper for waiting for that motion to complete.
+ * It will return true when completed successfully, and false if not done or has an error.
+ * Error states are automatically dealt with, assuming the next thing that happens is
+ * a new iteration of the state loop.
+ */
+bool wait_for_motion() {
+  if (CARRIAGE_MOTOR.HlfbState() == MotorDriver::HLFB_ASSERTED) {
+    return true;
+  }
+  if (CARRIAGE_MOTOR.StatusReg().bit.AlertsPresent) {
+    // motor has an error
+    ConnectorUsb.SendLine("Motor alert detected during homing.");
+    print_motor_alerts();
+    machine_state = error;
+    return false;
+  }
+  if (is_e_stop || !MANDREL_LATCH_LMT.State() || !is_homed) {
+    // TODO: this should be recoverable
+    ConnectorUsb.SendLine("preconditions failed since starting job");
+    machine_state = error;
+    return false;
+  }
+  return false;
+}
 
 /**
  * Interrupt handler gets automatically called every ms
