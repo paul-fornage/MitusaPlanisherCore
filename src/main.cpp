@@ -11,12 +11,15 @@
 #include "NvmManager.h"
 #include "ClearCore.h"
 #include "indicator_light.h"
+#include "button.h"
 
 
 bool is_homed = false;                  // Has the axis been homed
 volatile bool is_e_stop = false;               // Is the Emergency Stop currently active
 bool is_fingers_down = false;                  // Is the finger actuation currently active
-bool is_head_commanded_down = true;            // Is the head currently commanded down 
+bool is_head_commanded_down = true;            // Is the head currently commanded down
+
+bool io_configured = false;                  // Has the IO been configured
 
 uint32_t last_iteration_delta;          // Time spent on the last iteration of the main loop in millis
 uint32_t last_iteration_time;           // Time of the last iteration of the main loop in millis
@@ -102,9 +105,9 @@ volatile IndicatorLight learn_indicator_light;  /// Defined globally, but should
 #define CCIO_TIMEOUT_MS 10000 // Number of ms to wait for CCIO to connect before failing POST
 
 #define CARRIAGE_MOTOR_MAX_ACCEL 50000
-#define CARRIAGE_MOTOR_MAX_VEL 1000
+#define CARRIAGE_MOTOR_MAX_VEL 4000
 #define CARRIAGE_MOTOR_MAX_POS 12000
-#define CARRIAGE_MOTOR_PLANISH_VEL 500
+#define CARRIAGE_MOTOR_MAX_PLANISH_VEL 2000
 
 #define ITERATION_TIME_WARNING_MS 100 // after this many milliseconds stuck on one iteration of the state machine, give a warning.
 #define ITERATION_TIME_ERROR_MS 1000  // after this many milliseconds stuck on one iteration of the state machine, declare an error
@@ -119,7 +122,10 @@ volatile IndicatorLight learn_indicator_light;  /// Defined globally, but should
 #define JOG_FWD_SW_ACTIVE_STATE 0
 #define JOG_REV_SW_ACTIVE_STATE 0
 
-
+Button LearnButton;
+Button HomeButton;
+Button CycleButton;
+Button FingerButton;
 
 bool configure_io();
 void e_stop_handler();
@@ -138,6 +144,7 @@ void set_finger_state(bool state);
 void set_head_state(bool state);
 bool move_motor_with_speed(int32_t position, int32_t speed);
 void motor_jog(bool reverse);
+void update_buttons();
 
 extern "C" void TCC2_0_Handler(void) __attribute__((
             alias("PeriodicInterrupt")));
@@ -177,23 +184,35 @@ void setup() {
   ConnectorUsb.SendLine(saved_job_end_pos);
   ConnectorUsb.SendLine(saved_job_park_pos);
 
+  io_configured = configure_io();
+
+  if (io_configured) {
+    // do this twice so that the buffer only contains measured values
+    update_buttons();
+    update_buttons();
+  }
+
   last_iteration_time = millis();
   machine_state = post;
-
 }
 
 
 void loop() {
+  // TODO: Delay state?
   loop_num++;
 
-  // TODO: Check and latch input button states if high
+  if (io_configured) {
+    // on the first execution it is possible that IO is not configured
+    update_buttons();
+  }
 
   iteration_time_check();
   switch (machine_state) {
     case post:
       ConnectorUsb.SendLine("Power on self test");
       // Configure the IO and make sure it was successful
-      if (!configure_io()) {
+      if (!io_configured) {
+        ConnectorUsb.SendLine("IO was not configured successfully, hanging");
         machine_state = error;
         break;
       }
@@ -202,8 +221,9 @@ void loop() {
     case begin_homing:
       ConnectorUsb.SendLine("begin homing");
       CARRIAGE_MOTOR.EnableRequest(false);
-      delay(10);
+      delay(10); // TODO: remove delays where possible
       CARRIAGE_MOTOR.EnableRequest(true);
+      delay(5);
       home_indicator_light.setPattern(LightPattern::BLINK);
       machine_state = wait_for_homing;
       break;
@@ -217,6 +237,13 @@ void loop() {
         machine_state = idle;
       } else if (CARRIAGE_MOTOR.StatusReg().bit.AlertsPresent) {
         // motor has an error
+
+        if(CARRIAGE_MOTOR.AlertReg().bit.MotionCanceledMotorDisabled) {
+          // TODO: If homing requirement for jogging gets removed, this needs updating
+          ConnectorUsb.SendLine("Motor was commanded to move before enabling."
+                                "depending on how the code turns out this might not be problematic");
+        }
+
         ConnectorUsb.SendLine("Motor alert detected during homing.");
         print_motor_alerts();
         machine_state = error;
@@ -231,12 +258,14 @@ void loop() {
       //   ConnectorUsb.SendLine(CARRIAGE_MOTOR.PositionRefCommanded());
       // }
       if (!is_e_stop && MANDREL_LATCH_LMT.State()) {
-        if (HOME_SW.InputRisen() || HOME_SW.State()) {
+        if (HomeButton.is_rising()) {
           machine_state = begin_homing;
           break;
         }
-        if (FINGER_SW.InputRisen() || FINGER_SW.State()) {
-          set_finger_state(!is_fingers_down);
+        if (FingerButton.is_rising()) {
+          const bool new_finger_state = !is_fingers_down;
+          ConnectorUsb.SendLine(new_finger_state ? "Engaging fingers" : "Disengaging fingers");
+          set_finger_state(new_finger_state);
         }
         if (HEAD_SW.State() == HEAD_UP_LMT.State()) {
           // Despite the '==' in that expression, this check is to see if there is a MISMATCH between
@@ -251,15 +280,11 @@ void loop() {
             machine_state = manual_jog;
             break;
           }
-          if (LEARN_SW.InputRisen() || LEARN_SW.State()) {
+          if (LearnButton.is_rising()) {
             machine_state = learn_start_pos;
             break;
           }
-
-          if (FINGER_SW.InputRisen() || FINGER_SW.State()) {
-            set_finger_state(true);
-          }
-          if (CYCLE_SW.InputRisen() || CYCLE_SW.State()) {
+          if (CycleButton.is_rising()) {
             if (is_fingers_down) {
               machine_state = job_begin;
               break;
@@ -347,6 +372,7 @@ void loop() {
     case job_head_down:
       ConnectorUsb.SendLine("Lowering head");
       set_head_state(true);
+      machine_state = job_head_down_wait;
       break;
     case job_head_down_wait:
       if (is_e_stop || !MANDREL_LATCH_LMT.State() || !is_homed) {
@@ -364,7 +390,8 @@ void loop() {
       break;
     case job_planish_to_end:
       ConnectorUsb.SendLine("Planishing to end position");
-      move_motor_with_speed(saved_job_end_pos, CARRIAGE_MOTOR_PLANISH_VEL);
+      move_motor_with_speed(saved_job_end_pos, CARRIAGE_MOTOR_MAX_PLANISH_VEL);
+      machine_state = job_planish_to_end_wait;
       break;
     case job_planish_to_end_wait:
       if (wait_for_motion()) {
@@ -384,7 +411,8 @@ void loop() {
       break;
     case job_planish_to_start:
       ConnectorUsb.SendLine("Begin planishing to start position");
-      move_motor_with_speed(saved_job_start_pos, CARRIAGE_MOTOR_PLANISH_VEL);
+      move_motor_with_speed(saved_job_start_pos, CARRIAGE_MOTOR_MAX_PLANISH_VEL);
+      machine_state = job_planish_to_start_wait;
       break;
     case job_planish_to_start_wait:
       if (wait_for_motion()) {
@@ -397,6 +425,7 @@ void loop() {
     case job_head_up:
       ConnectorUsb.SendLine("Raising head");
       set_head_state(false);
+      machine_state = job_head_up_wait;
       break;
     case job_head_up_wait:
       if (is_e_stop || !MANDREL_LATCH_LMT.State() || !is_homed) {
@@ -415,6 +444,7 @@ void loop() {
     case job_jog_to_park:
       ConnectorUsb.SendLine("Begin jogging to park position");
       move_motor_with_speed(saved_job_park_pos, CARRIAGE_MOTOR_MAX_VEL);
+      machine_state = job_jog_to_park_wait;
       break;
     case job_jog_to_park_wait:
       if (wait_for_motion()) {
@@ -432,7 +462,7 @@ void loop() {
       break;
     case learn_jog_to_end_pos:
       if (!is_e_stop && MANDREL_LATCH_LMT.State() && is_homed) {
-        if (LEARN_SW.InputRisen() || LEARN_SW.State()) {
+        if (LearnButton.is_rising()) {
           machine_state = learn_end_pos;
           break;
         }
@@ -455,7 +485,7 @@ void loop() {
       break;
     case learn_jog_to_park_pos:
       if (!is_e_stop && MANDREL_LATCH_LMT.State() && is_homed) {
-        if (LEARN_SW.InputRisen() || LEARN_SW.State()) {
+        if (LearnButton.is_rising()) {
           machine_state = learn_park_pos;
           break;
         }
@@ -487,12 +517,6 @@ void loop() {
       machine_state = idle;
       break;
   }
-
-  // Unlatch input button states
-  LEARN_SW.InputRisen();
-  HOME_SW.InputRisen();
-  CYCLE_SW.InputRisen();
-  FINGER_SW.InputRisen();
 }
 
 /**
@@ -563,6 +587,9 @@ bool configure_io() {
   CARRIAGE_MOTOR.VelMax(CARRIAGE_MOTOR_MAX_VEL);
   CARRIAGE_MOTOR.AccelMax(CARRIAGE_MOTOR_MAX_ACCEL);
 
+  set_finger_state(false);
+  set_head_state(false);
+
   ConfigurePeriodicInterrupt(1000);
 
   return true;
@@ -575,7 +602,9 @@ bool configure_io() {
  * a new iteration of the state loop.
  */
 bool wait_for_motion() {
-  if (CARRIAGE_MOTOR.HlfbState() == MotorDriver::HLFB_ASSERTED) {
+  if (CARRIAGE_MOTOR.HlfbState() == MotorDriver::HLFB_ASSERTED
+      && CARRIAGE_MOTOR.StepsComplete()) {
+    ConnectorUsb.SendLine("Motor has completed motion");
     return true;
   }
   if (CARRIAGE_MOTOR.StatusReg().bit.AlertsPresent) {
@@ -586,7 +615,7 @@ bool wait_for_motion() {
     return false;
   }
   if (is_e_stop || !MANDREL_LATCH_LMT.State() || !is_homed) {
-    // TODO: this should be recoverable
+    // TODO: this should be recoverable, and treated as an e-stop
     ConnectorUsb.SendLine("preconditions failed since starting job");
     machine_state = error;
     return false;
@@ -854,12 +883,27 @@ bool move_motor_with_speed(const int32_t position, const int32_t speed) {
   ConnectorUsb.Send(");");
   CARRIAGE_MOTOR.VelMax(speed);
   return CARRIAGE_MOTOR.Move(position, StepGenerator::MOVE_TARGET_ABSOLUTE);
+  // TODO: wait until HLFB De-asserts, assuming it should. (moving to current position would otherwise hang)
 }
 
 void motor_jog(const bool reverse) {
   if (HEAD_UP_LMT.State()) {
     CARRIAGE_MOTOR.MoveVelocity(reverse ? -CARRIAGE_MOTOR_MAX_VEL : CARRIAGE_MOTOR_MAX_VEL);
   } else {
-    CARRIAGE_MOTOR.MoveVelocity(reverse ? -CARRIAGE_MOTOR_PLANISH_VEL : CARRIAGE_MOTOR_PLANISH_VEL);
+    CARRIAGE_MOTOR.MoveVelocity(reverse ? -CARRIAGE_MOTOR_MAX_PLANISH_VEL : CARRIAGE_MOTOR_MAX_PLANISH_VEL);
   }
+}
+
+/**
+ * Updates the button states at once. This is done to make sure that on
+ * every iteration of the state machine loop, the button can be guaranteed
+ * to have risen THAT loop and not previously.
+ *
+ * @pre IO has been configured
+ */
+void update_buttons() {
+  LearnButton.new_reading(LEARN_SW.State());
+  HomeButton.new_reading(HOME_SW.State());
+  CycleButton.new_reading(CYCLE_SW.State());
+  FingerButton.new_reading(FINGER_SW.State());
 }
