@@ -14,8 +14,9 @@
 
 
 bool is_homed = false;                  // Has the axis been homed
-volatile bool is_e_stop = false;                // Is the Emergency Stop currently active
+volatile bool is_e_stop = false;               // Is the Emergency Stop currently active
 bool is_fingers_down = false;                  // Is the finger actuation currently active
+bool is_head_commanded_down = true;            // Is the head currently commanded down 
 
 uint32_t last_iteration_delta;          // Time spent on the last iteration of the main loop in millis
 uint32_t last_iteration_time;           // Time of the last iteration of the main loop in millis
@@ -43,6 +44,7 @@ enum PlanishStates {
   manual_jog,                 // manually commanded jog
   e_stop,                     // E-stop currently active
   error,                      // unrecoverable error has occurred and machine needs to reboot. should be a dead end state
+  wait_for_head,              // Me asf
 
   job_begin,                  // Job has been started, check initial configuration
   job_begin_lifting_head,     // Job was started with head down, wait for it to lift
@@ -133,6 +135,8 @@ void read_job_from_nvram();
 void save_job_to_nvram();
 bool wait_for_motion();
 void set_finger_state(bool state);
+void set_head_state(bool state);
+bool move_motor_with_speed(int32_t position, int32_t speed);
 
 extern "C" void TCC2_0_Handler(void) __attribute__((
             alias("PeriodicInterrupt")));
@@ -230,6 +234,16 @@ void loop() {
           machine_state = begin_homing;
           break;
         }
+        if (FINGER_SW.InputRisen() || FINGER_SW.State()) {
+          set_finger_state(!is_fingers_down);
+        }
+        if (HEAD_SW.State() == HEAD_UP_LMT.State()) {
+          // Despite the '==' in that expression, this check is to see if there is a MISMATCH between
+          // measured and commanded head state.
+          set_head_state(HEAD_SW.State());
+          machine_state = wait_for_head;
+          break;
+        }
         if (is_homed) {
           if (JOG_FWD_SW.State() == JOG_FWD_SW_ACTIVE_STATE
               || JOG_REV_SW.State() == JOG_REV_SW_ACTIVE_STATE) {
@@ -244,15 +258,26 @@ void loop() {
           if (FINGER_SW.InputRisen() || FINGER_SW.State()) {
             set_finger_state(true);
           }
-          if (is_fingers_down) {
-            if (CYCLE_SW.InputRisen() || CYCLE_SW.State()) {
+          if (CYCLE_SW.InputRisen() || CYCLE_SW.State()) {
+            if (is_fingers_down) {
               machine_state = job_begin;
               break;
+            } else {
+              ConnectorUsb.SendLine("Tried to start cycle without fingers engaged");
             }
           }
         }
       }
       break;
+    case wait_for_head:
+      if (loop_num%512==0) {
+        ConnectorUsb.Send("Waiting for head. Currently commanded ");
+        ConnectorUsb.SendLine(is_head_commanded_down ? "down." : "up.");
+      }
+      if (is_head_commanded_down != HEAD_UP_LMT.State()) {
+        machine_state = idle;
+      }
+      break;  
     case manual_jog:
       if (!is_e_stop && MANDREL_LATCH_LMT.State() && is_homed) {
         if (JOG_FWD_SW.State() == JOG_FWD_SW_ACTIVE_STATE) {
@@ -282,10 +307,12 @@ void loop() {
       }
       break;
     case job_begin:
-      set_ccio_pin(HEAD_ACTUATION, false);
+      set_head_state(false);
       if (HEAD_UP_LMT.State()) {
+        ConnectorUsb.SendLine("Job started head was already up");
         machine_state = job_jog_to_start;
       } else {
+        ConnectorUsb.SendLine("Job was started but the head was already down, raising");
         machine_state = job_begin_lifting_head;
       }
       break;
@@ -299,19 +326,26 @@ void loop() {
       if (HEAD_UP_LMT.State()) {
         machine_state = job_jog_to_start;
       }
+      if (loop_num%512==0) {
+        ConnectorUsb.SendLine("Waiting for head to rise for job start");
+      }
       break;
     case job_jog_to_start:
-      set_ccio_pin(HEAD_ACTUATION, false); // lift the head if it was down
-      CARRIAGE_MOTOR.Move(saved_job_start_pos, StepGenerator::MOVE_TARGET_ABSOLUTE);
+      ConnectorUsb.SendLine("Jog to start");
+      move_motor_with_speed(saved_job_start_pos, CARRIAGE_MOTOR_MAX_VEL);
       machine_state = job_jog_to_start_wait;
       break;
     case job_jog_to_start_wait:
       if (wait_for_motion()) {
         machine_state = job_head_down;
       }
+      if (loop_num%512==0) {
+        ConnectorUsb.SendLine("waiting for jog to start");
+      }
       break;
     case job_head_down:
-      set_ccio_pin(HEAD_ACTUATION, true);
+      ConnectorUsb.SendLine("Lowering head");
+      set_head_state(true);
       break;
     case job_head_down_wait:
       if (is_e_stop || !MANDREL_LATCH_LMT.State() || !is_homed) {
@@ -323,33 +357,45 @@ void loop() {
       if (!HEAD_UP_LMT.State()) {
         machine_state = job_planish_to_end;
       }
+      if (loop_num%512==0) {
+        ConnectorUsb.SendLine("Waiting for head to lower to begin planish");
+      }
       break;
     case job_planish_to_end:
-      CARRIAGE_MOTOR.VelMax(CARRIAGE_MOTOR_PLANISH_VEL);
-      CARRIAGE_MOTOR.Move(saved_job_end_pos, StepGenerator::MOVE_TARGET_ABSOLUTE);
+      ConnectorUsb.SendLine("Planishing to end position");
+      move_motor_with_speed(saved_job_end_pos, CARRIAGE_MOTOR_PLANISH_VEL);
       break;
     case job_planish_to_end_wait:
       if (wait_for_motion()) {
         if (HALF_CYCLE_SW.State()) {
+          ConnectorUsb.SendLine("half cycle detected, go to park");
           // if only doing a half-cycle, the single pass thus far is sufficient. retract head and return to park
           machine_state = job_head_up;
         } else {
+          ConnectorUsb.SendLine("full cycle detected, do second pass");
           // otherwise do the other pass
           machine_state = job_planish_to_start;
         }
       }
+      if (loop_num%512==0) {
+        ConnectorUsb.SendLine("Planishing to end position");
+      }
       break;
     case job_planish_to_start:
-      CARRIAGE_MOTOR.VelMax(CARRIAGE_MOTOR_PLANISH_VEL);
-      CARRIAGE_MOTOR.Move(saved_job_start_pos, StepGenerator::MOVE_TARGET_ABSOLUTE);
+      ConnectorUsb.SendLine("Begin planishing to start position");
+      move_motor_with_speed(saved_job_start_pos, CARRIAGE_MOTOR_PLANISH_VEL);
       break;
     case job_planish_to_start_wait:
       if (wait_for_motion()) {
         machine_state = job_head_up;
       }
+      if (loop_num%512==0) {
+        ConnectorUsb.SendLine("Planishing to start position");
+      }
       break;
     case job_head_up:
-      set_ccio_pin(HEAD_ACTUATION, false);
+      ConnectorUsb.SendLine("Raising head");
+      set_head_state(false);
       break;
     case job_head_up_wait:
       if (is_e_stop || !MANDREL_LATCH_LMT.State() || !is_homed) {
@@ -361,14 +407,20 @@ void loop() {
       if (HEAD_UP_LMT.State()) {
         machine_state = job_jog_to_park;
       }
+      if (loop_num%512==0) {
+        ConnectorUsb.SendLine("Waiting for head to raise to park");
+      }
       break;
     case job_jog_to_park:
-      CARRIAGE_MOTOR.VelMax(CARRIAGE_MOTOR_MAX_VEL);
-      CARRIAGE_MOTOR.Move(saved_job_park_pos, StepGenerator::MOVE_TARGET_ABSOLUTE);
+      ConnectorUsb.SendLine("Begin jogging to park position");
+      move_motor_with_speed(saved_job_park_pos, CARRIAGE_MOTOR_MAX_VEL);
       break;
     case job_jog_to_park_wait:
       if (wait_for_motion()) {
         machine_state = idle;
+      }
+      if (loop_num%512==0) {
+        ConnectorUsb.SendLine("Jogging to park position");
       }
       break;
     case learn_start_pos:
@@ -439,6 +491,7 @@ void loop() {
   LEARN_SW.InputRisen();
   HOME_SW.InputRisen();
   CYCLE_SW.InputRisen();
+  FINGER_SW.InputRisen();
 }
 
 /**
@@ -711,50 +764,7 @@ void print_motor_alerts(){
   }
 }
 
-/**
- * Command step pulses to move the motor's current position to the absolute
- * position specified by "position"
- * Prints the move status to the USB serial port
- * Returns when HLFB asserts (indicating the motor has reached the commanded
- * position)
- *
- * @param position The absolute position, in step pulses, to move to
- *
- * @return bool: whether the move was successfully triggered.
- */
-bool MoveAbsolutePosition(const int32_t position) {
-    // Check if a motor alert is currently preventing motion
-    // Clear alert if configured to do so 
-    if (CARRIAGE_MOTOR.StatusReg().bit.AlertsPresent) {
-        ConnectorUsb.SendLine("Motor alert detected.");       
-        print_motor_alerts();
-        ConnectorUsb.SendLine("Move canceled.");
-        ConnectorUsb.SendLine();
-        return false;
-    }
 
-    ConnectorUsb.Send("Moving to absolute position: ");
-    ConnectorUsb.SendLine(position);
-
-    // Command the move of absolute distance
-    CARRIAGE_MOTOR.Move(position, MotorDriver::MOVE_TARGET_ABSOLUTE);
-
-    // Waits for HLFB to assert (signaling the move has successfully completed)
-    ConnectorUsb.SendLine("Moving.. Waiting for HLFB");
-    while ( (!CARRIAGE_MOTOR.StepsComplete() || CARRIAGE_MOTOR.HlfbState() != MotorDriver::HLFB_ASSERTED) &&
-            !CARRIAGE_MOTOR.StatusReg().bit.AlertsPresent) {}
-    // Check if motor alert occurred during move
-    // Clear alert if configured to do so
-    if (CARRIAGE_MOTOR.StatusReg().bit.AlertsPresent) {
-        ConnectorUsb.SendLine("Motor alert detected.");
-        print_motor_alerts();
-        ConnectorUsb.SendLine("Motion may not have completed as expected. Proceed with caution.");
-        ConnectorUsb.SendLine();
-        return false;
-    }
-    ConnectorUsb.SendLine("Move Done");
-    return true;
-}
 
 /**
  * Convert bytes to u32. Big endian, little endian?
@@ -811,8 +821,36 @@ void save_job_to_nvram() {
   NvmManager::Instance().BlockWrite(NvmManager::NVM_LOC_USER_START, (sizeof NV_Ram), &NV_Ram[0]);
 }
 
-
+/**
+ * Setter for finger state that caches state
+ * @param state true for engaged
+ */
 void set_finger_state(const bool state) {
   is_fingers_down = state;
   set_ccio_pin(FINGER_ACTUATION, state);
+}
+
+/**
+ * Setter for head state that caches state
+ * @param state true for down
+ */
+void set_head_state(const bool state) {
+  is_head_commanded_down = state;
+  set_ccio_pin(HEAD_ACTUATION, state);
+}
+
+/**
+ * Very simple helper function to avoid forgetting to call velmax
+ * @param position
+ * @param speed
+ * @return whatever `CARRIAGE_MOTOR.Move` returns. (no one knows atm)
+ */
+bool move_motor_with_speed(const int32_t position, const int32_t speed) {
+  ConnectorUsb.Send("move_motor_with_speed(");
+  ConnectorUsb.Send(position);
+  ConnectorUsb.Send(", ");
+  ConnectorUsb.Send(speed);
+  ConnectorUsb.Send(");");
+  CARRIAGE_MOTOR.VelMax(speed);
+  return CARRIAGE_MOTOR.Move(position, StepGenerator::MOVE_TARGET_ABSOLUTE);
 }
