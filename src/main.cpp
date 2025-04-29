@@ -102,9 +102,9 @@ volatile IndicatorLight learn_indicator_light;  /// Defined globally, but should
 #define CCIO_TIMEOUT_MS 10000 // Number of ms to wait for CCIO to connect before failing POST
 
 #define CARRIAGE_MOTOR_MAX_ACCEL 50000
-#define CARRIAGE_MOTOR_MAX_VEL 5000
+#define CARRIAGE_MOTOR_MAX_VEL 1000
 #define CARRIAGE_MOTOR_MAX_POS 12000
-#define CARRIAGE_MOTOR_PLANISH_VEL 2000
+#define CARRIAGE_MOTOR_PLANISH_VEL 500
 
 #define ITERATION_TIME_WARNING_MS 100 // after this many milliseconds stuck on one iteration of the state machine, give a warning.
 #define ITERATION_TIME_ERROR_MS 1000  // after this many milliseconds stuck on one iteration of the state machine, declare an error
@@ -137,6 +137,7 @@ bool wait_for_motion();
 void set_finger_state(bool state);
 void set_head_state(bool state);
 bool move_motor_with_speed(int32_t position, int32_t speed);
+void motor_jog(bool reverse);
 
 extern "C" void TCC2_0_Handler(void) __attribute__((
             alias("PeriodicInterrupt")));
@@ -281,11 +282,11 @@ void loop() {
     case manual_jog:
       if (!is_e_stop && MANDREL_LATCH_LMT.State() && is_homed) {
         if (JOG_FWD_SW.State() == JOG_FWD_SW_ACTIVE_STATE) {
-          CARRIAGE_MOTOR.MoveVelocity(500);
+          motor_jog(false);
           break;
         }
         if (JOG_REV_SW.State() == JOG_REV_SW_ACTIVE_STATE) {
-          CARRIAGE_MOTOR.MoveVelocity(-500);
+          motor_jog(true);
           break;
         }
       }
@@ -436,11 +437,11 @@ void loop() {
           break;
         }
         if (JOG_FWD_SW.State() == JOG_FWD_SW_ACTIVE_STATE) {
-          CARRIAGE_MOTOR.MoveVelocity(500);
+          motor_jog(false);
           break;
         }
         if (JOG_REV_SW.State() == JOG_REV_SW_ACTIVE_STATE) {
-          CARRIAGE_MOTOR.MoveVelocity(-500);
+          motor_jog(true);
           break;
         }
       }
@@ -459,11 +460,11 @@ void loop() {
           break;
         }
         if (JOG_FWD_SW.State() == JOG_FWD_SW_ACTIVE_STATE) {
-          CARRIAGE_MOTOR.MoveVelocity(500);
+          motor_jog(false);
           break;
         }
         if (JOG_REV_SW.State() == JOG_REV_SW_ACTIVE_STATE) {
-          CARRIAGE_MOTOR.MoveVelocity(-500);
+          motor_jog(true);
           break;
         }
       }
@@ -853,4 +854,12 @@ bool move_motor_with_speed(const int32_t position, const int32_t speed) {
   ConnectorUsb.Send(");");
   CARRIAGE_MOTOR.VelMax(speed);
   return CARRIAGE_MOTOR.Move(position, StepGenerator::MOVE_TARGET_ABSOLUTE);
+}
+
+void motor_jog(const bool reverse) {
+  if (HEAD_UP_LMT.State()) {
+    CARRIAGE_MOTOR.MoveVelocity(reverse ? -CARRIAGE_MOTOR_MAX_VEL : CARRIAGE_MOTOR_MAX_VEL);
+  } else {
+    CARRIAGE_MOTOR.MoveVelocity(reverse ? -CARRIAGE_MOTOR_PLANISH_VEL : CARRIAGE_MOTOR_PLANISH_VEL);
+  }
 }
