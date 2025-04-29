@@ -20,6 +20,10 @@ bool Button::is_rising() const {
 bool Button::is_falling() const {
     return !current_state && last_state;
 }
+bool Button::is_changing() const {
+    return current_state ^ last_state;
+}
+
 bool Button::get_current_state() const {
     return current_state;
 }

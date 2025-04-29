@@ -9,7 +9,7 @@
 #include "clearcore.h"
 
 
-enum LightPattern {
+enum class LightPattern {
     OFF,        // Always off
     ON,         // Always on
     FLASH1,     // Flash 1 / 4

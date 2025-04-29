@@ -5,7 +5,7 @@
 
 IndicatorLight::IndicatorLight(Connector* outputPin)
     : pin(outputPin)
-    , pattern(OFF)
+    , pattern(LightPattern::OFF)
     , period(100)
     , tick_counter(0)
     , output_state(false) {
@@ -13,7 +13,7 @@ IndicatorLight::IndicatorLight(Connector* outputPin)
 
 IndicatorLight::IndicatorLight()
     : pin(nullptr)
-    , pattern(OFF)
+    , pattern(LightPattern::OFF)
     , period(100)
     , tick_counter(0)
     , output_state(false) {
@@ -50,25 +50,25 @@ bool IndicatorLight::calculateOutput() const volatile {
     // ConnectorUsb.SendLine(phase);
     
     switch (pattern) {
-        case OFF:
+        case LightPattern::OFF:
             return false;
             
-        case ON:
+        case LightPattern::ON:
             return true;
             
-        case FLASH1:
+        case LightPattern::FLASH1:
             return phase == 0;
             
-        case FLASH2: {
+        case LightPattern::FLASH2: {
             return phase == 0 || phase == 2;
         }
             
-        case FLASH3: {
+        case LightPattern::FLASH3: {
             return phase == 0 || phase == 2 || phase == 4;
         }
-        case BLINK:
+        case LightPattern::BLINK:
             return !(phase % 2);
-        case STROBE:
+        case LightPattern::STROBE:
             return !(tick_counter % 2);
     }
     // should never happen

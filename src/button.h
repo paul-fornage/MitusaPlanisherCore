@@ -11,6 +11,7 @@ public:
     Button(bool initial_state, bool past_state);
     bool is_rising() const;
     bool is_falling() const;
+    bool is_changing() const;
     bool get_current_state() const;
     void new_reading(bool new_state);
 private:
