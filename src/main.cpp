@@ -45,8 +45,11 @@ uint8_t NV_Ram[12];                    // NVram Max Available is `416 bytes of u
 // Reasons to have an E-stop. Defines what conditions need to be met for the e-stop to end
 // not currently used because ISR must be void
 enum class EstopReason {
-  button,
-  mandrel_latch,
+  NONE,               // Should not happen
+  button,             // E-Stop connector read high, could be a button or a laser switch or something
+  mandrel_latch,      // An operation was in progress that needed the mandrel latch to be down,
+                      // but it was opened while the operation was in progress
+  internal_error,     // The code reached one of those 'this should not be possible' comments. Require reboot.
 };
 
 enum class PlanishStates {
@@ -57,9 +60,8 @@ enum class PlanishStates {
   manual_jog,                 // manually commanded jog
   e_stop_begin,               // E-stop was activated, secure system and save current config to be resumed
   e_stop_wait,                // E-stop is active, wait for it to end
-  resume_from_e_stop,         // E-stop was released. find resume point and go back
   error,                      // unrecoverable error has occurred and machine needs to reboot. should be a dead end state
-  wait_for_head,              // Me asf
+  wait_for_head,              // Me asf. This is for when the head position is changed from the idle state, not for jobs
 
   job_begin,                  // Job has been started, check initial configuration
   job_begin_lifting_head,     // Job was started with head down, wait for it to lift
@@ -90,6 +92,8 @@ volatile PlanishStates machine_state;     // the current state of the machine. V
 
 volatile IndicatorLight home_indicator_light;   /// Defined globally, but should not be accessed unless configure_IO has completed without errors
 volatile IndicatorLight learn_indicator_light;  /// Defined globally, but should not be accessed unless configure_IO has completed without errors
+
+volatile EstopReason estop_reason = EstopReason::NONE;
 
 #define ESTOP_SW ConnectorA12
 #define LASER_SW ConnectorA11
@@ -146,7 +150,7 @@ Button FingerButton;
 Button HeadButton;
 
 bool configure_io();
-void e_stop_handler();
+void e_stop_button_handler();
 bool motor_movement_checks();
 void print_motor_alerts();
 void iteration_time_check();
@@ -165,6 +169,8 @@ bool move_motor_auto_speed(int32_t position);
 void motor_jog(bool reverse);
 void update_buttons();
 void update_speed_pot();
+void e_stop_handler(EstopReason reason);
+PlanishStates secure_system(PlanishStates last_state);
 
 extern "C" void TCC2_0_Handler(void) __attribute__((
             alias("PeriodicInterrupt")));
@@ -175,9 +181,9 @@ void setup() {
 
   ESTOP_SW.Mode(Connector::INPUT_DIGITAL);
   ESTOP_SW.FilterLength(5, DigitalIn::FILTER_UNIT_SAMPLES);
-  ESTOP_SW.InterruptHandlerSet(e_stop_handler, InputManager::InterruptTrigger::CHANGE);
+  ESTOP_SW.InterruptHandlerSet(e_stop_button_handler, InputManager::InterruptTrigger::CHANGE);
   if (ESTOP_SW.State() != ESTOP_SW_SAFE_STATE) { // make sure e-stop wasn't already depressed before interrupt was registered
-    e_stop_handler();
+    e_stop_button_handler();
   }
 
   ConnectorUsb.PortOpen();
@@ -186,7 +192,7 @@ void setup() {
     continue;
 
   if (!ConnectorUsb) {
-    machine_state = PlanishStates::error;
+    e_stop_handler(EstopReason::internal_error);
     return;
   }
 
@@ -213,7 +219,7 @@ void setup() {
     update_buttons();
   } else {                      // if the IO failed to configure properly
     ConnectorUsb.SendLine("IO was not configured successfully, hanging");
-    machine_state = PlanishStates::error;
+    e_stop_handler(EstopReason::internal_error);
     return;
   }
 
@@ -228,6 +234,7 @@ void loop() {
   // Fix by checking at the beginning of every cycle
   if (is_e_stop) {
     machine_state = PlanishStates::e_stop_begin;
+    CARRIAGE_MOTOR.MoveStopAbrupt();
   }
 
   loop_num++;
@@ -275,8 +282,8 @@ void loop() {
 
         ConnectorUsb.SendLine("Motor alert detected during homing.");
         print_motor_alerts();
-        machine_state = PlanishStates::error;
         home_indicator_light.setPattern(LightPattern::STROBE);
+        e_stop_handler(EstopReason::internal_error);
       } else {
         // still homing
       }
@@ -348,19 +355,43 @@ void loop() {
       CARRIAGE_MOTOR.MoveStopDecel();
       break;
     case PlanishStates::e_stop_begin:
-
+      estop_resume_state = secure_system(estop_last_state);
       break;
     case PlanishStates::e_stop_wait:
-      if ((ESTOP_SW.State() == ESTOP_SW_SAFE_STATE) && (millis() - last_estop_millis > ESTOP_COOLDOWN_MS)) {
-        ConnectorUsb.SendLine("Emergency Stop Released, returning to idle");
-        machine_state = PlanishStates::idle;
-        is_e_stop = false;
-        break;
+      switch (estop_reason) {
+        case EstopReason::NONE:
+          ConnectorUsb.SendLine("E-Stop was triggered without setting the reason, changing to error");
+          estop_reason = EstopReason::internal_error;
+          break;
+        case EstopReason::button:
+          if ((ESTOP_SW.State() == ESTOP_SW_SAFE_STATE)
+              && (millis() - last_estop_millis > ESTOP_COOLDOWN_MS))
+          { // if the button was released and the estop has been active for over a second
+            ConnectorUsb.SendLine("Emergency Stop Released, resuming");
+            machine_state = estop_resume_state;
+            is_e_stop = false;
+            break;
+          }
+          break;
+        case EstopReason::mandrel_latch:
+          if ((ESTOP_SW.State() == ESTOP_SW_SAFE_STATE)
+              && (millis() - last_estop_millis > ESTOP_COOLDOWN_MS)
+              && (MANDREL_LATCH_LMT.State()))
+          { // if the latch was fixed and the button hasn't been pressed and the estop has been active for over a second
+            ConnectorUsb.SendLine("Mandrel put back, resuming");
+            machine_state = estop_resume_state;
+            is_e_stop = false;
+            break;
+          }
+          break;
+        case EstopReason::internal_error:
+          machine_state = PlanishStates::error;
+          break;
       }
       break;
-    case PlanishStates::resume_from_e_stop:
-      break;
     case PlanishStates::error:
+      home_indicator_light.setPattern(LightPattern::BLINK);
+      learn_indicator_light.setPattern(LightPattern::BLINK);
       while (true) {
         ConnectorUsb.SendLine("reached error state");
         delay(1000);
@@ -377,10 +408,9 @@ void loop() {
       }
       break;
     case PlanishStates::job_begin_lifting_head:
-      if (is_e_stop || !MANDREL_LATCH_LMT.State() || !is_homed) {
-        // TODO: this should be recoverable
-        ConnectorUsb.SendLine("preconditions failed since starting job");
-        machine_state = PlanishStates::error;
+      if (!MANDREL_LATCH_LMT.State()) {
+        ConnectorUsb.SendLine("mandrel limit precondition failed since starting job");
+        e_stop_handler(EstopReason::mandrel_latch);
         break;
       }
       if (HEAD_UP_LMT.State()) {
@@ -410,10 +440,9 @@ void loop() {
       machine_state = PlanishStates::job_head_down_wait;
       break;
     case PlanishStates::job_head_down_wait:
-      if (is_e_stop || !MANDREL_LATCH_LMT.State() || !is_homed) {
-        // TODO: this should be recoverable
-        ConnectorUsb.SendLine("preconditions failed since starting job");
-        machine_state = PlanishStates::error;
+      if (!MANDREL_LATCH_LMT.State()) {
+        ConnectorUsb.SendLine("mandrel limit precondition failed since starting job");
+        e_stop_handler(EstopReason::mandrel_latch);
         break;
       }
       if (!HEAD_UP_LMT.State()) {
@@ -465,10 +494,9 @@ void loop() {
       machine_state = PlanishStates::job_head_up_wait;
       break;
     case PlanishStates::job_head_up_wait:
-      if (is_e_stop || !MANDREL_LATCH_LMT.State() || !is_homed) {
-        // TODO: this should be recoverable
-        ConnectorUsb.SendLine("preconditions failed since starting job");
-        machine_state = PlanishStates::error;
+      if (!MANDREL_LATCH_LMT.State()) {
+        ConnectorUsb.SendLine("mandrel limit precondition failed since starting job");
+        e_stop_handler(EstopReason::mandrel_latch);
         break;
       }
       if (HEAD_UP_LMT.State()) {
@@ -553,6 +581,8 @@ void loop() {
       learn_indicator_light.setPattern(LightPattern::OFF);
 
       machine_state = PlanishStates::idle;
+      break;
+    case PlanishStates::resume_from_e_stop:
       break;
   }
 }
@@ -651,16 +681,15 @@ bool wait_for_motion() {
     // motor has an error
     ConnectorUsb.SendLine("Motor alert detected during homing.");
     print_motor_alerts();
-    machine_state = PlanishStates::error;
+    e_stop_handler(EstopReason::internal_error);
     return false;
   }
 
   // TODO: make sure EVERY TIME something is being waited for in the main loop that setting estop to true will abort the wait. That means check everywhere else
 
   if (is_e_stop || !MANDREL_LATCH_LMT.State() || !is_homed) {
-    // TODO: this should be recoverable, and treated as an e-stop
     ConnectorUsb.SendLine("preconditions failed since starting job");
-    machine_state = PlanishStates::error;
+    e_stop_handler(EstopReason::internal_error);
     return false;
   }
   return false;
@@ -696,7 +725,7 @@ void iteration_time_check() {
     ConnectorUsb.Send("ms) to complete. This is likely a bug. Last iteration took ");
     ConnectorUsb.Send(last_iteration_delta);
     ConnectorUsb.Send("ms. Engaging E-Stop and stopping execution\n");
-    machine_state = PlanishStates::error;
+    e_stop_handler(EstopReason::internal_error);
   } else if (last_iteration_delta >= ITERATION_TIME_WARNING_MS) {
     ConnectorUsb.Send("Last iteration of the state machine took more than `ITERATION_TIME_WARNING_MS` (");
     ConnectorUsb.Send(ITERATION_TIME_WARNING_MS);
@@ -798,16 +827,30 @@ void set_ccio_pin(
   }
 }
 
-void e_stop_handler() {
-  is_e_stop = true;
-  estop_last_state = machine_state;
-  CARRIAGE_MOTOR.MoveStopAbrupt();
-  machine_state = PlanishStates::e_stop_begin;
-  last_estop_millis = millis();
-  ConnectorUsb.SendLine("Emergency Stop");
+/**
+ * Just a wrapper for `e_stop_handler` that 'curries' the E-stop reason for the ISR
+ */
+void e_stop_button_handler() {
+  e_stop_handler(EstopReason::button);
 }
 
-
+/**
+ * Latch E-stop on.
+ * @param reason Why I pulled you over today
+ */
+void e_stop_handler(const EstopReason reason) {
+  if (!is_e_stop) { // prevent the handler from being called when e-stop already active
+    estop_reason = reason;
+    is_e_stop = true;
+    estop_last_state = machine_state;
+    CARRIAGE_MOTOR.MoveStopAbrupt();
+    machine_state = PlanishStates::e_stop_begin;
+    last_estop_millis = millis();
+    ConnectorUsb.SendLine("Emergency Stop");
+  } else {
+    ConnectorUsb.SendLine("Emergency Stop ISR called when e-stop was already active");
+  }
+}
 
 /**
  * Prints active alerts.
@@ -831,8 +874,6 @@ void print_motor_alerts(){
     ConnectorUsb.SendLine("    MotorFaulted ");
   }
 }
-
-
 
 /**
  * Convert bytes to u32. Big endian, little endian?
@@ -986,140 +1027,70 @@ void update_speed_pot() {
  * @param last_state The last known state before state machine was interrupted
  * @return The state to resume from
  */
-PlanishStates e_stop_resume(const PlanishStates last_state) {
 
-  // !! I am purposefully omitting a default case.
-  // even though it saves some lines, I would rather not forget new states
-  switch (last_state) {
-    case PlanishStates::post:
-      return PlanishStates::post;
-    case PlanishStates::begin_homing:
-      return PlanishStates::begin_homing;
-    case PlanishStates::wait_for_homing:
-      // If interrupted during homing the motor is actually disabled,
-      // as any move commands to stop it do not work.
-      // Therefore it needs to restart the homing process
-      return PlanishStates::begin_homing;
-    case PlanishStates::idle:
-      return PlanishStates::idle;
-    case PlanishStates::manual_jog:
-      // While the manual jog state will already send the state
-      // back to idle if no jog is commanded, I'd rather not risk it.
-      // This is totally recoverable anyway
-      return PlanishStates::idle;
-    case PlanishStates::e_stop_begin:
-      // if the e_stop state gets interrupted by an
-      // e-stop I think it's safe to have a breakdown
-      return PlanishStates::error;
-    case PlanishStates::e_stop_wait:
-      break;
-    case PlanishStates::resume_from_e_stop:
-      break;
-    case PlanishStates::error:
-      // error state only exists to be unrecoverable
-      return PlanishStates::error;
-    case PlanishStates::wait_for_head:
-      // TODO: Ensure substate is maintained and will resume with the correct command
-      return PlanishStates::wait_for_head;
-    case PlanishStates::job_begin:
-      break;
-    case PlanishStates::job_begin_lifting_head:
-      break;
-    case PlanishStates::job_jog_to_start:
-      break;
-    case PlanishStates::job_jog_to_start_wait:
-      break;
-    case PlanishStates::job_head_down:
-      break;
-    case PlanishStates::job_head_down_wait:
-      break;
-    case PlanishStates::job_planish_to_end:
-      break;
-    case PlanishStates::job_planish_to_end_wait:
-      break;
-    case PlanishStates::job_planish_to_start:
-      break;
-    case PlanishStates::job_planish_to_start_wait:
-      break;
-    case PlanishStates::job_head_up:
-      break;
-    case PlanishStates::job_head_up_wait:
-      break;
-    case PlanishStates::job_jog_to_park:
-      break;
-    case PlanishStates::job_jog_to_park_wait:
-      break;
-    case PlanishStates::learn_start_pos:
-      break;
-    case PlanishStates::learn_jog_to_end_pos:
-      break;
-    case PlanishStates::learn_end_pos:
-      break;
-    case PlanishStates::learn_jog_to_park_pos:
-      break;
-    case PlanishStates::learn_park_pos:
-      break;
-    case PlanishStates::saving_job_to_nvram:
-      break;
-  }
-  return PlanishStates::error;
-}
-
-void secure_system(const PlanishStates last_state) {
+/**
+ * Handle stopping and securing every part of the system.
+ * @param last_state The state of the system before the e-stop
+ * @return The state to resume to once the E-stop cause was rectified
+ */
+PlanishStates secure_system(const PlanishStates last_state) {
   switch (last_state) {
     case PlanishStates::post:
       // E-stop during post isn't worth recovering. Recover from what?
-      estop_resume_state = PlanishStates::error;
-      break;
+      return PlanishStates::error;
     case PlanishStates::begin_homing:
     case PlanishStates::wait_for_homing:
+      // TODO: Motor may give an error related to getting move commands when disabled/homing. clear or address it
       home_indicator_light.setPattern(LightPattern::OFF);
       CARRIAGE_MOTOR.EnableRequest(false);
       is_homed = false;
-      estop_resume_state = PlanishStates::idle;
-      break;
+      return PlanishStates::idle;
     case PlanishStates::idle:
+      return PlanishStates::idle;
     case PlanishStates::manual_jog:
-      // these are both always recoverable
-      break;
+      return PlanishStates::idle;
     case PlanishStates::e_stop_begin:
-      break;
     case PlanishStates::e_stop_wait:
-      break;
     case PlanishStates::resume_from_e_stop:
-      break;
+      // This is not a valid state. The state before the E-stop ran should never be e-stop
+      return PlanishStates::error;
     case PlanishStates::error:
-      break;
+      // This would mean the machine was in an error state before the e-stop.
+      return PlanishStates::error;
     case PlanishStates::wait_for_head:
-      break;
+      if (is_head_commanded_down == HEAD_UP_LMT.State()) { // despite the `==` this check if there is a mismatch
+        set_head_state(false); // if the head was in motion, raise it
+      } // if the head was not in motion, then it's fine to keep where it is
+      return PlanishStates::idle;
     case PlanishStates::job_begin:
-      break;
+      return PlanishStates::job_begin;
     case PlanishStates::job_begin_lifting_head:
-      break;
+      // this is safe to resume, stateless
+      return PlanishStates::job_begin_lifting_head;
     case PlanishStates::job_jog_to_start:
-      break;
     case PlanishStates::job_jog_to_start_wait:
-      break;
+      return PlanishStates::job_jog_to_start;
     case PlanishStates::job_head_down:
-      break;
+      return PlanishStates::job_head_down;
     case PlanishStates::job_head_down_wait:
-      break;
+      if (is_head_commanded_down == HEAD_UP_LMT.State()) { // despite the `==` this check if there is a mismatch
+        set_head_state(false); // if the head was in motion, raise it
+      } // if the head was not in motion, then it's fine to keep where it is
+      // resume by lowering the head again
+      return PlanishStates::job_head_down;
     case PlanishStates::job_planish_to_end:
-      break;
     case PlanishStates::job_planish_to_end_wait:
-      break;
+      return PlanishStates::job_planish_to_end;
     case PlanishStates::job_planish_to_start:
-      break;
     case PlanishStates::job_planish_to_start_wait:
-      break;
+      return PlanishStates::job_planish_to_start;
     case PlanishStates::job_head_up:
-      break;
+      return PlanishStates::job_head_up;
     case PlanishStates::job_head_up_wait:
-      break;
+      return PlanishStates::job_head_up_wait;
     case PlanishStates::job_jog_to_park:
-      break;
     case PlanishStates::job_jog_to_park_wait:
-      break;
+      return PlanishStates::job_jog_to_park;
     case PlanishStates::learn_start_pos:
     case PlanishStates::learn_jog_to_end_pos:
     case PlanishStates::learn_end_pos:
@@ -1127,11 +1098,9 @@ void secure_system(const PlanishStates last_state) {
     case PlanishStates::learn_park_pos:
       // An estop here will cancel the learn operation
       learn_indicator_light.setPattern(LightPattern::OFF);
-
-
-      estop_resume_state = PlanishStates::idle;
-      break;
+      return PlanishStates::idle;
     case PlanishStates::saving_job_to_nvram:
-      break;
+      return PlanishStates::saving_job_to_nvram;
   }
+  return PlanishStates::error;
 }
