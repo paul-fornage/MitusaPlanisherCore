@@ -15,6 +15,7 @@
 
 bool is_homed = false;                  // Has the axis been homed
 volatile bool is_e_stop = false;                // Is the Emergency Stop currently active
+bool is_fingers_down = false;                  // Is the finger actuation currently active
 
 uint32_t last_iteration_delta;          // Time spent on the last iteration of the main loop in millis
 uint32_t last_iteration_time;           // Time of the last iteration of the main loop in millis
@@ -131,6 +132,7 @@ void u32_to_bytes(uint32_t value, uint8_t bytes[4], uint32_t offset = 0);
 void read_job_from_nvram();
 void save_job_to_nvram();
 bool wait_for_motion();
+void set_finger_state(bool state);
 
 extern "C" void TCC2_0_Handler(void) __attribute__((
             alias("PeriodicInterrupt")));
@@ -238,9 +240,15 @@ void loop() {
             machine_state = learn_start_pos;
             break;
           }
-          if (CYCLE_SW.InputRisen() || CYCLE_SW.State()) {
-            machine_state = job_begin;
-            break;
+
+          if (FINGER_SW.InputRisen() || FINGER_SW.State()) {
+            set_finger_state(true);
+          }
+          if (is_fingers_down) {
+            if (CYCLE_SW.InputRisen() || CYCLE_SW.State()) {
+              machine_state = job_begin;
+              break;
+            }
           }
         }
       }
@@ -801,4 +809,10 @@ void save_job_to_nvram() {
   u32_to_bytes(saved_job_end_pos, NV_Ram, 4);
   u32_to_bytes(saved_job_park_pos, NV_Ram, 8);
   NvmManager::Instance().BlockWrite(NvmManager::NVM_LOC_USER_START, (sizeof NV_Ram), &NV_Ram[0]);
+}
+
+
+void set_finger_state(const bool state) {
+  is_fingers_down = state;
+  set_ccio_pin(FINGER_ACTUATION, state);
 }
