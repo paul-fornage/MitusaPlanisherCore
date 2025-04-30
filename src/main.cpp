@@ -752,14 +752,16 @@ void iteration_time_check() {
     ConnectorUsb.Send(ITERATION_TIME_ERROR_MS);
     ConnectorUsb.Send("ms) to complete. This is likely a bug. Last iteration took ");
     ConnectorUsb.Send(last_iteration_delta);
-    ConnectorUsb.Send("ms. Engaging E-Stop and stopping execution\n");
+    ConnectorUsb.Send("ms. Engaging E-Stop and stopping execution. Last state: ");
+    ConnectorUsb.SendLine(get_state_name(machine_state));
     e_stop_handler(EstopReason::internal_error);
   } else if (last_iteration_delta >= ITERATION_TIME_WARNING_MS) {
     ConnectorUsb.Send("Last iteration of the state machine took more than `ITERATION_TIME_WARNING_MS` (");
     ConnectorUsb.Send(ITERATION_TIME_WARNING_MS);
     ConnectorUsb.Send("ms) to complete. This is likely a bug. Last iteration took ");
     ConnectorUsb.Send(last_iteration_delta);
-    ConnectorUsb.Send("ms. Continuing execution");
+    ConnectorUsb.Send("ms. Continuing execution. Last state: ");
+    ConnectorUsb.SendLine(get_state_name(machine_state));
   }
 }
 
@@ -860,6 +862,7 @@ void set_ccio_pin(
  */
 void e_stop_button_handler() {
   e_stop_handler(EstopReason::button);
+  ConnectorUsb.SendLine("ISR");
 }
 
 /**
