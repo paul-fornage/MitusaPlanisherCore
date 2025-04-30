@@ -14,6 +14,9 @@
 #include "button.h"
 
 
+// TODO: Bug when booting with e-stop on
+
+
 bool is_homed = false;                  // Has the axis been homed
 volatile bool is_e_stop = false;               // Is the Emergency Stop currently active
 bool is_fingers_down = false;                  // Is the finger actuation currently active
@@ -178,6 +181,8 @@ void update_speed_pot();
 void e_stop_handler(EstopReason reason);
 PlanishStates secure_system(PlanishStates last_state);
 
+const char *get_state_name(PlanishStates state);
+
 extern "C" void TCC2_0_Handler(void) __attribute__((
             alias("PeriodicInterrupt")));
 
@@ -239,8 +244,11 @@ void loop() {
   // but before the state change, the `e_stop_begin` set in the ISR will be overwritten.
   // Fix by checking at the beginning of every cycle
   if (is_e_stop) {
-    machine_state = PlanishStates::e_stop_begin;
-    CARRIAGE_MOTOR.MoveStopAbrupt();
+    // Also make sure that the e-stop hasn't been handled already and is now waiting for rectification
+    if (machine_state != PlanishStates::e_stop_wait) {
+      machine_state = PlanishStates::e_stop_begin;
+      CARRIAGE_MOTOR.MoveStopAbrupt();
+    }
   }
 
   loop_num++;
@@ -363,9 +371,14 @@ void loop() {
       CARRIAGE_MOTOR.MoveStopDecel();
       break;
     case PlanishStates::e_stop_begin:
+      ConnectorUsb.SendLine("PlanishStates::e_stop_begin");
       estop_resume_state = secure_system(estop_last_state);
+      ConnectorUsb.Send("secure_system returns");
+      ConnectorUsb.Send(get_state_name(estop_resume_state));
+      machine_state = PlanishStates::e_stop_wait;
       break;
     case PlanishStates::e_stop_wait:
+      ConnectorUsb.SendLine("PlanishStates::e_stop_wait");
       switch (estop_reason) {
         case EstopReason::NONE:
           ConnectorUsb.SendLine("E-Stop was triggered without setting the reason, changing to error");
@@ -851,7 +864,7 @@ void e_stop_button_handler() {
 
 /**
  * Latch E-stop on.
- * @param reason Why I pulled you over today
+ * @param reason Why I pulled you over today. Defines what should happen to release the e-stop
  */
 void e_stop_handler(const EstopReason reason) {
   if (!is_e_stop) { // prevent the handler from being called when e-stop already active
@@ -1040,6 +1053,8 @@ void update_speed_pot() {
  * @return The state to resume to once the E-stop cause was rectified
  */
 PlanishStates secure_system(const PlanishStates last_state) {
+  ConnectorUsb.Send("secure_system called with state: ");
+  ConnectorUsb.Send(get_state_name(last_state));
   switch (last_state) {
     case PlanishStates::post:
       // E-stop during post isn't worth recovering. Recover from what?
@@ -1127,3 +1142,50 @@ PlanishStates secure_system(const PlanishStates last_state) {
   }
   return PlanishStates::error;
 }
+
+
+
+
+
+/**
+ * For debugging.
+ * @param state
+ * @return the name of the state in the codebase.
+ */
+const char *get_state_name(const PlanishStates state) {
+#define STATE_NAME(state) case PlanishStates::state: return #state;
+  switch (state) {
+    STATE_NAME(post);
+    STATE_NAME(begin_homing);
+    STATE_NAME(homing_wait_for_disable);
+    STATE_NAME(wait_for_homing);
+    STATE_NAME(idle);
+    STATE_NAME(manual_jog);
+    STATE_NAME(e_stop_begin);
+    STATE_NAME(e_stop_wait);
+    STATE_NAME(error);
+    STATE_NAME(wait_for_head);
+    STATE_NAME(job_begin);
+    STATE_NAME(job_begin_lifting_head);
+    STATE_NAME(job_jog_to_start);
+    STATE_NAME(job_jog_to_start_wait);
+    STATE_NAME(job_head_down);
+    STATE_NAME(job_head_down_wait);
+    STATE_NAME(job_planish_to_end);
+    STATE_NAME(job_planish_to_end_wait);
+    STATE_NAME(job_planish_to_start);
+    STATE_NAME(job_planish_to_start_wait);
+    STATE_NAME(job_head_up);
+    STATE_NAME(job_head_up_wait);
+    STATE_NAME(job_jog_to_park);
+    STATE_NAME(job_jog_to_park_wait);
+    STATE_NAME(learn_start_pos);
+    STATE_NAME(learn_jog_to_end_pos);
+    STATE_NAME(learn_end_pos);
+    STATE_NAME(learn_jog_to_park_pos);
+    STATE_NAME(learn_park_pos);
+    STATE_NAME(saving_job_to_nvram);
+  }
+  return "INVALID_STATE";
+}
+
