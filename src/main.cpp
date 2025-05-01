@@ -12,6 +12,7 @@
 #include "ClearCore.h"
 #include "indicator_light.h"
 #include "button.h"
+#include "EthernetTcpClient.h"
 
 
 // TODO: Bug when booting with e-stop on
@@ -224,6 +225,9 @@ extern "C" void TCC2_0_Handler(void) __attribute__((
 
 void setup() {
 
+
+
+
   ESTOP_SW.Mode(Connector::INPUT_DIGITAL);
   ESTOP_SW.FilterLength(5, DigitalIn::FILTER_UNIT_SAMPLES);
   ESTOP_SW.InterruptHandlerSet(e_stop_button_handler, InputManager::InterruptTrigger::CHANGE);
@@ -243,6 +247,29 @@ void setup() {
 
   // Debug delay to be able to restart motor before program starts
   delay(4000);
+
+  EthernetMgr.Setup();
+  const bool dhcpSuccess = EthernetMgr.DhcpBegin();
+  while (dhcpSuccess) {
+    ConnectorUsb.Send("DHCP Success. IP: ");
+    ConnectorUsb.SendLine(EthernetMgr.LocalIp().StringValue());
+
+    EthernetTcpClient client;
+    // Start a TCP connection with the server on port 8888.
+    if (client.Connect(IpAddress(192, 168, 1, 15), 8888)) {
+      while (client.Connected()) {
+        while (client.BytesAvailable()) {
+          ConnectorUsb.SendChar(static_cast<uint8_t>(client.Read()));
+        }
+        while (ConnectorUsb.AvailableForRead()) {
+          client.Send(static_cast<uint8_t>(ConnectorUsb.CharGet()));
+        }
+      }
+    }
+    ConnectorUsb.SendLine("connection ended, retrying");
+  }
+
+  ConnectorUsb.SendLine("DHCP shat the bed");
 
   read_job_from_nvram();
 
