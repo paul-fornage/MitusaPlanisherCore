@@ -103,6 +103,31 @@ volatile IndicatorLight learn_indicator_light;  /// Defined globally, but should
 
 volatile EstopReason estop_reason = EstopReason::NONE;
 
+/**
+ * when defined the motor will not move and
+ * any commands meant for the motor will be logged/simulated
+ */
+#define TEST_MODE_DISABLE_MOTOR
+
+
+#ifdef TEST_MODE_DISABLE_MOTOR
+// Wrapper for commands to the motor that will print them instead if motor is disabled for test mode
+#define MOTOR_COMMAND(code) ConnectorUsb.SendLine(#code)
+#define MOTOR_ASSERTED true
+#define MOTOR_HAS_ERRORS false
+#define MOTOR_ERROR_COMMANDED_WHEN_DISABLED false
+#define MOTOR_STEPS_COMPLETE true
+#define MOTOR_COMMANDED_POSITION 0
+#else
+// Wrapper for commands to the motor that will print them instead if motor is disabled for test mode
+#define MOTOR_COMMAND(code) code
+#define MOTOR_ASSERTED (CARRIAGE_MOTOR.HlfbState() == MotorDriver::HLFB_ASSERTED)
+#define MOTOR_HAS_ERRORS (CARRIAGE_MOTOR.StatusReg().bit.AlertsPresent)
+#define MOTOR_ERROR_COMMANDED_WHEN_DISABLED (CARRIAGE_MOTOR.AlertReg().bit.MotionCanceledMotorDisabled)
+#define MOTOR_STEPS_COMPLETE CARRIAGE_MOTOR.StepsComplete()
+#define MOTOR_COMMANDED_POSITION CARRIAGE_MOTOR.PositionRefCommanded()
+#endif
+
 #define ESTOP_SW ConnectorA12
 #define LASER_SW ConnectorA11
 #define LEARN_SW ConnectorA10
@@ -117,7 +142,9 @@ volatile EstopReason estop_reason = EstopReason::NONE;
 #define JOG_REV_SW ConnectorIO4
 #define HEAD_SW ConnectorIO5
 
+#ifndef TEST_MODE_DISABLE_MOTOR
 #define CARRIAGE_MOTOR ConnectorM0
+#endif
 
 // CCIO pin definitions. these are not interchangeable with native io ports.
 // please see `configure_io()` to change assignment between ccio and native pins
@@ -186,7 +213,7 @@ void update_buttons();
 void update_speed_pot();
 void e_stop_handler(EstopReason reason);
 PlanishState secure_system(PlanishState last_state);
-PlanishState state_machine(PlanishState state);
+PlanishState state_machine(PlanishState state_in);
 
 const char *get_state_name(PlanishState state);
 
@@ -215,7 +242,7 @@ void setup() {
   }
 
   // Debug delay to be able to restart motor before program starts
-  delay(1000);
+  delay(4000);
 
   read_job_from_nvram();
 
@@ -249,7 +276,9 @@ void loop() {
     // Also make sure that the state wasn't already set to something more severe
     if (machine_state != PlanishState::e_stop_wait && machine_state != PlanishState::error) {
       machine_state = PlanishState::e_stop_begin;
-      CARRIAGE_MOTOR.MoveStopAbrupt();
+
+      MOTOR_COMMAND(CARRIAGE_MOTOR.MoveStopAbrupt(););
+
     }
   }
 
@@ -270,41 +299,43 @@ void loop() {
 
 }
 
-PlanishState state_machine(PlanishState state_in) {
-  switch (machine_state) {
+PlanishState state_machine(const PlanishState state_in) {
+  switch (state_in) {
     case PlanishState::post:  // Not used anymore but could be in the future
       ConnectorUsb.SendLine("Power on self test");
       return PlanishState::idle;
 
     case PlanishState::begin_homing:
       ConnectorUsb.SendLine("begin homing");
-      CARRIAGE_MOTOR.EnableRequest(false);
+
+      MOTOR_COMMAND(CARRIAGE_MOTOR.EnableRequest(false));
+
       homing_disable_time = millis();
       return PlanishState::homing_wait_for_disable;
 
     case PlanishState::homing_wait_for_disable:
       if (millis() - homing_disable_time > MOTOR_EN_DIS_DELAY_MS) {
-        CARRIAGE_MOTOR.EnableRequest(true);
+        MOTOR_COMMAND(CARRIAGE_MOTOR.EnableRequest(true););
         home_indicator_light.setPattern(LightPattern::BLINK);
         return PlanishState::wait_for_homing;
       }
       return PlanishState::homing_wait_for_disable;
 
     case PlanishState::wait_for_homing:
-      if (CARRIAGE_MOTOR.HlfbState() == MotorDriver::HLFB_ASSERTED) {
+      if (MOTOR_ASSERTED) {
         // homing done no errors
         ConnectorUsb.SendLine("homing complete");
         // the position saved in the local motor instance is not neccesarily the same of the motor FW.
         // this line ensures they are set to the same thing, but when there seems to be a rounding error between the two
         // can confirm they don't desync over the course of at least ~20,000 steps
-        CARRIAGE_MOTOR.PositionRefSet(0);
+        MOTOR_COMMAND(CARRIAGE_MOTOR.PositionRefSet(0););
         is_homed = true;
         home_indicator_light.setPattern(LightPattern::ON);
         return PlanishState::idle;
       }
 
-      if (CARRIAGE_MOTOR.StatusReg().bit.AlertsPresent) { // motor has an error
-        if(CARRIAGE_MOTOR.AlertReg().bit.MotionCanceledMotorDisabled) {
+      if (MOTOR_HAS_ERRORS) {
+        if(MOTOR_ERROR_COMMANDED_WHEN_DISABLED) {
           ConnectorUsb.SendLine("Motor was commanded to move before enabling."
                                 "depending on how the code turns out this might not be problematic");
         }
@@ -396,7 +427,8 @@ PlanishState state_machine(PlanishState state_in) {
       // 1. the motor is not homed
       // 2. the mandrel limit switch is not in the safe position
       // 3. neither the forward nor reverse jog is being commanded
-      CARRIAGE_MOTOR.MoveStopDecel();
+      MOTOR_COMMAND(CARRIAGE_MOTOR.MoveStopDecel(););
+
       return PlanishState::idle;
 
     case PlanishState::e_stop_begin:
@@ -474,7 +506,7 @@ PlanishState state_machine(PlanishState state_in) {
       }
 
     case PlanishState::job_begin_lifting_head:
-      if (!MANDREL_LATCH_LMT.State() == MANDREL_LATCH_LMT_SAFE_STATE) {
+      if (MANDREL_LATCH_LMT.State() != MANDREL_LATCH_LMT_SAFE_STATE) {
         ConnectorUsb.SendLine("mandrel limit precondition failed since starting job");
         e_stop_handler(EstopReason::mandrel_latch);
         return PlanishState::e_stop_begin;
@@ -494,7 +526,7 @@ PlanishState state_machine(PlanishState state_in) {
 
     case PlanishState::job_jog_to_start_wait:
       // TODO update the speed with the pot
-      CARRIAGE_MOTOR.VelMax(current_jog_speed);
+      MOTOR_COMMAND(CARRIAGE_MOTOR.VelMax(current_jog_speed););
       if (wait_for_motion()) {
         return PlanishState::job_head_down;
       }
@@ -509,7 +541,7 @@ PlanishState state_machine(PlanishState state_in) {
       return PlanishState::job_head_down_wait;
 
     case PlanishState::job_head_down_wait:
-      if (!MANDREL_LATCH_LMT.State() == MANDREL_LATCH_LMT_SAFE_STATE) {
+      if (MANDREL_LATCH_LMT.State() != MANDREL_LATCH_LMT_SAFE_STATE) {
         ConnectorUsb.SendLine("mandrel limit precondition failed since starting job");
         e_stop_handler(EstopReason::mandrel_latch);
         return PlanishState::e_stop_begin;
@@ -529,7 +561,7 @@ PlanishState state_machine(PlanishState state_in) {
 
     case PlanishState::job_planish_to_end_wait:
       // TODO update the speed with the pot
-      CARRIAGE_MOTOR.VelMax(current_planish_speed);
+      MOTOR_COMMAND(CARRIAGE_MOTOR.VelMax(current_planish_speed););
       if (wait_for_motion()) {
         if (HALF_CYCLE_SW.State()) {
           ConnectorUsb.SendLine("half cycle detected, go to park");
@@ -553,7 +585,7 @@ PlanishState state_machine(PlanishState state_in) {
 
     case PlanishState::job_planish_to_start_wait:
       // TODO update the speed with the pot
-      CARRIAGE_MOTOR.VelMax(current_planish_speed);
+      MOTOR_COMMAND(CARRIAGE_MOTOR.VelMax(current_planish_speed););
       if (wait_for_motion()) {
         return PlanishState::job_head_up;
       }
@@ -568,7 +600,7 @@ PlanishState state_machine(PlanishState state_in) {
       return PlanishState::job_head_up_wait;
 
     case PlanishState::job_head_up_wait:
-      if (!MANDREL_LATCH_LMT.State() == MANDREL_LATCH_LMT_SAFE_STATE) {
+      if (MANDREL_LATCH_LMT.State() != MANDREL_LATCH_LMT_SAFE_STATE) {
         ConnectorUsb.SendLine("mandrel limit precondition failed since starting job");
         e_stop_handler(EstopReason::mandrel_latch);
         return PlanishState::e_stop_begin;
@@ -588,7 +620,7 @@ PlanishState state_machine(PlanishState state_in) {
 
     case PlanishState::job_jog_to_park_wait:
       // TODO update the speed with the pot
-      CARRIAGE_MOTOR.VelMax(current_jog_speed);
+      MOTOR_COMMAND(CARRIAGE_MOTOR.VelMax(current_jog_speed););
       if (wait_for_motion()) {
         return PlanishState::idle;
       }
@@ -600,7 +632,7 @@ PlanishState state_machine(PlanishState state_in) {
     case PlanishState::learn_start_pos:
       learn_indicator_light.setPattern(LightPattern::FLASH1);
       ConnectorUsb.SendLine("learn start pos");
-      temp_job_start_pos = CARRIAGE_MOTOR.PositionRefCommanded();
+      temp_job_start_pos = MOTOR_COMMANDED_POSITION;
       return PlanishState::learn_jog_to_end_pos;
 
     case PlanishState::learn_jog_to_end_pos:
@@ -613,7 +645,7 @@ PlanishState state_machine(PlanishState state_in) {
         } else if (JOG_REV_SW.State() == JOG_REV_SW_ACTIVE_STATE) {
           motor_jog(true);
         } else {
-          CARRIAGE_MOTOR.MoveStopDecel();
+          MOTOR_COMMAND(CARRIAGE_MOTOR.MoveStopDecel(););
         }
         return PlanishState::learn_jog_to_end_pos;
       }
@@ -623,7 +655,7 @@ PlanishState state_machine(PlanishState state_in) {
     case PlanishState::learn_end_pos:
       learn_indicator_light.setPattern(LightPattern::FLASH2);
       ConnectorUsb.SendLine("learn end pos");
-      temp_job_end_pos = CARRIAGE_MOTOR.PositionRefCommanded();
+      temp_job_end_pos = MOTOR_COMMANDED_POSITION;
       return PlanishState::learn_jog_to_park_pos;
 
     case PlanishState::learn_jog_to_park_pos:
@@ -636,7 +668,7 @@ PlanishState state_machine(PlanishState state_in) {
         } else if (JOG_REV_SW.State() == JOG_REV_SW_ACTIVE_STATE) {
           motor_jog(true);
         } else {
-          CARRIAGE_MOTOR.MoveStopDecel();
+          MOTOR_COMMAND(CARRIAGE_MOTOR.MoveStopDecel(););
         }
         return PlanishState::learn_jog_to_park_pos;
       }
@@ -646,7 +678,7 @@ PlanishState state_machine(PlanishState state_in) {
     case PlanishState::learn_park_pos:
       learn_indicator_light.setPattern(LightPattern::FLASH3);
       ConnectorUsb.SendLine("learn park pos");
-      temp_job_park_pos = CARRIAGE_MOTOR.PositionRefCommanded();
+      temp_job_park_pos = MOTOR_COMMANDED_POSITION;
       return PlanishState::saving_job_to_nvram;
 
     case PlanishState::saving_job_to_nvram:
@@ -657,7 +689,15 @@ PlanishState state_machine(PlanishState state_in) {
       save_job_to_nvram();
       learn_indicator_light.setPattern(LightPattern::OFF);
       return PlanishState::idle;
+
+
   }
+  // this means the state machine did not already give a state
+  ConnectorUsb.SendLine("State machine iteration executed without explicitly returning the next state");
+  ConnectorUsb.Send("Previous state: ");
+  ConnectorUsb.SendLine(get_state_name(state_in));
+  e_stop_handler(EstopReason::internal_error);
+  return PlanishState::e_stop_begin;
 }
 
 /**
@@ -719,16 +759,15 @@ bool configure_io() {
   learn_indicator_light.setPeriod(50);
   learn_indicator_light.setPattern(LightPattern::OFF);
 
-  MotorMgr.MotorInputClocking(MotorManager::CLOCK_RATE_NORMAL);
-  MotorMgr.MotorModeSet(MotorManager::MOTOR_ALL, Connector::CPM_MODE_STEP_AND_DIR);
+  MOTOR_COMMAND(MotorMgr.MotorInputClocking(MotorManager::CLOCK_RATE_NORMAL););
+  MOTOR_COMMAND(MotorMgr.MotorModeSet(MotorManager::MOTOR_ALL, Connector::CPM_MODE_STEP_AND_DIR););
 
-  CARRIAGE_MOTOR.HlfbMode(MotorDriver::HLFB_MODE_HAS_BIPOLAR_PWM);
-  CARRIAGE_MOTOR.HlfbCarrier(MotorDriver::HLFB_CARRIER_482_HZ);
-
+  MOTOR_COMMAND(CARRIAGE_MOTOR.HlfbMode(MotorDriver::HLFB_MODE_HAS_BIPOLAR_PWM););
+  MOTOR_COMMAND(CARRIAGE_MOTOR.HlfbCarrier(MotorDriver::HLFB_CARRIER_482_HZ););
 
   update_speed_pot();
-  CARRIAGE_MOTOR.VelMax(current_jog_speed);
-  CARRIAGE_MOTOR.AccelMax(CARRIAGE_MOTOR_MAX_ACCEL);
+  MOTOR_COMMAND(CARRIAGE_MOTOR.VelMax(current_jog_speed););
+  MOTOR_COMMAND(CARRIAGE_MOTOR.AccelMax(CARRIAGE_MOTOR_MAX_ACCEL););
 
   set_finger_state(false);
   set_head_state(false);
@@ -745,12 +784,11 @@ bool configure_io() {
  * a new iteration of the state loop.
  */
 bool wait_for_motion() {
-  if (CARRIAGE_MOTOR.HlfbState() == MotorDriver::HLFB_ASSERTED
-      && CARRIAGE_MOTOR.StepsComplete()) {
+  if (MOTOR_ASSERTED && MOTOR_STEPS_COMPLETE) {
     ConnectorUsb.SendLine("Motor has completed motion");
     return true;
   }
-  if (CARRIAGE_MOTOR.StatusReg().bit.AlertsPresent) {
+  if (MOTOR_HAS_ERRORS) {
     // motor has an error
     ConnectorUsb.SendLine("Motor alert detected during homing.");
     print_motor_alerts();
@@ -919,7 +957,7 @@ void e_stop_handler(const EstopReason reason) {
     estop_reason = reason;
     is_e_stop = true;
     estop_last_state = machine_state;
-    CARRIAGE_MOTOR.MoveStopAbrupt();
+    MOTOR_COMMAND(CARRIAGE_MOTOR.MoveStopAbrupt(););
     machine_state = PlanishState::e_stop_begin;
     last_estop_millis = millis();
     ConnectorUsb.SendLine("Emergency Stop");
@@ -935,6 +973,9 @@ void e_stop_handler(const EstopReason reason) {
  */
 void print_motor_alerts(){
   // report status of alerts
+#ifdef TEST_MODE_DISABLE_MOTOR
+  ConnectorUsb.SendLine("print_motor_alerts()");
+#else
   ConnectorUsb.SendLine("ClearPath Alerts present: ");
   if(CARRIAGE_MOTOR.AlertReg().bit.MotionCanceledInAlert){
     ConnectorUsb.SendLine("    MotionCanceledInAlert "); }
@@ -949,6 +990,7 @@ void print_motor_alerts(){
   if(CARRIAGE_MOTOR.AlertReg().bit.MotorFaulted){
     ConnectorUsb.SendLine("    MotorFaulted ");
   }
+#endif
 }
 
 /**
@@ -1042,8 +1084,8 @@ bool move_motor_with_speed(const int32_t position, const int32_t speed) {
   ConnectorUsb.Send(", ");
   ConnectorUsb.Send(speed);
   ConnectorUsb.Send(");");
-  CARRIAGE_MOTOR.VelMax(speed);
-  return CARRIAGE_MOTOR.Move(position, StepGenerator::MOVE_TARGET_ABSOLUTE);
+  MOTOR_COMMAND(CARRIAGE_MOTOR.VelMax(speed););
+  return MOTOR_COMMAND(CARRIAGE_MOTOR.Move(position, StepGenerator::MOVE_TARGET_ABSOLUTE););
 }
 
 /**
@@ -1056,15 +1098,15 @@ bool move_motor_auto_speed(const int32_t position) {
   ConnectorUsb.Send(position);
   ConnectorUsb.Send(");");
   const int32_t speed = HEAD_UP_LMT.State() ? current_jog_speed : current_planish_speed;
-  CARRIAGE_MOTOR.VelMax(speed);
-  return CARRIAGE_MOTOR.Move(position, StepGenerator::MOVE_TARGET_ABSOLUTE);
+  MOTOR_COMMAND(CARRIAGE_MOTOR.VelMax(speed););
+  return MOTOR_COMMAND(CARRIAGE_MOTOR.Move(position, StepGenerator::MOVE_TARGET_ABSOLUTE););
 }
 
 void motor_jog(const bool reverse) {
   if (HEAD_UP_LMT.State()) {
-    CARRIAGE_MOTOR.MoveVelocity(reverse ? -current_jog_speed : current_jog_speed);
+    MOTOR_COMMAND(CARRIAGE_MOTOR.MoveVelocity(reverse ? -current_jog_speed : current_jog_speed););
   } else {
-    CARRIAGE_MOTOR.MoveVelocity(reverse ? -current_planish_speed : current_planish_speed);
+    MOTOR_COMMAND(CARRIAGE_MOTOR.MoveVelocity(reverse ? -current_planish_speed : current_planish_speed););
   }
 }
 
@@ -1117,8 +1159,9 @@ PlanishState secure_system(const PlanishState last_state) {
     case PlanishState::begin_homing:
     case PlanishState::homing_wait_for_disable:
     case PlanishState::wait_for_homing:
+      // special case where telling the motor to stop won't stop it. it needs to be disabled.
       home_indicator_light.setPattern(LightPattern::OFF);
-      CARRIAGE_MOTOR.EnableRequest(false);
+      MOTOR_COMMAND(CARRIAGE_MOTOR.EnableRequest(false););
       is_homed = false;
       return PlanishState::idle;
 
