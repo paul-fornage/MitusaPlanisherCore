@@ -58,7 +58,7 @@ enum class EstopReason {
   motor_error,        // The motor has an error, this can only be rectified by re-homing
 };
 
-enum class PlanishStates {
+enum class PlanishState {
   post,                       // Power On Self Test
   begin_homing,               // start axis homing
   homing_wait_for_disable,    // during homing the motor needs to wait between disabling and re-enabling
@@ -93,9 +93,9 @@ enum class PlanishStates {
   saving_job_to_nvram,        // Job is recorded and needs to be saved in NVRAM
 };
 
-volatile PlanishStates estop_last_state;  // When an estop is called, this gets set to whatever the current state was.
-volatile PlanishStates estop_resume_state;      // When an estop is resolved, this stores where to resume
-volatile PlanishStates machine_state;     // the current state of the machine. Volatile because it can be changed by estop ISR
+volatile PlanishState estop_last_state;  // When an estop is called, this gets set to whatever the current state was.
+volatile PlanishState estop_resume_state;      // When an estop is resolved, this stores where to resume
+volatile PlanishState machine_state;     // the current state of the machine. Volatile because it can be changed by estop ISR
 
 volatile IndicatorLight home_indicator_light;   /// Defined globally, but should not be accessed unless configure_IO has completed without errors
 volatile IndicatorLight learn_indicator_light;  /// Defined globally, but should not be accessed unless configure_IO has completed without errors
@@ -143,6 +143,7 @@ volatile EstopReason estop_reason = EstopReason::NONE;
 
 #define ESTOP_COOLDOWN_MS 1000
 #define ESTOP_SW_SAFE_STATE 1
+#define MANDREL_LATCH_LMT_SAFE_STATE 1 // MANDREL_LATCH_LMT.State() should return this when it's safe/down/engaged
 
 #define JOG_FWD_SW_ACTIVE_STATE 0
 #define JOG_REV_SW_ACTIVE_STATE 0
@@ -179,9 +180,10 @@ void motor_jog(bool reverse);
 void update_buttons();
 void update_speed_pot();
 void e_stop_handler(EstopReason reason);
-PlanishStates secure_system(PlanishStates last_state);
+PlanishState secure_system(PlanishState last_state);
+PlanishState state_machine(PlanishState state);
 
-const char *get_state_name(PlanishStates state);
+const char *get_state_name(PlanishState state);
 
 extern "C" void TCC2_0_Handler(void) __attribute__((
             alias("PeriodicInterrupt")));
@@ -194,7 +196,7 @@ void setup() {
   ESTOP_SW.FilterLength(5, DigitalIn::FILTER_UNIT_SAMPLES);
   ESTOP_SW.InterruptHandlerSet(e_stop_button_handler, InputManager::InterruptTrigger::CHANGE);
   if (ESTOP_SW.State() != ESTOP_SW_SAFE_STATE) { // make sure e-stop wasn't already depressed before interrupt was registered
-    e_stop_button_handler();
+    e_stop_handler(EstopReason::button);
   }
 
   ConnectorUsb.PortOpen();
@@ -208,11 +210,7 @@ void setup() {
   }
 
   // Debug delay to be able to restart motor before program starts
-  uint8_t delay_cycles = 3;
-  while (delay_cycles--) {
-    delay(1000);
-    ConnectorUsb.SendLine(delay_cycles);
-  }
+  delay(1000);
 
   read_job_from_nvram();
 
@@ -223,19 +221,18 @@ void setup() {
 
   io_configured = configure_io();
 
-  if (io_configured) {          // if the IO was successfully configured,
-    machine_state = PlanishStates::post;
-    // do this twice so that the buffer only contains measured values
-    update_buttons();
-    update_buttons();
-  } else {                      // if the IO failed to configure properly
+  if (!io_configured) {           // if the IO failed to configure properly
     ConnectorUsb.SendLine("IO was not configured successfully, hanging");
     e_stop_handler(EstopReason::internal_error);
     return;
   }
+  // do this twice so that the buffer only contains measured values
+  update_buttons();
+  update_buttons();
 
   last_iteration_time = millis();
-  machine_state = PlanishStates::post;
+  machine_state = PlanishState::post;
+
 }
 
 
@@ -245,74 +242,78 @@ void loop() {
   // Fix by checking at the beginning of every cycle
   if (is_e_stop) {
     // Also make sure that the e-stop hasn't been handled already and is now waiting for rectification
-    if (machine_state != PlanishStates::e_stop_wait) {
-      machine_state = PlanishStates::e_stop_begin;
+    if (machine_state != PlanishState::e_stop_wait) {
+      machine_state = PlanishState::e_stop_begin;
       CARRIAGE_MOTOR.MoveStopAbrupt();
     }
   }
 
   loop_num++;
 
-  if (io_configured) {
-    // on the first execution it is possible that IO is not configured
-    update_buttons();
-    if (loop_num%64==0) {
-      update_speed_pot();
-    }
-  }
 
   last_iteration_time = millis();
 
+  // state machine state machine machine state
+  // Run one instance of the state machine
+  machine_state = state_machine(machine_state);
+
+  // both of these calls rely on io being configured but it
+  update_buttons();
+  if (loop_num%32==0) {
+    update_speed_pot();
+  }
+
+}
+
+PlanishState state_machine(PlanishState state) {
   switch (machine_state) {
-    case PlanishStates::post:  // Not used anymore but could be in the future
+    case PlanishState::post:  // Not used anymore but could be in the future
       ConnectorUsb.SendLine("Power on self test");
-      machine_state = PlanishStates::idle;
-      break;
-    case PlanishStates::begin_homing:
+      return PlanishState::idle;
+
+    case PlanishState::begin_homing:
       ConnectorUsb.SendLine("begin homing");
       CARRIAGE_MOTOR.EnableRequest(false);
       homing_disable_time = millis();
-      machine_state = PlanishStates::homing_wait_for_disable;
-      break;
-    case PlanishStates::homing_wait_for_disable:
+      return PlanishState::homing_wait_for_disable;
+
+    case PlanishState::homing_wait_for_disable:
       if (millis() - homing_disable_time > MOTOR_EN_DIS_DELAY_MS) {
         CARRIAGE_MOTOR.EnableRequest(true);
         home_indicator_light.setPattern(LightPattern::BLINK);
-        machine_state = PlanishStates::wait_for_homing;
+        return PlanishState::wait_for_homing;
       }
-      break;
-    case PlanishStates::wait_for_homing:
+      return PlanishState::homing_wait_for_disable;
+
+    case PlanishState::wait_for_homing:
       if (CARRIAGE_MOTOR.HlfbState() == MotorDriver::HLFB_ASSERTED) {
         // homing done no errors
         ConnectorUsb.SendLine("homing complete");
+        // the position saved in the local motor instance is not neccesarily the same of the motor FW.
+        // this line ensures they are set to the same thing, but when there seems to be a rounding error between the two
+        // can confirm they don't desync over the course of at least ~20,000 steps
         CARRIAGE_MOTOR.PositionRefSet(0);
         is_homed = true;
         home_indicator_light.setPattern(LightPattern::ON);
-        machine_state = PlanishStates::idle;
-      } else if (CARRIAGE_MOTOR.StatusReg().bit.AlertsPresent) {
-        // motor has an error
+        return PlanishState::idle;
+      }
 
+      if (CARRIAGE_MOTOR.StatusReg().bit.AlertsPresent) { // motor has an error
         if(CARRIAGE_MOTOR.AlertReg().bit.MotionCanceledMotorDisabled) {
           ConnectorUsb.SendLine("Motor was commanded to move before enabling."
                                 "depending on how the code turns out this might not be problematic");
         }
-
         ConnectorUsb.SendLine("Motor alert detected during homing.");
         print_motor_alerts();
         e_stop_handler(EstopReason::motor_error);
-      } else {
-        // still homing
       }
-      break;
-    case PlanishStates::idle:
-      // if (loop_num%128==0) {
-      //   ConnectorUsb.Send("CARRIAGE_MOTOR.PositionRefCommanded() == ");
-      //   ConnectorUsb.SendLine(CARRIAGE_MOTOR.PositionRefCommanded());
-      // }
-      if (!is_e_stop && MANDREL_LATCH_LMT.State()) {
+
+      return PlanishState::wait_for_homing;
+
+    case PlanishState::idle:
+      if (MANDREL_LATCH_LMT.State() == MANDREL_LATCH_LMT_SAFE_STATE) {
         if (HomeButton.is_rising()) {
-          machine_state = PlanishStates::begin_homing;
-          break;
+          return PlanishState::begin_homing;
         }
         if (FingerButton.is_rising()) {
           const bool new_finger_state = !is_fingers_down;
@@ -323,23 +324,22 @@ void loop() {
           // Despite the '==' in that expression, this check is to see if there is a MISMATCH between
           // measured and commanded head state.
           set_head_state(HeadButton.get_current_state());
-          machine_state = PlanishStates::wait_for_head;
-          break;
+          return PlanishState::wait_for_head;
+
         }
         if (is_homed) {
           if (JOG_FWD_SW.State() == JOG_FWD_SW_ACTIVE_STATE
               || JOG_REV_SW.State() == JOG_REV_SW_ACTIVE_STATE) {
-            machine_state = PlanishStates::manual_jog;
+            return PlanishState::manual_jog;
             break;
-          }
+              }
           if (LearnButton.is_rising()) {
-            machine_state = PlanishStates::learn_start_pos;
+            return PlanishState::learn_start_pos;
             break;
           }
           if (CycleButton.is_rising()) {
             if (is_fingers_down) {
-              machine_state = PlanishStates::job_begin;
-              break;
+              return PlanishState::job_begin;
             } else {
               ConnectorUsb.SendLine("Tried to start cycle without fingers engaged");
             }
@@ -347,17 +347,17 @@ void loop() {
         }
       }
       break;
-    case PlanishStates::wait_for_head:
+    case PlanishState::wait_for_head:
       if (loop_num%512==0) {
         ConnectorUsb.Send("Waiting for head. Currently commanded ");
         ConnectorUsb.SendLine(is_head_commanded_down ? "down." : "up.");
       }
       if (is_head_commanded_down != HEAD_UP_LMT.State()) {
-        machine_state = PlanishStates::idle;
+        return PlanishState::idle;
       }
-      break;  
-    case PlanishStates::manual_jog:
-      if (!is_e_stop && MANDREL_LATCH_LMT.State() && is_homed) {
+      break;
+    case PlanishState::manual_jog:
+      if (MANDREL_LATCH_LMT.State() == MANDREL_LATCH_LMT_SAFE_STATE && is_homed) {
         if (JOG_FWD_SW.State() == JOG_FWD_SW_ACTIVE_STATE) {
           motor_jog(false);
           break;
@@ -367,17 +367,17 @@ void loop() {
           break;
         }
       }
-      machine_state = PlanishStates::idle;
       CARRIAGE_MOTOR.MoveStopDecel();
-      break;
-    case PlanishStates::e_stop_begin:
+      return PlanishState::idle;
+
+    case PlanishState::e_stop_begin:
       ConnectorUsb.SendLine("PlanishStates::e_stop_begin");
       estop_resume_state = secure_system(estop_last_state);
       ConnectorUsb.Send("secure_system returns");
       ConnectorUsb.Send(get_state_name(estop_resume_state));
-      machine_state = PlanishStates::e_stop_wait;
-      break;
-    case PlanishStates::e_stop_wait:
+      return PlanishState::e_stop_wait;
+
+    case PlanishState::e_stop_wait:
       ConnectorUsb.SendLine("PlanishStates::e_stop_wait");
       switch (estop_reason) {
         case EstopReason::NONE:
@@ -389,7 +389,7 @@ void loop() {
               && (millis() - last_estop_millis > ESTOP_COOLDOWN_MS))
           { // if the button was released and the estop has been active for over a second
             ConnectorUsb.SendLine("Emergency Stop Released, resuming");
-            machine_state = estop_resume_state;
+            return estop_resume_state;
             is_e_stop = false;
             break;
           }
@@ -397,17 +397,15 @@ void loop() {
         case EstopReason::mandrel_latch:
           if ((ESTOP_SW.State() == ESTOP_SW_SAFE_STATE)
               && (millis() - last_estop_millis > ESTOP_COOLDOWN_MS)
-              && (MANDREL_LATCH_LMT.State()))
+              && (MANDREL_LATCH_LMT.State() == MANDREL_LATCH_LMT_SAFE_STATE))
           { // if the latch was fixed and the button hasn't been pressed and the estop has been active for over a second
             ConnectorUsb.SendLine("Mandrel put back, resuming");
-            machine_state = estop_resume_state;
             is_e_stop = false;
-            break;
+            return estop_resume_state;
           }
           break;
         case EstopReason::internal_error:
-          machine_state = PlanishStates::error;
-          break;
+          return PlanishState::error;
         case EstopReason::motor_error:
           if ((ESTOP_SW.State() == ESTOP_SW_SAFE_STATE)
               && (millis() - last_estop_millis > ESTOP_COOLDOWN_MS)
@@ -415,7 +413,7 @@ void loop() {
           { // if the button was released and the estop has been active for over a second
             ConnectorUsb.SendLine("Motor error cleared by homing, resuming");
             home_indicator_light.setPattern(LightPattern::OFF);
-            machine_state = PlanishStates::begin_homing;
+            return PlanishState::begin_homing;
             is_e_stop = false;
             break;
           }
@@ -423,147 +421,152 @@ void loop() {
           break;
       }
       break;
-    case PlanishStates::error:
+    case PlanishState::error:
       home_indicator_light.setPattern(LightPattern::STROBE);
       learn_indicator_light.setPattern(LightPattern::STROBE);
       while (true) {
         ConnectorUsb.SendLine("reached error state");
         delay(1000);
       }
-      break;
-    case PlanishStates::job_begin:
+
+    case PlanishState::job_begin:
       set_head_state(false);
       if (HEAD_UP_LMT.State()) {
         ConnectorUsb.SendLine("Job started head was already up");
-        machine_state = PlanishStates::job_jog_to_start;
+        return PlanishState::job_jog_to_start;
       } else {
         ConnectorUsb.SendLine("Job was started but the head was already down, raising");
-        machine_state = PlanishStates::job_begin_lifting_head;
+        return PlanishState::job_begin_lifting_head;
       }
-      break;
-    case PlanishStates::job_begin_lifting_head:
-      if (!MANDREL_LATCH_LMT.State()) {
+
+    case PlanishState::job_begin_lifting_head:
+      if (!MANDREL_LATCH_LMT.State() == MANDREL_LATCH_LMT_SAFE_STATE) {
         ConnectorUsb.SendLine("mandrel limit precondition failed since starting job");
         e_stop_handler(EstopReason::mandrel_latch);
         break;
       }
       if (HEAD_UP_LMT.State()) {
-        machine_state = PlanishStates::job_jog_to_start;
+        return PlanishState::job_jog_to_start;
       }
       if (loop_num%512==0) {
         ConnectorUsb.SendLine("Waiting for head to rise for job start");
       }
       break;
-    case PlanishStates::job_jog_to_start:
+
+    case PlanishState::job_jog_to_start:
       ConnectorUsb.SendLine("Jog to start");
       move_motor_auto_speed(saved_job_start_pos);
-      machine_state = PlanishStates::job_jog_to_start_wait;
-      break;
-    case PlanishStates::job_jog_to_start_wait:
+      return PlanishState::job_jog_to_start_wait;
+
+    case PlanishState::job_jog_to_start_wait:
       CARRIAGE_MOTOR.VelMax(current_jog_speed);
       if (wait_for_motion()) {
-        machine_state = PlanishStates::job_head_down;
+        return PlanishState::job_head_down;
       }
       if (loop_num%512==0) {
         ConnectorUsb.SendLine("waiting for jog to start");
       }
       break;
-    case PlanishStates::job_head_down:
+
+    case PlanishState::job_head_down:
       ConnectorUsb.SendLine("Lowering head");
       set_head_state(true);
-      machine_state = PlanishStates::job_head_down_wait;
-      break;
-    case PlanishStates::job_head_down_wait:
-      if (!MANDREL_LATCH_LMT.State()) {
+      return PlanishState::job_head_down_wait;
+
+    case PlanishState::job_head_down_wait:
+      if (!MANDREL_LATCH_LMT.State() == MANDREL_LATCH_LMT_SAFE_STATE) {
         ConnectorUsb.SendLine("mandrel limit precondition failed since starting job");
         e_stop_handler(EstopReason::mandrel_latch);
         break;
       }
       if (!HEAD_UP_LMT.State()) {
-        machine_state = PlanishStates::job_planish_to_end;
+        return PlanishState::job_planish_to_end;
       }
       if (loop_num%512==0) {
         ConnectorUsb.SendLine("Waiting for head to lower to begin planish");
       }
       break;
-    case PlanishStates::job_planish_to_end:
+    case PlanishState::job_planish_to_end:
       ConnectorUsb.SendLine("Planishing to end position");
       move_motor_auto_speed(saved_job_end_pos);
-      machine_state = PlanishStates::job_planish_to_end_wait;
-      break;
-    case PlanishStates::job_planish_to_end_wait:
+      return PlanishState::job_planish_to_end_wait;
+
+    case PlanishState::job_planish_to_end_wait:
       CARRIAGE_MOTOR.VelMax(current_planish_speed);
       if (wait_for_motion()) {
         if (HALF_CYCLE_SW.State()) {
           ConnectorUsb.SendLine("half cycle detected, go to park");
           // if only doing a half-cycle, the single pass thus far is sufficient. retract head and return to park
-          machine_state = PlanishStates::job_head_up;
+          return PlanishState::job_head_up;
         } else {
           ConnectorUsb.SendLine("full cycle detected, do second pass");
           // otherwise do the other pass
-          machine_state = PlanishStates::job_planish_to_start;
+          return PlanishState::job_planish_to_start;
         }
       }
       if (loop_num%512==0) {
         ConnectorUsb.SendLine("Planishing to end position");
       }
       break;
-    case PlanishStates::job_planish_to_start:
+
+    case PlanishState::job_planish_to_start:
       ConnectorUsb.SendLine("Begin planishing to start position");
       move_motor_auto_speed(saved_job_start_pos);
-      machine_state = PlanishStates::job_planish_to_start_wait;
-      break;
-    case PlanishStates::job_planish_to_start_wait:
+      return PlanishState::job_planish_to_start_wait;
+
+    case PlanishState::job_planish_to_start_wait:
       CARRIAGE_MOTOR.VelMax(current_planish_speed);
       if (wait_for_motion()) {
-        machine_state = PlanishStates::job_head_up;
+        return PlanishState::job_head_up;
       }
       if (loop_num%512==0) {
         ConnectorUsb.SendLine("Planishing to start position");
       }
       break;
-    case PlanishStates::job_head_up:
+
+    case PlanishState::job_head_up:
       ConnectorUsb.SendLine("Raising head");
       set_head_state(false);
-      machine_state = PlanishStates::job_head_up_wait;
-      break;
-    case PlanishStates::job_head_up_wait:
-      if (!MANDREL_LATCH_LMT.State()) {
+      return PlanishState::job_head_up_wait;
+
+    case PlanishState::job_head_up_wait:
+      if (!MANDREL_LATCH_LMT.State() == MANDREL_LATCH_LMT_SAFE_STATE) {
         ConnectorUsb.SendLine("mandrel limit precondition failed since starting job");
         e_stop_handler(EstopReason::mandrel_latch);
         break;
       }
       if (HEAD_UP_LMT.State()) {
-        machine_state = PlanishStates::job_jog_to_park;
+        return PlanishState::job_jog_to_park;
       }
       if (loop_num%512==0) {
         ConnectorUsb.SendLine("Waiting for head to raise to park");
       }
       break;
-    case PlanishStates::job_jog_to_park:
+
+    case PlanishState::job_jog_to_park:
       ConnectorUsb.SendLine("Begin jogging to park position");
       move_motor_auto_speed(saved_job_park_pos);
-      machine_state = PlanishStates::job_jog_to_park_wait;
-      break;
-    case PlanishStates::job_jog_to_park_wait:
+      return PlanishState::job_jog_to_park_wait;
+
+    case PlanishState::job_jog_to_park_wait:
       CARRIAGE_MOTOR.VelMax(current_jog_speed);
       if (wait_for_motion()) {
-        machine_state = PlanishStates::idle;
+        return PlanishState::idle;
       }
       if (loop_num%512==0) {
         ConnectorUsb.SendLine("Jogging to park position");
       }
       break;
-    case PlanishStates::learn_start_pos:
+    case PlanishState::learn_start_pos:
       learn_indicator_light.setPattern(LightPattern::FLASH1);
       ConnectorUsb.SendLine("learn start pos");
       temp_job_start_pos = CARRIAGE_MOTOR.PositionRefCommanded();
-      machine_state = PlanishStates::learn_jog_to_end_pos;
-      break;
-    case PlanishStates::learn_jog_to_end_pos:
-      if (!is_e_stop && MANDREL_LATCH_LMT.State() && is_homed) {
+      return PlanishState::learn_jog_to_end_pos;
+
+    case PlanishState::learn_jog_to_end_pos:
+      if (MANDREL_LATCH_LMT.State() == MANDREL_LATCH_LMT_SAFE_STATE && is_homed) {
         if (LearnButton.is_rising()) {
-          machine_state = PlanishStates::learn_end_pos;
+          return PlanishState::learn_end_pos;
           break;
         }
         if (JOG_FWD_SW.State() == JOG_FWD_SW_ACTIVE_STATE) {
@@ -577,16 +580,17 @@ void loop() {
       }
       CARRIAGE_MOTOR.MoveStopDecel();
       break;
-    case PlanishStates::learn_end_pos:
+
+    case PlanishState::learn_end_pos:
       learn_indicator_light.setPattern(LightPattern::FLASH2);
       ConnectorUsb.SendLine("learn end pos");
       temp_job_end_pos = CARRIAGE_MOTOR.PositionRefCommanded();
-      machine_state = PlanishStates::learn_jog_to_park_pos;
-      break;
-    case PlanishStates::learn_jog_to_park_pos:
-      if (!is_e_stop && MANDREL_LATCH_LMT.State() && is_homed) {
+      return PlanishState::learn_jog_to_park_pos;
+
+    case PlanishState::learn_jog_to_park_pos:
+      if (MANDREL_LATCH_LMT.State() == MANDREL_LATCH_LMT_SAFE_STATE && is_homed) {
         if (LearnButton.is_rising()) {
-          machine_state = PlanishStates::learn_park_pos;
+          return PlanishState::learn_park_pos;
           break;
         }
         if (JOG_FWD_SW.State() == JOG_FWD_SW_ACTIVE_STATE) {
@@ -600,22 +604,19 @@ void loop() {
       }
       CARRIAGE_MOTOR.MoveStopDecel();
       break;
-    case PlanishStates::learn_park_pos:
+    case PlanishState::learn_park_pos:
       learn_indicator_light.setPattern(LightPattern::FLASH3);
       ConnectorUsb.SendLine("learn park pos");
       temp_job_park_pos = CARRIAGE_MOTOR.PositionRefCommanded();
-      machine_state = PlanishStates::saving_job_to_nvram;
-      break;
-    case PlanishStates::saving_job_to_nvram:
+      return PlanishState::saving_job_to_nvram;
+    case PlanishState::saving_job_to_nvram:
       ConnectorUsb.SendLine("saving job to nvram");
       ConnectorUsb.SendLine(temp_job_start_pos);
       ConnectorUsb.SendLine(temp_job_end_pos);
       ConnectorUsb.SendLine(temp_job_park_pos);
       save_job_to_nvram();
       learn_indicator_light.setPattern(LightPattern::OFF);
-
-      machine_state = PlanishStates::idle;
-      break;
+      return PlanishState::idle;
   }
 }
 
@@ -717,7 +718,7 @@ bool wait_for_motion() {
     return false;
   }
 
-  if (!MANDREL_LATCH_LMT.State()) {
+  if (MANDREL_LATCH_LMT.State() != MANDREL_LATCH_LMT_SAFE_STATE) {
     e_stop_handler(EstopReason::mandrel_latch);
   }
   return false;
@@ -875,11 +876,11 @@ void e_stop_handler(const EstopReason reason) {
     is_e_stop = true;
     estop_last_state = machine_state;
     CARRIAGE_MOTOR.MoveStopAbrupt();
-    machine_state = PlanishStates::e_stop_begin;
+    machine_state = PlanishState::e_stop_begin;
     last_estop_millis = millis();
     ConnectorUsb.SendLine("Emergency Stop");
   } else {
-    ConnectorUsb.SendLine("Emergency Stop ISR called when e-stop was already active");
+    ConnectorUsb.SendLine("Emergency Stop Handler called when e-stop was already active");
   }
 }
 
@@ -909,6 +910,9 @@ void print_motor_alerts(){
 /**
  * Convert bytes to u32. Big endian, little endian?
  * I don't know, but it works with `u32_to_bytes()`
+ *
+ * @warning `bytes[offset+3]` needs to be a valid address
+ *
  * @param bytes Const; The bytes to turn into a u32
  * @param offset Offset for accessing array
  * @return the u32
@@ -924,6 +928,9 @@ uint32_t bytes_to_u32(const uint8_t *bytes, const uint32_t offset) {
 /**
  * Convert uint32_t into bytes. Big endian, little endian?
  * I don't know, but it works with `bytes_to_u32()`
+ *
+ * @warning `bytes[offset+3]` needs to be a valid address
+ *
  * @param value The u32 to convert
  * @param bytes Where that converted u32 should go
  * @param offset Offset for writing to array
@@ -1055,99 +1062,96 @@ void update_speed_pot() {
  * @param last_state The state of the system before the e-stop
  * @return The state to resume to once the E-stop cause was rectified
  */
-PlanishStates secure_system(const PlanishStates last_state) {
+PlanishState secure_system(const PlanishState last_state) {
   ConnectorUsb.Send("secure_system called with state: ");
   ConnectorUsb.Send(get_state_name(last_state));
   switch (last_state) {
-    case PlanishStates::post:
+    case PlanishState::post:
       // E-stop during post isn't worth recovering. Recover from what?
-      return PlanishStates::error;
+      return PlanishState::error;
 
-    case PlanishStates::begin_homing:
-    case PlanishStates::homing_wait_for_disable:
-    case PlanishStates::wait_for_homing:
+    case PlanishState::begin_homing:
+    case PlanishState::homing_wait_for_disable:
+    case PlanishState::wait_for_homing:
       home_indicator_light.setPattern(LightPattern::OFF);
       CARRIAGE_MOTOR.EnableRequest(false);
       is_homed = false;
-      return PlanishStates::idle;
+      return PlanishState::idle;
 
-    case PlanishStates::idle:
-      return PlanishStates::idle;
+    case PlanishState::idle:
+      return PlanishState::idle;
 
-    case PlanishStates::manual_jog:
-      return PlanishStates::idle;
+    case PlanishState::manual_jog:
+      return PlanishState::idle;
 
-    case PlanishStates::e_stop_begin:
-    case PlanishStates::e_stop_wait:
+    case PlanishState::e_stop_begin:
+    case PlanishState::e_stop_wait:
       // This is not a valid state. The state before the E-stop ran should never be e-stop
-      return PlanishStates::error;
+      return PlanishState::error;
 
-    case PlanishStates::error:
+    case PlanishState::error:
       // This would mean the machine was in an error state before the e-stop.
-      return PlanishStates::error;
+      return PlanishState::error;
 
-    case PlanishStates::wait_for_head:
+    case PlanishState::wait_for_head:
       if (is_head_commanded_down == HEAD_UP_LMT.State()) { // despite the `==` this check if there is a mismatch
         set_head_state(false); // if the head was in motion, raise it
       } // if the head was not in motion, then it's fine to keep where it is
-      return PlanishStates::idle;
+      return PlanishState::idle;
 
-    case PlanishStates::job_begin:
-      return PlanishStates::job_begin;
+    case PlanishState::job_begin:
+      return PlanishState::job_begin;
 
-    case PlanishStates::job_begin_lifting_head:
+    case PlanishState::job_begin_lifting_head:
       // this is safe to resume, stateless
-      return PlanishStates::job_begin_lifting_head;
+      return PlanishState::job_begin_lifting_head;
 
-    case PlanishStates::job_jog_to_start:
-    case PlanishStates::job_jog_to_start_wait:
-      return PlanishStates::job_jog_to_start;
+    case PlanishState::job_jog_to_start:
+    case PlanishState::job_jog_to_start_wait:
+      return PlanishState::job_jog_to_start;
 
-    case PlanishStates::job_head_down:
-      return PlanishStates::job_head_down;
+    case PlanishState::job_head_down:
+      return PlanishState::job_head_down;
 
-    case PlanishStates::job_head_down_wait:
+    case PlanishState::job_head_down_wait:
       if (is_head_commanded_down == HEAD_UP_LMT.State()) { // despite the `==` this check if there is a mismatch
         set_head_state(false); // if the head was in motion, raise it
       } // if the head was not in motion, then it's fine to keep where it is
       // resume by lowering the head again
-      return PlanishStates::job_head_down;
+      return PlanishState::job_head_down;
 
-    case PlanishStates::job_planish_to_end:
-    case PlanishStates::job_planish_to_end_wait:
-      return PlanishStates::job_planish_to_end;
+    case PlanishState::job_planish_to_end:
+    case PlanishState::job_planish_to_end_wait:
+      return PlanishState::job_planish_to_end;
 
-    case PlanishStates::job_planish_to_start:
-    case PlanishStates::job_planish_to_start_wait:
-      return PlanishStates::job_planish_to_start;
+    case PlanishState::job_planish_to_start:
+    case PlanishState::job_planish_to_start_wait:
+      return PlanishState::job_planish_to_start;
 
-    case PlanishStates::job_head_up:
-      return PlanishStates::job_head_up;
+    case PlanishState::job_head_up:
+      return PlanishState::job_head_up;
 
-    case PlanishStates::job_head_up_wait:
-      return PlanishStates::job_head_up_wait;
+    case PlanishState::job_head_up_wait:
+      return PlanishState::job_head_up_wait;
 
-    case PlanishStates::job_jog_to_park:
-    case PlanishStates::job_jog_to_park_wait:
-      return PlanishStates::job_jog_to_park;
+    case PlanishState::job_jog_to_park:
+    case PlanishState::job_jog_to_park_wait:
+      return PlanishState::job_jog_to_park;
 
-    case PlanishStates::learn_start_pos:
-    case PlanishStates::learn_jog_to_end_pos:
-    case PlanishStates::learn_end_pos:
-    case PlanishStates::learn_jog_to_park_pos:
-    case PlanishStates::learn_park_pos:
+    case PlanishState::learn_start_pos:
+    case PlanishState::learn_jog_to_end_pos:
+    case PlanishState::learn_end_pos:
+    case PlanishState::learn_jog_to_park_pos:
+    case PlanishState::learn_park_pos:
       // An estop here will cancel the learn operation
       learn_indicator_light.setPattern(LightPattern::OFF);
-      return PlanishStates::idle;
+      return PlanishState::idle;
 
-    case PlanishStates::saving_job_to_nvram:
-      return PlanishStates::saving_job_to_nvram;
+    case PlanishState::saving_job_to_nvram:
+      return PlanishState::saving_job_to_nvram;
   }
-  return PlanishStates::error;
+  return PlanishState::error;
 }
-
-
-
 
 
 /**
@@ -1155,8 +1159,8 @@ PlanishStates secure_system(const PlanishStates last_state) {
  * @param state
  * @return the name of the state in the codebase.
  */
-const char *get_state_name(const PlanishStates state) {
-#define STATE_NAME(state) case PlanishStates::state: return #state;
+const char *get_state_name(const PlanishState state) {
+#define STATE_NAME(state) case PlanishState::state: return #state;
   switch (state) {
     STATE_NAME(post);
     STATE_NAME(begin_homing);
