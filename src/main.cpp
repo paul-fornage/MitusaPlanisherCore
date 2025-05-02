@@ -173,8 +173,8 @@ volatile EstopReason estop_reason = EstopReason::NONE;
 #define ESTOP_SW_SAFE_STATE 1
 #define MANDREL_LATCH_LMT_SAFE_STATE 1 // MANDREL_LATCH_LMT.State() should return this when it's safe/down/engaged
 
-#define JOG_FWD_SW_ACTIVE_STATE 0
-#define JOG_REV_SW_ACTIVE_STATE 0
+#define JOG_FWD_SW_ACTIVE_STATE 1
+#define JOG_REV_SW_ACTIVE_STATE 1
 
 #define ADC_RES_BITS 12
 #define ADC_MAX_VALUE ((1 << ADC_RES_BITS)-1)
@@ -214,35 +214,36 @@ void update_speed_pot();
 void e_stop_handler(EstopReason reason);
 PlanishState secure_system(PlanishState last_state);
 PlanishState state_machine(PlanishState state_in);
+const char *get_estop_reason_name(EstopReason state);
 
 const char *get_state_name(PlanishState state);
 
 extern "C" void TCC2_0_Handler(void) __attribute__((
             alias("PeriodicInterrupt")));
 
+volatile bool debug_isr_flag = false;
 
 
 void setup() {
 
   ESTOP_SW.Mode(Connector::INPUT_DIGITAL);
   ESTOP_SW.FilterLength(5, DigitalIn::FILTER_UNIT_SAMPLES);
-  ESTOP_SW.InterruptHandlerSet(e_stop_button_handler, InputManager::InterruptTrigger::CHANGE);
-  if (ESTOP_SW.State() != ESTOP_SW_SAFE_STATE) { // make sure e-stop wasn't already depressed before interrupt was registered
-    e_stop_handler(EstopReason::button);
-  }
 
   ConnectorUsb.PortOpen();
   const uint32_t startTime = millis();
   while (!ConnectorUsb && millis() - startTime < SERIAL_ESTABLISH_TIMEOUT)
     continue;
 
-  if (!ConnectorUsb) {
+  if (ConnectorUsb.IsInHwFault()) {
     e_stop_handler(EstopReason::internal_error);
     return;
   }
 
   // Debug delay to be able to restart motor before program starts
-  delay(4000);
+  delay(2000);
+
+
+
 
   read_job_from_nvram();
 
@@ -265,10 +266,20 @@ void setup() {
   last_iteration_time = millis();
   machine_state = PlanishState::post;
 
+//  ESTOP_SW.InterruptHandlerSet(e_stop_button_handler, InputManager::InterruptTrigger::CHANGE);
+
+
+
 }
 
 
 void loop() {
+
+  if (ESTOP_SW.State() != ESTOP_SW_SAFE_STATE) { // make sure e-stop wasn't already depressed before interrupt was registered
+    ConnectorUsb.SendLine("E-Stop was triggered before interrupt was registered, changing to error");
+    e_stop_handler(EstopReason::button);
+  }
+
   // If the ESTOP ISR is called after a state change condition is met,
   // but before the state change, the `e_stop_begin` set in the ISR will be overwritten.
   // Fix by checking at the beginning of every cycle
@@ -284,6 +295,9 @@ void loop() {
 
   loop_num++;
 
+  if (loop_num%(8*STATE_MACHINE_LOOPS_LOG_INTERVAL)==0) {
+//    ConnectorUsb.SendLine(get_state_name(machine_state));
+  }
 
   last_iteration_time = millis();
 
@@ -357,6 +371,7 @@ PlanishState state_machine(const PlanishState state_in) {
           set_finger_state(new_finger_state);
         }
         if (HeadButton.is_changing()) {
+          // TODO: Make sure fingers are engaged for this and head lowering
           // Although the head switch is not momentary, changes should only be made when the user commands it, to avoid
           // unexpected moves when relinquishing head control to user after a job
           set_head_state(HeadButton.get_current_state());
@@ -399,7 +414,11 @@ PlanishState state_machine(const PlanishState state_in) {
             ConnectorUsb.SendLine("Tried to start cycle without fingers engaged or being homed");
           }
         }
-      } // </ Mandrel limit switch in safe position>
+      } else {// </ Mandrel limit switch in safe position>
+        if(loop_num%STATE_MACHINE_LOOPS_LOG_INTERVAL==0) {
+          ConnectorUsb.SendLine("Mandrel limit switch not in safe position");
+        }
+      }
       return PlanishState::idle;
     case PlanishState::wait_for_head:
       if (loop_num%STATE_MACHINE_LOOPS_LOG_INTERVAL==0) {
@@ -490,8 +509,11 @@ PlanishState state_machine(const PlanishState state_in) {
       home_indicator_light.setPattern(LightPattern::STROBE);
       learn_indicator_light.setPattern(LightPattern::STROBE);
       while (true) {
-        ConnectorUsb.SendLine("reached error state");
+        ConnectorUsb.SendLine("reached error state.");
+        ConnectorUsb.Send("estop reason: ");
+        ConnectorUsb.SendLine(get_estop_reason_name(estop_reason));
         delay(1000);
+
       }
 
     case PlanishState::job_begin:
@@ -755,9 +777,11 @@ bool configure_io() {
   home_indicator_light.setPin(CcioMgr.PinByIndex(HOME_SW_LIGHT));
   home_indicator_light.setPeriod(50);
   home_indicator_light.setPattern(LightPattern::OFF);
+  home_indicator_light.setInverted(false);
   learn_indicator_light.setPin(CcioMgr.PinByIndex(LEARN_SW_LIGHT));
   learn_indicator_light.setPeriod(50);
   learn_indicator_light.setPattern(LightPattern::OFF);
+  learn_indicator_light.setInverted(true);
 
   MOTOR_COMMAND(MotorMgr.MotorInputClocking(MotorManager::CLOCK_RATE_NORMAL););
   MOTOR_COMMAND(MotorMgr.MotorModeSet(MotorManager::MOTOR_ALL, Connector::CPM_MODE_STEP_AND_DIR););
@@ -945,6 +969,7 @@ void set_ccio_pin(
  */
 void e_stop_button_handler() {
   e_stop_handler(EstopReason::button);
+  debug_isr_flag = true;
   ConnectorUsb.SendLine("ISR");
 }
 
@@ -1153,8 +1178,7 @@ PlanishState secure_system(const PlanishState last_state) {
   ConnectorUsb.Send(get_state_name(last_state));
   switch (last_state) {
     case PlanishState::post:
-      // E-stop during post isn't worth recovering. Recover from what?
-      return PlanishState::error;
+      return PlanishState::post;
 
     case PlanishState::begin_homing:
     case PlanishState::homing_wait_for_disable:
@@ -1283,3 +1307,19 @@ const char *get_state_name(const PlanishState state) {
   return "INVALID_STATE";
 }
 
+/**
+ * For debugging.
+ * @param state
+ * @return the name of the state in the codebase.
+ */
+const char *get_estop_reason_name(const EstopReason state) {
+#define REASON_NAME(reason) case EstopReason::reason: return #reason;
+  switch (state) {
+    REASON_NAME(NONE)
+    REASON_NAME(button)
+    REASON_NAME(mandrel_latch)
+    REASON_NAME(internal_error)
+    REASON_NAME(motor_error)
+  }
+  return "INVALID_STATE";
+}

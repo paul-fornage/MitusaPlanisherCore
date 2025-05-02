@@ -1,10 +1,10 @@
 
 #include "indicator_light.h"
-#include "ClearCore.h"
 #include "Arduino.h"
 
 IndicatorLight::IndicatorLight(Connector* outputPin)
-    : pin(outputPin)
+    : inverted(false)
+    , pin(outputPin)
     , pattern(LightPattern::OFF)
     , period(100)
     , tick_counter(0)
@@ -12,7 +12,8 @@ IndicatorLight::IndicatorLight(Connector* outputPin)
 }
 
 IndicatorLight::IndicatorLight()
-    : pin(nullptr)
+    : inverted(false)
+    , pin(nullptr)
     , pattern(LightPattern::OFF)
     , period(100)
     , tick_counter(0)
@@ -83,6 +84,10 @@ void IndicatorLight::tick() volatile {
     output_state = calculateOutput();
     
     // Update output pin
-    pin->State(!output_state);
+    pin->State(output_state != inverted);
 
+}
+
+void IndicatorLight::setInverted(bool is_inverted) volatile {
+  inverted = is_inverted;
 }

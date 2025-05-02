@@ -34,6 +34,8 @@ public:
      */
     void setPattern(LightPattern newPattern) volatile;
 
+    void setInverted(bool is_inverted) volatile;
+
     /**
      * Set the period
      * @param newPeriod The period over which to repeat the pattern. Measured in 8ms; eg period of 4 repeats over 32ms
@@ -51,6 +53,7 @@ public:
     LightPattern getPattern() const volatile { return pattern; }
 
 private:
+    bool inverted;
     Connector* pin;
     LightPattern pattern;
     uint32_t period;
