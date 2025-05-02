@@ -224,12 +224,8 @@ extern "C" void TCC2_0_Handler(void) __attribute__((
 
 void setup() {
 
-  ESTOP_SW.Mode(Connector::INPUT_DIGITAL);
-  ESTOP_SW.FilterLength(5, DigitalIn::FILTER_UNIT_SAMPLES);
-  ESTOP_SW.InterruptHandlerSet(e_stop_button_handler, InputManager::InterruptTrigger::CHANGE);
-  if (ESTOP_SW.State() != ESTOP_SW_SAFE_STATE) { // make sure e-stop wasn't already depressed before interrupt was registered
-    e_stop_handler(EstopReason::button);
-  }
+
+
 
   ConnectorUsb.PortOpen();
   const uint32_t startTime = millis();
@@ -239,6 +235,19 @@ void setup() {
   if (!ConnectorUsb) {
     e_stop_handler(EstopReason::internal_error);
     return;
+  }
+
+  ESTOP_SW.Mode(Connector::INPUT_DIGITAL);
+  ESTOP_SW.FilterLength(5, DigitalIn::FILTER_UNIT_SAMPLES);
+  ESTOP_SW.InterruptHandlerSet(e_stop_button_handler, InputManager::InterruptTrigger::CHANGE);
+
+  while(true) {
+    delay(50);
+    if (ESTOP_SW.State() != ESTOP_SW_SAFE_STATE) { // make sure e-stop wasn't already depressed before interrupt was registered
+      ConnectorUsb.SendLine("UNSAFE");
+    } else {
+      ConnectorUsb.SendLine("SAFE");
+    }
   }
 
   // Debug delay to be able to restart motor before program starts
@@ -258,6 +267,8 @@ void setup() {
     e_stop_handler(EstopReason::internal_error);
     return;
   }
+
+
   // do this twice so that the buffer only contains measured values
   update_buttons();
   update_buttons();
