@@ -16,6 +16,7 @@
 
 
 // TODO: Bug when booting with e-stop on
+// TODO: E-stop ISR
 // TODO: https://piolabs.com/blog/insights/unit-testing-part-1.html#introduction, https://docs.platformio.org/en/latest/advanced/unit-testing/frameworks/doctest.html
 
 
