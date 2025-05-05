@@ -107,7 +107,7 @@ volatile EstopReason estop_reason = EstopReason::NONE;
  * when defined the motor will not move and
  * any commands meant for the motor will be logged/simulated
  */
-// #define TEST_MODE_DISABLE_MOTOR
+ #define TEST_MODE_DISABLE_MOTOR
 
 
 #ifdef TEST_MODE_DISABLE_MOTOR
@@ -238,7 +238,7 @@ void setup() {
 
   ConnectorUsb.PortOpen();
   const uint32_t startTime = millis();
-  while (!ConnectorUsb && millis() - startTime < SERIAL_ESTABLISH_TIMEOUT)
+  while (!ConnectorUsb && ((millis() - startTime) < SERIAL_ESTABLISH_TIMEOUT))
     continue;
 
   if (!ConnectorUsb) {
@@ -489,6 +489,11 @@ PlanishState state_machine(const PlanishState state_in) {
       return PlanishState::wait_for_head;
 
     case PlanishState::wait_for_fingers:
+
+      if (loop_num%STATE_MACHINE_LOOPS_LOG_INTERVAL==0) {
+        ConnectorUsb.Send("Waiting for fingers. Currently commanded ");
+        ConnectorUsb.SendLine(Fingers.get_commanded_state() ? "down." : "up.");
+      }
       if (!IS_MANDREL_SAFE) {
         e_stop_handler(EstopReason::mandrel_latch);
         return PlanishState::e_stop_begin;
@@ -847,18 +852,20 @@ bool configure_io() {
 
   Fingers.set_actuator_pin(CcioMgr.PinByIndex(FINGER_ACTUATION));
   Fingers.set_sense_pin(&FINGER_DOWN_LMT);
-  Fingers.set_commanded_state(false);
-
+  Fingers.set_commanded_state(Fingers.get_measured_state());
+  // TODO: what is the desired behavior for finger and head state on boot
   Head.set_actuator_pin(CcioMgr.PinByIndex(HEAD_ACTUATION));
   Head.set_sense_pin(&HEAD_UP_LMT, true);
-  Head.set_commanded_state(false);
+  Head.set_commanded_state(Head.get_measured_state());
 
   home_indicator_light.setPin(CcioMgr.PinByIndex(HOME_SW_LIGHT));
   home_indicator_light.setPeriod(50);
   home_indicator_light.setPattern(LightPattern::OFF);
+  home_indicator_light.setInverted(true);
   learn_indicator_light.setPin(CcioMgr.PinByIndex(LEARN_SW_LIGHT));
   learn_indicator_light.setPeriod(50);
   learn_indicator_light.setPattern(LightPattern::OFF);
+  learn_indicator_light.setInverted(true);
 
   MOTOR_COMMAND(MotorMgr.MotorInputClocking(MotorManager::CLOCK_RATE_NORMAL););
   MOTOR_COMMAND(MotorMgr.MotorModeSet(MotorManager::MOTOR_ALL, Connector::CPM_MODE_STEP_AND_DIR););
