@@ -107,7 +107,7 @@ volatile EstopReason estop_reason = EstopReason::NONE;
  * when defined the motor will not move and
  * any commands meant for the motor will be logged/simulated
  */
- #define TEST_MODE_DISABLE_MOTOR
+// #define TEST_MODE_DISABLE_MOTOR
 
 
 #ifdef TEST_MODE_DISABLE_MOTOR
@@ -158,17 +158,17 @@ volatile EstopReason estop_reason = EstopReason::NONE;
 #define CCIO_TIMEOUT_MS 10000 // Number of ms to wait for CCIO to connect before failing POST
 
 #define CARRIAGE_MOTOR_MAX_ACCEL 50000
-#define CARRIAGE_MOTOR_MAX_VEL 4000
+#define CARRIAGE_MOTOR_MAX_VEL 10000
 // not a safety limit, just what should the minimum position on the speed selector represent in jog mode
 #define CARRIAGE_MOTOR_MIN_VEL 100
 #define CARRIAGE_MOTOR_MAX_POS 12000
-#define CARRIAGE_MOTOR_MAX_PLANISH_VEL 2000
+#define CARRIAGE_MOTOR_MAX_PLANISH_VEL 4000
 // not a safety limit, just what should the minimum position on the speed selector represent in planish mode
 #define CARRIAGE_MOTOR_MIN_PLANISH_VEL 50
 
 #define ITERATION_TIME_WARNING_MS 50 // after this many milliseconds stuck on one iteration of the state machine, give a warning.
 #define ITERATION_TIME_ERROR_MS 100  // after this many milliseconds stuck on one iteration of the state machine, declare an error
-#define SERIAL_ESTABLISH_TIMEOUT 10000 // Number of ms to wait for serial to establish before failing POST
+#define SERIAL_ESTABLISH_TIMEOUT 5000 // Number of ms to wait for serial to establish before failing POST
 
 /// Interrupt priority for the periodic interrupt. 0 is highest priority, 7 is lowest.
 #define PERIODIC_INTERRUPT_PRIORITY 5
@@ -228,13 +228,13 @@ const char *get_state_name(PlanishState state);
 extern "C" void TCC2_0_Handler(void) __attribute__((
             alias("PeriodicInterrupt")));
 
-volatile bool debug_isr_flag = false;
+
 
 
 void setup() {
 
   ESTOP_SW.Mode(Connector::INPUT_DIGITAL);
-  ESTOP_SW.FilterLength(5, DigitalIn::FILTER_UNIT_SAMPLES);
+//  ESTOP_SW.FilterLength(5, DigitalIn::FILTER_UNIT_SAMPLES);
 
   ConnectorUsb.PortOpen();
   const uint32_t startTime = millis();
@@ -242,12 +242,12 @@ void setup() {
     continue;
 
   if (!ConnectorUsb) {
-    e_stop_handler(EstopReason::internal_error);
-    return;
+//    e_stop_handler(EstopReason::internal_error);
+//    return;
   }
 
   // Debug delay to be able to restart motor before program starts
-  delay(2000);
+//  delay(2000);
 
 
 
@@ -566,6 +566,8 @@ PlanishState state_machine(const PlanishState state_in) {
           return PlanishState::e_stop_wait;
         case EstopReason::internal_error:
           // unrecoverable by design
+          home_indicator_light.setPattern(LightPattern::STROBE);
+          learn_indicator_light.setPattern(LightPattern::STROBE);
           return PlanishState::error;
         case EstopReason::motor_error:
           if ((ESTOP_SW.State() == ESTOP_SW_SAFE_STATE)
@@ -852,11 +854,13 @@ bool configure_io() {
 
   Fingers.set_actuator_pin(CcioMgr.PinByIndex(FINGER_ACTUATION));
   Fingers.set_sense_pin(&FINGER_DOWN_LMT);
-  Fingers.set_commanded_state(Fingers.get_measured_state());
+  Fingers.set_commanded_state(false);
+//  Fingers.set_commanded_state(Fingers.get_measured_state());
   // TODO: what is the desired behavior for finger and head state on boot
   Head.set_actuator_pin(CcioMgr.PinByIndex(HEAD_ACTUATION));
   Head.set_sense_pin(&HEAD_UP_LMT, true);
-  Head.set_commanded_state(Head.get_measured_state());
+//  Head.set_commanded_state(Head.get_measured_state());
+  Head.set_commanded_state(false);
 
   home_indicator_light.setPin(CcioMgr.PinByIndex(HOME_SW_LIGHT));
   home_indicator_light.setPeriod(50);
@@ -1052,7 +1056,6 @@ void set_ccio_pin(
  */
 void e_stop_button_handler() {
   e_stop_handler(EstopReason::button);
-  debug_isr_flag = true;
   ConnectorUsb.SendLine("ISR");
 }
 
@@ -1188,13 +1191,13 @@ bool move_motor_auto_speed(const int32_t position) {
   ConnectorUsb.Send("move_motor_auto_speed(");
   ConnectorUsb.Send(position);
   ConnectorUsb.Send(");");
-  const int32_t speed = Head.get_measured_state() ? current_jog_speed : current_planish_speed;
+  const int32_t speed = Head.is_fully_disengaged() ? current_jog_speed : current_planish_speed;
   MOTOR_COMMAND(CARRIAGE_MOTOR.VelMax(speed););
   return MOTOR_COMMAND(CARRIAGE_MOTOR.Move(position, StepGenerator::MOVE_TARGET_ABSOLUTE););
 }
 
 void motor_jog(const bool reverse) {
-  if (Head.get_measured_state()) {
+  if (Head.is_fully_disengaged()) {
 #ifdef TEST_MODE_DISABLE_MOTOR
     ConnectorUsb.Send("Jog mode CARRIAGE_MOTOR.MoveVelocity(");
     ConnectorUsb.Send(reverse ? -current_jog_speed : current_jog_speed);
