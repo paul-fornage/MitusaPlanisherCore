@@ -159,8 +159,12 @@ volatile EstopReason estop_reason = EstopReason::NONE;
 
 #define CARRIAGE_MOTOR_MAX_ACCEL 50000
 #define CARRIAGE_MOTOR_MAX_VEL 4000
+// not a safety limit, just what should the minimum position on the speed selector represent in jog mode
+#define CARRIAGE_MOTOR_MIN_VEL 100
 #define CARRIAGE_MOTOR_MAX_POS 12000
 #define CARRIAGE_MOTOR_MAX_PLANISH_VEL 2000
+// not a safety limit, just what should the minimum position on the speed selector represent in planish mode
+#define CARRIAGE_MOTOR_MIN_PLANISH_VEL 50
 
 #define ITERATION_TIME_WARNING_MS 50 // after this many milliseconds stuck on one iteration of the state machine, give a warning.
 #define ITERATION_TIME_ERROR_MS 100  // after this many milliseconds stuck on one iteration of the state machine, declare an error
@@ -1157,9 +1161,21 @@ bool move_motor_auto_speed(const int32_t position) {
 
 void motor_jog(const bool reverse) {
   if (HEAD_UP_LMT.State()) {
-    MOTOR_COMMAND(CARRIAGE_MOTOR.MoveVelocity(reverse ? -current_jog_speed : current_jog_speed););
+#ifdef TEST_MODE_DISABLE_MOTOR
+    ConnectorUsb.Send("Jog mode CARRIAGE_MOTOR.MoveVelocity(");
+    ConnectorUsb.Send(reverse ? -current_jog_speed : current_jog_speed);
+    ConnectorUsb.SendLine(");");
+#else
+    CARRIAGE_MOTOR.MoveVelocity(reverse ? -current_jog_speed : current_jog_speed);
+#endif
   } else {
-    MOTOR_COMMAND(CARRIAGE_MOTOR.MoveVelocity(reverse ? -current_planish_speed : current_planish_speed););
+#ifdef TEST_MODE_DISABLE_MOTOR
+    ConnectorUsb.Send("Planish Mode CARRIAGE_MOTOR.MoveVelocity(");
+    ConnectorUsb.Send(reverse ? -current_planish_speed : current_planish_speed);
+    ConnectorUsb.SendLine(");");
+#else
+    CARRIAGE_MOTOR.MoveVelocity(reverse ? -current_planish_speed : current_planish_speed);
+#endif
   }
 }
 
@@ -1188,8 +1204,15 @@ void update_speed_pot() {
   const int16_t analog_reading = SPEED_POT.State();
   const float pot_percent = static_cast<float>(analog_reading) / ADC_MAX_VALUE;
 
-  const float temp_jog_speed = pot_percent * CARRIAGE_MOTOR_MAX_VEL;
-  const float temp_planish_speed = pot_percent * CARRIAGE_MOTOR_MAX_PLANISH_VEL;
+  float temp_jog_speed = (pot_percent * CARRIAGE_MOTOR_MAX_VEL) + CARRIAGE_MOTOR_MIN_VEL;
+  float temp_planish_speed = (pot_percent * CARRIAGE_MOTOR_MAX_PLANISH_VEL) + CARRIAGE_MOTOR_MIN_PLANISH_VEL;
+
+  if (temp_jog_speed > CARRIAGE_MOTOR_MAX_VEL) {
+    temp_jog_speed = CARRIAGE_MOTOR_MAX_VEL;
+  }
+  if (temp_planish_speed > CARRIAGE_MOTOR_MAX_PLANISH_VEL) {
+    temp_planish_speed = CARRIAGE_MOTOR_MAX_PLANISH_VEL;
+  }
 
   current_planish_speed = static_cast<int32_t>(temp_planish_speed);
   current_jog_speed = static_cast<int32_t>(temp_jog_speed);
