@@ -129,7 +129,7 @@ volatile EstopReason estop_reason = EstopReason::NONE;
 #endif
 
 #define ESTOP_SW ConnectorA12
-#define LASER_SW ConnectorA11
+#define FINGER_DOWN_LMT ConnectorA11
 #define LEARN_SW ConnectorA10
 #define SPEED_POT ConnectorA9
 #define MANDREL_LATCH_LMT ConnectorDI8
