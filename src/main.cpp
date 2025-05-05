@@ -12,6 +12,7 @@
 #include "ClearCore.h"
 #include "indicator_light.h"
 #include "button.h"
+#include "actuator.h"
 
 
 // TODO: Bug when booting with e-stop on
@@ -20,8 +21,6 @@
 
 bool is_homed = false;                  // Has the axis been homed
 volatile bool is_e_stop = false;               // Is the Emergency Stop currently active
-bool is_fingers_down = false;                  // Is the finger actuation currently active
-bool is_head_commanded_down = true;            // Is the head currently commanded down
 
 bool io_configured = false;                  // Has the IO been configured
 
@@ -70,6 +69,7 @@ enum class PlanishState {
   e_stop_wait,                // E-stop is active, wait for it to end
   error,                      // unrecoverable error has occurred and machine needs to reboot. should be a dead end state
   wait_for_head,              // Me asf. This is for when the head position is changed from the idle state, not for jobs
+  wait_for_fingers,           // This is for when the finger position is changed from the idle state, not for jobs
 
   job_begin,                  // Job has been started, check initial configuration
   job_begin_lifting_head,     // Job was started with head down, wait for it to lift
@@ -107,7 +107,7 @@ volatile EstopReason estop_reason = EstopReason::NONE;
  * when defined the motor will not move and
  * any commands meant for the motor will be logged/simulated
  */
-#define TEST_MODE_DISABLE_MOTOR
+// #define TEST_MODE_DISABLE_MOTOR
 
 
 #ifdef TEST_MODE_DISABLE_MOTOR
@@ -126,6 +126,8 @@ volatile EstopReason estop_reason = EstopReason::NONE;
 #define MOTOR_ERROR_COMMANDED_WHEN_DISABLED (CARRIAGE_MOTOR.AlertReg().bit.MotionCanceledMotorDisabled)
 #define MOTOR_STEPS_COMPLETE CARRIAGE_MOTOR.StepsComplete()
 #define MOTOR_COMMANDED_POSITION CARRIAGE_MOTOR.PositionRefCommanded()
+
+#define CARRIAGE_MOTOR ConnectorM0
 #endif
 
 #define ESTOP_SW ConnectorA12
@@ -142,9 +144,7 @@ volatile EstopReason estop_reason = EstopReason::NONE;
 #define JOG_REV_SW ConnectorIO4
 #define HEAD_SW ConnectorIO5
 
-#ifndef TEST_MODE_DISABLE_MOTOR
-#define CARRIAGE_MOTOR ConnectorM0
-#endif
+
 
 // CCIO pin definitions. these are not interchangeable with native io ports.
 // please see `configure_io()` to change assignment between ccio and native pins
@@ -177,6 +177,8 @@ volatile EstopReason estop_reason = EstopReason::NONE;
 #define ESTOP_SW_SAFE_STATE 1
 #define MANDREL_LATCH_LMT_SAFE_STATE 1 // MANDREL_LATCH_LMT.State() should return this when it's safe/down/engaged
 
+#define IS_MANDREL_SAFE (MANDREL_LATCH_LMT.State() == MANDREL_LATCH_LMT_SAFE_STATE)
+
 #define JOG_FWD_SW_ACTIVE_STATE 1
 #define JOG_REV_SW_ACTIVE_STATE 1
 
@@ -195,6 +197,9 @@ Button CycleButton;
 Button FingerButton;
 Button HeadButton;
 
+SensedActuator Fingers;
+SensedActuator Head;
+
 bool configure_io();
 void e_stop_button_handler();
 bool motor_movement_checks();
@@ -208,8 +213,6 @@ void u32_to_bytes(uint32_t value, uint8_t bytes[4], uint32_t offset = 0);
 void read_job_from_nvram();
 void save_job_to_nvram();
 bool wait_for_motion();
-void set_finger_state(bool state);
-void set_head_state(bool state);
 bool move_motor_with_speed(int32_t position, int32_t speed);
 bool move_motor_auto_speed(int32_t position);
 void motor_jog(bool reverse);
@@ -238,7 +241,7 @@ void setup() {
   while (!ConnectorUsb && millis() - startTime < SERIAL_ESTABLISH_TIMEOUT)
     continue;
 
-  if (ConnectorUsb.IsInHwFault()) {
+  if (!ConnectorUsb) {
     e_stop_handler(EstopReason::internal_error);
     return;
   }
@@ -280,7 +283,7 @@ void setup() {
 void loop() {
 
   if (ESTOP_SW.State() != ESTOP_SW_SAFE_STATE) { // make sure e-stop wasn't already depressed before interrupt was registered
-    ConnectorUsb.SendLine("E-Stop was triggered before interrupt was registered, changing to error");
+    ConnectorUsb.SendLine("E-Stop was triggered by button from the main loop check");
     e_stop_handler(EstopReason::button);
   }
 
@@ -299,9 +302,6 @@ void loop() {
 
   loop_num++;
 
-  if (loop_num%(8*STATE_MACHINE_LOOPS_LOG_INTERVAL)==0) {
-//    ConnectorUsb.SendLine(get_state_name(machine_state));
-  }
 
   last_iteration_time = millis();
 
@@ -327,6 +327,7 @@ PlanishState state_machine(const PlanishState state_in) {
       ConnectorUsb.SendLine("begin homing");
 
       MOTOR_COMMAND(CARRIAGE_MOTOR.EnableRequest(false));
+      is_homed = false;
 
       homing_disable_time = millis();
       return PlanishState::homing_wait_for_disable;
@@ -340,6 +341,11 @@ PlanishState state_machine(const PlanishState state_in) {
       return PlanishState::homing_wait_for_disable;
 
     case PlanishState::wait_for_homing:
+      if (!IS_MANDREL_SAFE) {
+        e_stop_handler(EstopReason::mandrel_latch);
+        return PlanishState::e_stop_begin;
+      }
+
       if (MOTOR_ASSERTED) {
         // homing done no errors
         ConnectorUsb.SendLine("homing complete");
@@ -361,48 +367,72 @@ PlanishState state_machine(const PlanishState state_in) {
         print_motor_alerts();
         e_stop_handler(EstopReason::motor_error);
       }
-
       return PlanishState::wait_for_homing;
 
     case PlanishState::idle:
-      if (MANDREL_LATCH_LMT.State() == MANDREL_LATCH_LMT_SAFE_STATE) {
-        if (HomeButton.is_rising()) {
-          // TODO: make sure head is up
-          return PlanishState::begin_homing;
+      if (HomeButton.is_rising()) {
+        if (IS_MANDREL_SAFE) {
+          if (Head.is_fully_disengaged()) {
+            return PlanishState::begin_homing;
+          } else {
+            ConnectorUsb.SendLine("Tried to home while head engaged");
+          }
+        } else {
+          ConnectorUsb.SendLine("Tried to home without mandrel latch engaged");
         }
-        if (FingerButton.is_rising()) {
-          const bool new_finger_state = !is_fingers_down; // < doesn't necessarily get acted on or set.
-          if((HEAD_UP_LMT.State() && !is_head_commanded_down) || new_finger_state) {
+      }
+
+      if (FingerButton.is_rising()) {
+        const bool new_finger_state = !Fingers.get_commanded_state(); // < doesn't necessarily get acted on or set.
+        if (IS_MANDREL_SAFE || !new_finger_state) {
+          if(Head.is_fully_disengaged() || new_finger_state) {
             // make sure the head is up and not engaged, and also not in the process of lowering.
             // OR the user is trying to engage the fingers because the head somehow was already down
             ConnectorUsb.SendLine(new_finger_state ? "Engaging fingers" : "Disengaging fingers");
-            set_finger_state(new_finger_state);
+            Fingers.set_commanded_state(new_finger_state);
+            return PlanishState::wait_for_fingers;
           } else {
             ConnectorUsb.SendLine("Tried to disengage fingers while head was down or lowering");
           }
+        } else {
+          ConnectorUsb.SendLine("tried to engage fingers without mandrel latch engaged");
+        }
+      }
 
+      if (HeadButton.is_changing()) {
+        // Although the head switch is not momentary, changes should only be made when the user commands it, to avoid
+        // unexpected moves when relinquishing head control to user after a job
+        const bool new_head_state = HeadButton.get_current_state(); // < doesn't necessarily get acted on or set.
+
+        if((IS_MANDREL_SAFE && Fingers.is_fully_engaged()) || !new_head_state) {
+          // if safety checks for lowering head pass, or the user is trying to raise the head
+          Head.set_commanded_state(new_head_state);
+          return PlanishState::wait_for_head;
+        } else {
+          ConnectorUsb.SendLine("Tried to lower head while fingers not down or mandrel latch not engaged");
+          return PlanishState::idle;
         }
-        if (HeadButton.is_changing()) {
-          // Although the head switch is not momentary, changes should only be made when the user commands it, to avoid
-          // unexpected moves when relinquishing head control to user after a job
-          if(is_fingers_down) {
-            set_head_state(HeadButton.get_current_state());
-            return PlanishState::wait_for_head;
+      }
+
+      if (LearnButton.is_rising()) {
+        if (IS_MANDREL_SAFE) {
+          if (Head.is_fully_disengaged()) {
+            if (is_homed) {
+              return PlanishState::learn_start_pos;
+            } else {
+              ConnectorUsb.SendLine("Tried to start learn without homed");
+            }
           } else {
-            ConnectorUsb.SendLine("Tried to change head while fingers not down");
-            return PlanishState::idle;
+            ConnectorUsb.SendLine("Tried to learn job while the head was not fully down");
           }
+        } else {
+          ConnectorUsb.SendLine("Tried to learn job without mandrel being in safe position");
         }
-        if (LearnButton.is_rising()) {
-          // TODO: make sure head is up, because you cant change it in learn mode
-          if (is_homed) {
-            return PlanishState::learn_start_pos;
-          } else {
-            ConnectorUsb.SendLine("Tried to start learn without homed");
-          }
-        }
-        if (JOG_FWD_SW.State() == JOG_FWD_SW_ACTIVE_STATE
-            || JOG_REV_SW.State() == JOG_REV_SW_ACTIVE_STATE) {
+      }
+
+      if (JOG_FWD_SW.State() == JOG_FWD_SW_ACTIVE_STATE
+          || JOG_REV_SW.State() == JOG_REV_SW_ACTIVE_STATE) {
+        if (IS_MANDREL_SAFE) {
           if (is_homed) {
             // This is weird, while there is nothing that depends on the motor's absolute position for this,
             // it needs to be enabled, and enabling is what starts the homing process.
@@ -412,58 +442,72 @@ PlanishState state_machine(const PlanishState state_in) {
           } else {
             ConnectorUsb.SendLine("Tried to start jog without being homed");
           }
+        } else {
+          ConnectorUsb.SendLine("Tried to jog without mandrel switch engaged");
         }
-        if (LearnButton.is_rising()) {
-          if (is_homed) {
-            return PlanishState::learn_start_pos;
-          } else {
-            ConnectorUsb.SendLine("Tried to start learn without being homed");
-          }
-        }
-        if (CycleButton.is_rising()) {
-          if (is_fingers_down && is_homed) {
-            return PlanishState::job_begin;
-          } else if (!is_fingers_down && is_homed) {
-            ConnectorUsb.SendLine("Tried to start cycle without fingers engaged");
-          } else if (is_fingers_down && !is_homed){
-            ConnectorUsb.SendLine("Tried to start cycle without being homed");
-          } else {
-            ConnectorUsb.SendLine("Tried to start cycle without fingers engaged or being homed");
-          }
-        }
-      } else {// </ Mandrel limit switch in safe position>
-        if(loop_num%STATE_MACHINE_LOOPS_LOG_INTERVAL==0) {
-          ConnectorUsb.SendLine("Mandrel limit switch not in safe position");
+      }
+
+      if (CycleButton.is_rising()) {
+        if (Fingers.is_fully_engaged() && is_homed && IS_MANDREL_SAFE) {
+          return PlanishState::job_begin;
+        } else if (!Fingers.is_fully_engaged()) {
+          ConnectorUsb.SendLine("Tried to start cycle without fingers engaged");
+        } else if (!is_homed){
+          ConnectorUsb.SendLine("Tried to start cycle without being homed");
+        } else {
+          ConnectorUsb.SendLine("Tried to start cycle without Mandrel latch being engaged");
         }
       }
       return PlanishState::idle;
+
     case PlanishState::wait_for_head:
       if (loop_num%STATE_MACHINE_LOOPS_LOG_INTERVAL==0) {
         ConnectorUsb.Send("Waiting for head. Currently commanded ");
-        ConnectorUsb.SendLine(is_head_commanded_down ? "down." : "up.");
+        ConnectorUsb.SendLine(Head.get_commanded_state() ? "down." : "up.");
       }
+      if (!IS_MANDREL_SAFE) {
+        e_stop_handler(EstopReason::mandrel_latch);
+        return PlanishState::e_stop_begin;
+      }
+
+      // if head was changed from manual control, they should be able to 'undo' it without waiting for completion
       if (HeadButton.is_changing()) {
-        if(is_fingers_down || !HeadButton.get_current_state()) {
+        const bool new_head_state = HeadButton.get_current_state(); // < doesn't necessarily get acted on or set.
+        if(Fingers.is_fully_engaged() || !new_head_state) {
           // Make sure the fingers are down or the user is trying to raise the head.
           // Basically don't let them lower it without fingers engaged
-          set_head_state(HeadButton.get_current_state());
+          Head.set_commanded_state(new_head_state);
           return PlanishState::wait_for_head;
         } else {
-          ConnectorUsb.SendLine("Tried to change head while fingers not down");
+          ConnectorUsb.SendLine("Tried to lower head while fingers not down");
           return PlanishState::idle;
         }
-        // Although the head switch is not momentary, changes should only be made when the user commands it, to avoid
-        // unexpected moves when relinquishing head control to user after a job
-        set_head_state(HeadButton.get_current_state());
-        return PlanishState::wait_for_head;
       }
-      if (is_head_commanded_down != HEAD_UP_LMT.State()) {
-        // even though it says `!=`, this is checking if the states match
+      if (!Head.is_mismatch()) {
         return PlanishState::idle;
       }
       return PlanishState::wait_for_head;
+
+    case PlanishState::wait_for_fingers:
+      if (!IS_MANDREL_SAFE) {
+        e_stop_handler(EstopReason::mandrel_latch);
+        return PlanishState::e_stop_begin;
+      }
+
+      if (FingerButton.is_rising()) { // still let the user change the finger state even if in motion
+        const bool new_finger_state = !Fingers.get_commanded_state(); // < doesn't necessarily get acted on or set.
+        ConnectorUsb.SendLine(new_finger_state ? "Engaging fingers" : "Disengaging fingers");
+        Fingers.set_commanded_state(new_finger_state);
+        return PlanishState::wait_for_fingers;
+      }
+
+      if (!Fingers.is_mismatch()) {
+        return PlanishState::idle;
+      }
+      return PlanishState::wait_for_fingers;
+
     case PlanishState::manual_jog:
-      if (MANDREL_LATCH_LMT.State() == MANDREL_LATCH_LMT_SAFE_STATE && is_homed) {
+      if (IS_MANDREL_SAFE && is_homed) {
         if (JOG_FWD_SW.State() == JOG_FWD_SW_ACTIVE_STATE) {
           motor_jog(false);
           return PlanishState::manual_jog;
@@ -506,7 +550,7 @@ PlanishState state_machine(const PlanishState state_in) {
         case EstopReason::mandrel_latch:
           if ((ESTOP_SW.State() == ESTOP_SW_SAFE_STATE)
               && (millis() - last_estop_millis > ESTOP_COOLDOWN_MS)
-              && (MANDREL_LATCH_LMT.State() == MANDREL_LATCH_LMT_SAFE_STATE))
+              && (IS_MANDREL_SAFE))
           {
             // if the latch was fixed and the button hasn't been pressed,
             // and the estop was activated more than `ESTOP_COOLDOWN_MS` ago
@@ -521,7 +565,7 @@ PlanishState state_machine(const PlanishState state_in) {
         case EstopReason::motor_error:
           if ((ESTOP_SW.State() == ESTOP_SW_SAFE_STATE)
               && (millis() - last_estop_millis > ESTOP_COOLDOWN_MS)
-              && (MANDREL_LATCH_LMT.State() == MANDREL_LATCH_LMT_SAFE_STATE)
+              && (IS_MANDREL_SAFE)
               && HomeButton.is_rising())
           {
             // if the latch was fixed and the button hasn't been pressed,
@@ -529,7 +573,7 @@ PlanishState state_machine(const PlanishState state_in) {
             ConnectorUsb.SendLine("Motor error cleared by homing, resuming");
             home_indicator_light.setPattern(LightPattern::OFF);
             is_e_stop = false;
-            return PlanishState::begin_homing;
+            return PlanishState::begin_homing; // this estop can only be recovered from if they press the home button
           }
           home_indicator_light.setPattern(LightPattern::STROBE);
           return PlanishState::e_stop_wait;
@@ -545,13 +589,12 @@ PlanishState state_machine(const PlanishState state_in) {
         ConnectorUsb.Send("estop reason: ");
         ConnectorUsb.SendLine(get_estop_reason_name(estop_reason));
         delay(1000);
-
       }
 
     case PlanishState::job_begin:
-      set_head_state(false); // head is supposed to already be raised, but this needs to be called
+      Head.set_commanded_state(false); // head is supposed to already be raised, but this needs to be called
       // despite the sensor check in case it was in the proccess of lowering already
-      if (HEAD_UP_LMT.State()) {
+      if (Head.is_fully_disengaged()) {
         ConnectorUsb.SendLine("Job started head was already up");
         return PlanishState::job_jog_to_start;
       } else {
@@ -560,12 +603,12 @@ PlanishState state_machine(const PlanishState state_in) {
       }
 
     case PlanishState::job_begin_lifting_head:
-      if (MANDREL_LATCH_LMT.State() != MANDREL_LATCH_LMT_SAFE_STATE) {
+      if (!IS_MANDREL_SAFE) {
         ConnectorUsb.SendLine("mandrel limit precondition failed since starting job");
         e_stop_handler(EstopReason::mandrel_latch);
         return PlanishState::e_stop_begin;
       }
-      if (HEAD_UP_LMT.State()) {
+      if (Head.is_fully_disengaged()) {
         return PlanishState::job_jog_to_start;
       }
       if (loop_num%STATE_MACHINE_LOOPS_LOG_INTERVAL==0) {
@@ -579,7 +622,6 @@ PlanishState state_machine(const PlanishState state_in) {
       return PlanishState::job_jog_to_start_wait;
 
     case PlanishState::job_jog_to_start_wait:
-      // TODO update the speed with the pot
       MOTOR_COMMAND(CARRIAGE_MOTOR.VelMax(current_jog_speed););
       if (wait_for_motion()) {
         return PlanishState::job_head_down;
@@ -591,16 +633,16 @@ PlanishState state_machine(const PlanishState state_in) {
 
     case PlanishState::job_head_down:
       ConnectorUsb.SendLine("Lowering head");
-      set_head_state(true);
+      Head.set_commanded_state(true);
       return PlanishState::job_head_down_wait;
 
     case PlanishState::job_head_down_wait:
-      if (MANDREL_LATCH_LMT.State() != MANDREL_LATCH_LMT_SAFE_STATE) {
+      if (!IS_MANDREL_SAFE) {
         ConnectorUsb.SendLine("mandrel limit precondition failed since starting job");
         e_stop_handler(EstopReason::mandrel_latch);
         return PlanishState::e_stop_begin;
       }
-      if (!HEAD_UP_LMT.State()) {
+      if (Head.is_fully_engaged()) {
         return PlanishState::job_planish_to_end;
       }
       if (loop_num%STATE_MACHINE_LOOPS_LOG_INTERVAL==0) {
@@ -614,7 +656,6 @@ PlanishState state_machine(const PlanishState state_in) {
       return PlanishState::job_planish_to_end_wait;
 
     case PlanishState::job_planish_to_end_wait:
-      // TODO update the speed with the pot
       MOTOR_COMMAND(CARRIAGE_MOTOR.VelMax(current_planish_speed););
       if (wait_for_motion()) {
         if (HALF_CYCLE_SW.State()) {
@@ -638,7 +679,6 @@ PlanishState state_machine(const PlanishState state_in) {
       return PlanishState::job_planish_to_start_wait;
 
     case PlanishState::job_planish_to_start_wait:
-      // TODO update the speed with the pot
       MOTOR_COMMAND(CARRIAGE_MOTOR.VelMax(current_planish_speed););
       if (wait_for_motion()) {
         return PlanishState::job_head_up;
@@ -650,16 +690,16 @@ PlanishState state_machine(const PlanishState state_in) {
 
     case PlanishState::job_head_up:
       ConnectorUsb.SendLine("Raising head");
-      set_head_state(false);
+      Head.set_commanded_state(false);
       return PlanishState::job_head_up_wait;
 
     case PlanishState::job_head_up_wait:
-      if (MANDREL_LATCH_LMT.State() != MANDREL_LATCH_LMT_SAFE_STATE) {
+      if (!IS_MANDREL_SAFE) {
         ConnectorUsb.SendLine("mandrel limit precondition failed since starting job");
         e_stop_handler(EstopReason::mandrel_latch);
         return PlanishState::e_stop_begin;
       }
-      if (HEAD_UP_LMT.State()) {
+      if (Head.is_fully_disengaged()) {
         return PlanishState::job_jog_to_park;
       }
       if (loop_num%STATE_MACHINE_LOOPS_LOG_INTERVAL==0) {
@@ -673,7 +713,6 @@ PlanishState state_machine(const PlanishState state_in) {
       return PlanishState::job_jog_to_park_wait;
 
     case PlanishState::job_jog_to_park_wait:
-      // TODO update the speed with the pot
       MOTOR_COMMAND(CARRIAGE_MOTOR.VelMax(current_jog_speed););
       if (wait_for_motion()) {
         return PlanishState::idle;
@@ -690,21 +729,21 @@ PlanishState state_machine(const PlanishState state_in) {
       return PlanishState::learn_jog_to_end_pos;
 
     case PlanishState::learn_jog_to_end_pos:
-      if (MANDREL_LATCH_LMT.State() == MANDREL_LATCH_LMT_SAFE_STATE) {
-        if (LearnButton.is_rising()) {
-          return PlanishState::learn_end_pos;
-        }
-        if (JOG_FWD_SW.State() == JOG_FWD_SW_ACTIVE_STATE) {
-          motor_jog(false);
-        } else if (JOG_REV_SW.State() == JOG_REV_SW_ACTIVE_STATE) {
-          motor_jog(true);
-        } else {
-          MOTOR_COMMAND(CARRIAGE_MOTOR.MoveStopDecel(););
-        }
-        return PlanishState::learn_jog_to_end_pos;
+      if (!IS_MANDREL_SAFE) {
+        e_stop_handler(EstopReason::mandrel_latch);
+        return PlanishState::e_stop_begin;
       }
-      e_stop_handler(EstopReason::mandrel_latch);
-      return PlanishState::e_stop_begin;
+      if (LearnButton.is_rising()) {
+        return PlanishState::learn_end_pos;
+      }
+      if (JOG_FWD_SW.State() == JOG_FWD_SW_ACTIVE_STATE) {
+        motor_jog(false);
+      } else if (JOG_REV_SW.State() == JOG_REV_SW_ACTIVE_STATE) {
+        motor_jog(true);
+      } else {
+        MOTOR_COMMAND(CARRIAGE_MOTOR.MoveStopDecel(););
+      }
+      return PlanishState::learn_jog_to_end_pos;
 
     case PlanishState::learn_end_pos:
       learn_indicator_light.setPattern(LightPattern::FLASH2);
@@ -713,21 +752,21 @@ PlanishState state_machine(const PlanishState state_in) {
       return PlanishState::learn_jog_to_park_pos;
 
     case PlanishState::learn_jog_to_park_pos:
-      if (MANDREL_LATCH_LMT.State() == MANDREL_LATCH_LMT_SAFE_STATE) {
-        if (LearnButton.is_rising()) {
-          return PlanishState::learn_park_pos;
-        }
-        if (JOG_FWD_SW.State() == JOG_FWD_SW_ACTIVE_STATE) {
-          motor_jog(false);
-        } else if (JOG_REV_SW.State() == JOG_REV_SW_ACTIVE_STATE) {
-          motor_jog(true);
-        } else {
-          MOTOR_COMMAND(CARRIAGE_MOTOR.MoveStopDecel(););
-        }
-        return PlanishState::learn_jog_to_park_pos;
+      if (!IS_MANDREL_SAFE) {
+        e_stop_handler(EstopReason::mandrel_latch);
+        return PlanishState::e_stop_begin;
       }
-      e_stop_handler(EstopReason::mandrel_latch);
-      return PlanishState::e_stop_begin;
+      if (LearnButton.is_rising()) {
+        return PlanishState::learn_park_pos;
+      }
+      if (JOG_FWD_SW.State() == JOG_FWD_SW_ACTIVE_STATE) {
+        motor_jog(false);
+      } else if (JOG_REV_SW.State() == JOG_REV_SW_ACTIVE_STATE) {
+        motor_jog(true);
+      } else {
+        MOTOR_COMMAND(CARRIAGE_MOTOR.MoveStopDecel(););
+      }
+      return PlanishState::learn_jog_to_park_pos;
 
     case PlanishState::learn_park_pos:
       learn_indicator_light.setPattern(LightPattern::FLASH3);
@@ -760,7 +799,7 @@ PlanishState state_machine(const PlanishState state_in) {
  */
 bool configure_io() {
 
-  LASER_SW.Mode(Connector::INPUT_DIGITAL);
+  FINGER_DOWN_LMT.Mode(Connector::INPUT_DIGITAL);
   LEARN_SW.Mode(Connector::INPUT_DIGITAL);
   SPEED_POT.Mode(Connector::INPUT_ANALOG);
   MANDREL_LATCH_LMT.Mode(Connector::INPUT_DIGITAL);
@@ -806,14 +845,20 @@ bool configure_io() {
   config_ccio_pin(HOME_SW_LIGHT, Connector::OUTPUT_DIGITAL);
   config_ccio_pin(LEARN_SW_LIGHT, Connector::OUTPUT_DIGITAL);
 
+  Fingers.set_actuator_pin(CcioMgr.PinByIndex(FINGER_ACTUATION));
+  Fingers.set_sense_pin(&FINGER_DOWN_LMT);
+  Fingers.set_commanded_state(false);
+
+  Head.set_actuator_pin(CcioMgr.PinByIndex(HEAD_ACTUATION));
+  Head.set_sense_pin(&HEAD_UP_LMT, true);
+  Head.set_commanded_state(false);
+
   home_indicator_light.setPin(CcioMgr.PinByIndex(HOME_SW_LIGHT));
   home_indicator_light.setPeriod(50);
   home_indicator_light.setPattern(LightPattern::OFF);
-  home_indicator_light.setInverted(false);
   learn_indicator_light.setPin(CcioMgr.PinByIndex(LEARN_SW_LIGHT));
   learn_indicator_light.setPeriod(50);
   learn_indicator_light.setPattern(LightPattern::OFF);
-  learn_indicator_light.setInverted(true);
 
   MOTOR_COMMAND(MotorMgr.MotorInputClocking(MotorManager::CLOCK_RATE_NORMAL););
   MOTOR_COMMAND(MotorMgr.MotorModeSet(MotorManager::MOTOR_ALL, Connector::CPM_MODE_STEP_AND_DIR););
@@ -825,8 +870,7 @@ bool configure_io() {
   MOTOR_COMMAND(CARRIAGE_MOTOR.VelMax(current_jog_speed););
   MOTOR_COMMAND(CARRIAGE_MOTOR.AccelMax(CARRIAGE_MOTOR_MAX_ACCEL););
 
-  set_finger_state(false);
-  set_head_state(false);
+
 
   ConfigurePeriodicInterrupt(1000);
 
@@ -852,7 +896,7 @@ bool wait_for_motion() {
     return false;
   }
 
-  if (MANDREL_LATCH_LMT.State() != MANDREL_LATCH_LMT_SAFE_STATE) {
+  if (!IS_MANDREL_SAFE) {
     e_stop_handler(EstopReason::mandrel_latch);
   }
   return false;
@@ -1111,23 +1155,6 @@ void save_job_to_nvram() {
   NvmManager::Instance().BlockWrite(NvmManager::NVM_LOC_USER_START, (sizeof NV_Ram), &NV_Ram[0]);
 }
 
-/**
- * Setter for finger state that caches state
- * @param state true for engaged
- */
-void set_finger_state(const bool state) {
-  is_fingers_down = state;
-  set_ccio_pin(FINGER_ACTUATION, state);
-}
-
-/**
- * Setter for head state that caches state
- * @param state true for down
- */
-void set_head_state(const bool state) {
-  is_head_commanded_down = state;
-  set_ccio_pin(HEAD_ACTUATION, state);
-}
 
 /**
  * Very simple helper function to avoid forgetting to call velmax
@@ -1154,13 +1181,13 @@ bool move_motor_auto_speed(const int32_t position) {
   ConnectorUsb.Send("move_motor_auto_speed(");
   ConnectorUsb.Send(position);
   ConnectorUsb.Send(");");
-  const int32_t speed = HEAD_UP_LMT.State() ? current_jog_speed : current_planish_speed;
+  const int32_t speed = Head.get_measured_state() ? current_jog_speed : current_planish_speed;
   MOTOR_COMMAND(CARRIAGE_MOTOR.VelMax(speed););
   return MOTOR_COMMAND(CARRIAGE_MOTOR.Move(position, StepGenerator::MOVE_TARGET_ABSOLUTE););
 }
 
 void motor_jog(const bool reverse) {
-  if (HEAD_UP_LMT.State()) {
+  if (Head.get_measured_state()) {
 #ifdef TEST_MODE_DISABLE_MOTOR
     ConnectorUsb.Send("Jog mode CARRIAGE_MOTOR.MoveVelocity(");
     ConnectorUsb.Send(reverse ? -current_jog_speed : current_jog_speed);
@@ -1229,6 +1256,7 @@ PlanishState secure_system(const PlanishState last_state) {
   ConnectorUsb.Send(get_state_name(last_state));
   switch (last_state) {
     case PlanishState::post:
+      // can happen if E-stop ISR goes off erroneously on boot
       return PlanishState::post;
 
     case PlanishState::begin_homing:
@@ -1256,9 +1284,17 @@ PlanishState secure_system(const PlanishState last_state) {
       return PlanishState::error;
 
     case PlanishState::wait_for_head:
-      if (is_head_commanded_down == HEAD_UP_LMT.State()) { // despite the `==` this check if there is a mismatch
-        set_head_state(false); // if the head was in motion, raise it
-      } // if the head was not in motion, then it's fine to keep where it is
+      if (Head.is_mismatch() && Head.get_commanded_state()) {
+        // if the head was being commanded down and hasn't reached down yet
+        Head.set_commanded_state(false);
+      } // if the head was not in motion, or was already raising, don't do anything
+      return PlanishState::idle;
+
+    case PlanishState::wait_for_fingers:
+      if (Fingers.is_mismatch() && Fingers.get_commanded_state()) {
+        // if the fingers were being commanded down and hadn't reached down yet
+        Fingers.set_commanded_state(false);
+      } // if the fingers were not in motion, or were already raising, don't do anything
       return PlanishState::idle;
 
     case PlanishState::job_begin:
@@ -1276,8 +1312,9 @@ PlanishState secure_system(const PlanishState last_state) {
       return PlanishState::job_head_down;
 
     case PlanishState::job_head_down_wait:
-      if (is_head_commanded_down == HEAD_UP_LMT.State()) { // despite the `==` this check if there is a mismatch
-        set_head_state(false); // if the head was in motion, raise it
+      if (Head.is_mismatch()) {
+        // if there is a mismatch between the commanded state and the measured state
+        Head.set_commanded_state(false); // if the head was in motion, raise it
       } // if the head was not in motion, then it's fine to keep where it is
       // resume by lowering the head again
       return PlanishState::job_head_down;
@@ -1333,6 +1370,7 @@ const char *get_state_name(const PlanishState state) {
     STATE_NAME(e_stop_begin);
     STATE_NAME(e_stop_wait);
     STATE_NAME(error);
+    STATE_NAME(wait_for_fingers);
     STATE_NAME(wait_for_head);
     STATE_NAME(job_begin);
     STATE_NAME(job_begin_lifting_head);
