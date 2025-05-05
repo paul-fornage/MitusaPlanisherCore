@@ -363,21 +363,34 @@ PlanishState state_machine(const PlanishState state_in) {
     case PlanishState::idle:
       if (MANDREL_LATCH_LMT.State() == MANDREL_LATCH_LMT_SAFE_STATE) {
         if (HomeButton.is_rising()) {
+          // TODO: make sure head is up
           return PlanishState::begin_homing;
         }
         if (FingerButton.is_rising()) {
-          const bool new_finger_state = !is_fingers_down;
-          ConnectorUsb.SendLine(new_finger_state ? "Engaging fingers" : "Disengaging fingers");
-          set_finger_state(new_finger_state);
+          const bool new_finger_state = !is_fingers_down; // < doesn't necessarily get acted on or set.
+          if((HEAD_UP_LMT.State() && !is_head_commanded_down) || new_finger_state) {
+            // make sure the head is up and not engaged, and also not in the process of lowering.
+            // OR the user is trying to engage the fingers because the head somehow was already down
+            ConnectorUsb.SendLine(new_finger_state ? "Engaging fingers" : "Disengaging fingers");
+            set_finger_state(new_finger_state);
+          } else {
+            ConnectorUsb.SendLine("Tried to disengage fingers while head was down or lowering");
+          }
+
         }
         if (HeadButton.is_changing()) {
-          // TODO: Make sure fingers are engaged for this and head lowering
           // Although the head switch is not momentary, changes should only be made when the user commands it, to avoid
           // unexpected moves when relinquishing head control to user after a job
-          set_head_state(HeadButton.get_current_state());
-          return PlanishState::wait_for_head;
+          if(is_fingers_down) {
+            set_head_state(HeadButton.get_current_state());
+            return PlanishState::wait_for_head;
+          } else {
+            ConnectorUsb.SendLine("Tried to change head while fingers not down");
+            return PlanishState::idle;
+          }
         }
         if (LearnButton.is_rising()) {
+          // TODO: make sure head is up, because you cant change it in learn mode
           if (is_homed) {
             return PlanishState::learn_start_pos;
           } else {
@@ -424,6 +437,21 @@ PlanishState state_machine(const PlanishState state_in) {
       if (loop_num%STATE_MACHINE_LOOPS_LOG_INTERVAL==0) {
         ConnectorUsb.Send("Waiting for head. Currently commanded ");
         ConnectorUsb.SendLine(is_head_commanded_down ? "down." : "up.");
+      }
+      if (HeadButton.is_changing()) {
+        if(is_fingers_down || !HeadButton.get_current_state()) {
+          // Make sure the fingers are down or the user is trying to raise the head.
+          // Basically don't let them lower it without fingers engaged
+          set_head_state(HeadButton.get_current_state());
+          return PlanishState::wait_for_head;
+        } else {
+          ConnectorUsb.SendLine("Tried to change head while fingers not down");
+          return PlanishState::idle;
+        }
+        // Although the head switch is not momentary, changes should only be made when the user commands it, to avoid
+        // unexpected moves when relinquishing head control to user after a job
+        set_head_state(HeadButton.get_current_state());
+        return PlanishState::wait_for_head;
       }
       if (is_head_commanded_down != HEAD_UP_LMT.State()) {
         // even though it says `!=`, this is checking if the states match
