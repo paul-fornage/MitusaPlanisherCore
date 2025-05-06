@@ -8,9 +8,17 @@
 */
 
 #include <Arduino.h>
+#include <StaticVector.h>
+
+
 #include "ClearCore.h"
 #include "EthernetTcpClient.h"
 
+#include "MiTcpMessage.h"
+
+StaticVector<uint8_t, MITCP_MESSAGE_BUFFER_SIZE> InBuffer;
+
+EthernetTcpClient client;
 
 void setup() {
 
@@ -19,32 +27,37 @@ void setup() {
   while (!ConnectorUsb)
     continue;
 
-
-
-  // Debug delay to be able to restart motor before program starts
-  delay(4000);
-
   EthernetMgr.Setup();
   const bool dhcpSuccess = EthernetMgr.DhcpBegin();
   while (dhcpSuccess) {
     ConnectorUsb.Send("DHCP Success. IP: ");
     ConnectorUsb.SendLine(EthernetMgr.LocalIp().StringValue());
 
-    EthernetTcpClient client;
+
     // Start a TCP connection with the server on port 8888.
     if (client.Connect(IpAddress(192, 168, 1, 15), 8888)) {
       while (client.Connected()) {
         while (client.BytesAvailable()) {
-          ConnectorUsb.SendChar(static_cast<uint8_t>(client.Read()));
-        }
-        while (ConnectorUsb.AvailableForRead()) {
-          client.Send(static_cast<uint8_t>(ConnectorUsb.CharGet()));
+          const char in_word = client.Read();
+          InBuffer.push_back(in_word);
+          if (in_word == '\0') {
+            const auto message = MiTcpMessage::decodeMessage(InBuffer);
+            if (!message.second) {
+              ConnectorUsb.SendLine("Failed to decode message");
+            } else {
+              ConnectorUsb.SendLine(message.first.to_string().c_str());
+            }
+            InBuffer.clear();
+          }
+          if (InBuffer.size() >= MITCP_MESSAGE_BUFFER_SIZE) {
+            InBuffer.clear();
+            ConnectorUsb.SendLine("Buffer Overflow, received 4096 bytes with no null");
+          }
         }
       }
     }
     ConnectorUsb.SendLine("connection ended, retrying");
   }
-
   ConnectorUsb.SendLine("DHCP shat the bed");
 
 
