@@ -48,6 +48,9 @@ uint32_t saved_job_park_pos = 0;            // Park position for learn mode
 
 uint8_t NV_Ram[12];                    // NVram Max Available is `416 bytes of user data
 
+uint8_t		DisplayBuffer[20];			// Remote Display Character buffer
+uint16_t current_speed = 0;
+
 // Reasons to have an E-stop. Defines what conditions need to be met for the e-stop to end
 // not currently used because ISR must be void
 enum class EstopReason {
@@ -158,6 +161,10 @@ volatile EstopReason estop_reason = EstopReason::NONE;
 #define EXPECTED_NUM_CCIO 1
 #define CCIO_TIMEOUT_MS 10000 // Number of ms to wait for CCIO to connect before failing POST
 
+#define SERIAL_DISPLAY ConnectorCOM0
+#define DISPLAY_TIMEOUT_MS 1000 // Number of ms to wait for serial to connect before failing POST
+#define DISP_BAUDRATE 57600
+
 #define CARRIAGE_MOTOR_MAX_ACCEL 50000
 #define CARRIAGE_MOTOR_MAX_VEL 10000
 // not a safety limit, just what should the minimum position on the speed selector represent in jog mode
@@ -169,8 +176,8 @@ volatile EstopReason estop_reason = EstopReason::NONE;
 
 #define ITERATION_TIME_WARNING_MS 50 // after this many milliseconds stuck on one iteration of the state machine, give a warning.
 #define ITERATION_TIME_ERROR_MS 100  // after this many milliseconds stuck on one iteration of the state machine, declare an error
-#define SERIAL_ESTABLISH_TIMEOUT 5000 // Number of ms to wait for serial to establish before failing POST
-
+#define SERIAL_DISPLAY_EST_TIMEOUT 1000 // Number of ms to wait for serial to establish before failing POST
+#define SERIAL_ESTABLISH_TIMEOUT 5000
 /// Interrupt priority for the periodic interrupt. 0 is highest priority, 7 is lowest.
 #define PERIODIC_INTERRUPT_PRIORITY 5
 
@@ -191,6 +198,9 @@ volatile EstopReason estop_reason = EstopReason::NONE;
 #define STATE_MACHINE_LOOPS_POT_UPDATE_INTERVAL 32 // number of loops of the main state machine between speed pot updates
 #define STATE_MACHINE_LOOPS_LOG_INTERVAL 1024 // number of loops of the main state machine between
 // logging from 'wait' states. Too low will flood the logs
+
+#define STEPS_PER_REV 800
+
 
 Button LearnButton;
 Button HomeButton;
@@ -223,7 +233,7 @@ void e_stop_handler(EstopReason reason);
 PlanishState secure_system(PlanishState last_state);
 PlanishState state_machine(PlanishState state_in);
 const char *get_estop_reason_name(EstopReason state);
-
+void send_to_display(uint16_t number_to_display);
 const char *get_state_name(PlanishState state);
 
 extern "C" void TCC2_0_Handler(void) __attribute__((
@@ -314,8 +324,75 @@ void loop() {
   update_buttons();
   if (loop_num%STATE_MACHINE_LOOPS_POT_UPDATE_INTERVAL==0) {
     update_speed_pot();
+    current_speed = Head.get_measured_state() ? current_planish_speed : current_jog_speed;
+    send_to_display(60*current_speed/STEPS_PER_REV);
   }
+}
 
+
+void send_to_display(uint16_t number_to_display) {
+  ConnectorUsb.Send("sending to display: ");
+  ConnectorUsb.SendLine(number_to_display);
+  uint8_t i;
+  // Load Display Ascii Command String
+  DisplayBuffer[0] = '$';
+  DisplayBuffer[1] = '0';
+  DisplayBuffer[2] = '0';
+  DisplayBuffer[3] = '1';
+  DisplayBuffer[4] = ',';
+  // Initialize ASCII char pointer
+  // Convert unsigned Integer value to ASCII Character string
+  // REM: ASCII LSB ... MSB format
+  if(number_to_display){
+    uint8_t j = 0;
+    uint8_t ss[10];
+    while(number_to_display)
+    {
+      const uint16_t x = number_to_display % 10;		// x = remainder of a/10
+      number_to_display /= 10;		// a = a/10
+      i ='0';		// Add ASCII offset "0"
+      i = i + x;		// Add remainder to ASCII "0"
+      ss[j] = i;	// Save ASCII character in buffer
+      // Insert Decimal point 0.0
+      if (j == 0){
+        j++;
+        ss[j] = 0x2e; // Save ASCII "."
+        // If A = 0 then insert 0 in front of ASCII "." character
+        if (!number_to_display){
+          j++;
+          ss[j] = 0x30;	// Formate "0.#"
+        }
+      }
+      j++;
+    }
+    i = 5;
+    // Convert ASCII characters to MSB..LSB mapping
+    while(j){
+      j--;
+      DisplayBuffer[i] = ss[j];
+      i++;
+    }
+  }
+  // IF Value = 0 then load "0.0" to the display
+  else {
+    i = 8;
+    DisplayBuffer[5] = '0';
+    DisplayBuffer[6] = '.';
+    DisplayBuffer[7] = '0';
+  }
+  // Terminate String for remote Display....
+  DisplayBuffer[i] = '#';
+  i++;
+  DisplayBuffer[i] = 0x0d;
+  i++;
+  DisplayBuffer[i] = 0x0a;
+  i++;
+  DisplayBuffer[i] = 0;
+  // Return total number of bytes to send to Display
+
+  for (uint8_t index = 0; index < i; index++) {
+    SERIAL_DISPLAY.SendChar(DisplayBuffer[index]);
+  }
 }
 
 PlanishState state_machine(const PlanishState state_in) {
@@ -824,6 +901,17 @@ bool configure_io() {
 
   CCIO1.Mode(Connector::CCIO);
   CCIO1.PortOpen();
+
+  SERIAL_DISPLAY.Mode(Connector::RS232);
+  SERIAL_DISPLAY.Speed(DISP_BAUDRATE);
+  SERIAL_DISPLAY.Parity(SerialBase::PARITY_N);
+  SERIAL_DISPLAY.StopBits(1);
+  SERIAL_DISPLAY.FlowControl(false);
+
+
+  const uint32_t startTime = millis();
+
+  while (!SERIAL_DISPLAY && Milliseconds() - startTime < SERIAL_DISPLAY_EST_TIMEOUT) {}
 
   if (CcioMgr.LinkBroken()) {
     uint32_t lastStatusTime = Milliseconds();
