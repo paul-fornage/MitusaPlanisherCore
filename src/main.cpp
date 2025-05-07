@@ -7,6 +7,8 @@
   This code is licensed under the BSD New License. See LICENSE.txt for more info.
 */
 
+
+
 #include <Arduino.h>
 #include "NvmManager.h"
 #include "ClearCore.h"
@@ -22,9 +24,6 @@
 
 #include "MiTcpMessage.h"
 
-StaticVector<uint8_t, MITCP_MESSAGE_BUFFER_SIZE> InBuffer;
-
-EthernetTcpClient client;
 
 
 
@@ -117,6 +116,9 @@ volatile IndicatorLight learn_indicator_light;  /// Defined globally, but should
 
 volatile EstopReason estop_reason = EstopReason::NONE;
 
+StaticVector<uint8_t, MITCP_MESSAGE_BUFFER_SIZE> InBuffer;
+EthernetTcpClient client;
+
 /**
  * when defined the motor will not move and
  * any commands meant for the motor will be logged/simulated
@@ -183,6 +185,9 @@ volatile EstopReason estop_reason = EstopReason::NONE;
 #define ITERATION_TIME_WARNING_MS 50 // after this many milliseconds stuck on one iteration of the state machine, give a warning.
 #define ITERATION_TIME_ERROR_MS 100  // after this many milliseconds stuck on one iteration of the state machine, declare an error
 #define SERIAL_ESTABLISH_TIMEOUT 5000 // Number of ms to wait for serial to establish before failing POST
+#define ETHERNET_ESTABLISH_TIMEOUT 3000 // Number of ms to wait before declaring network connection as failed
+#define TCP_ESTABLISH_TIMEOUT 3000 // Number of ms to wait before declaring TCP connection failed
+
 
 /// Interrupt priority for the periodic interrupt. 0 is highest priority, 7 is lowest.
 #define PERIODIC_INTERRUPT_PRIORITY 5
@@ -236,6 +241,10 @@ void e_stop_handler(EstopReason reason);
 PlanishState secure_system(PlanishState last_state);
 PlanishState state_machine(PlanishState state_in);
 const char *get_estop_reason_name(EstopReason state);
+void mitcp_check();
+void command_router(MiTcpMessage &message);
+void MiTcpReadRequestHandler(MiTcpMessage &message);
+void send_mitcp_message(const MiTcpMessage &message);
 
 const char *get_state_name(PlanishState state);
 
@@ -251,8 +260,8 @@ void setup() {
 //  ESTOP_SW.FilterLength(5, DigitalIn::FILTER_UNIT_SAMPLES);
 
   ConnectorUsb.PortOpen();
-  const uint32_t startTime = millis();
-  while (!ConnectorUsb && ((millis() - startTime) < SERIAL_ESTABLISH_TIMEOUT))
+  const uint32_t serial_start_time = millis();
+  while (!ConnectorUsb && ((millis() - serial_start_time) < SERIAL_ESTABLISH_TIMEOUT))
     continue;
 
   if (!ConnectorUsb) {
@@ -260,41 +269,29 @@ void setup() {
 //    return;
   }
 
-  // Debug delay to be able to restart motor before program starts
-//  delay(2000);
-
 
   EthernetMgr.Setup();
   const bool dhcpSuccess = EthernetMgr.DhcpBegin();
-  while (dhcpSuccess) {
-    ConnectorUsb.Send("DHCP Success. IP: ");
-    ConnectorUsb.SendLine(EthernetMgr.LocalIp().StringValue());
+
+  const uint32_t ethernet_start_time = millis();
+  while (!EthernetMgr.EthernetActive() && ((millis() - ethernet_start_time) < ETHERNET_ESTABLISH_TIMEOUT))
+    continue;
 
 
-    // Start a TCP connection with the server on port 8888.
-    if (client.Connect(IpAddress(192, 168, 1, 15), 8888)) {
-      while (client.Connected()) {
-        while (client.BytesAvailable()) {
-          const char in_word = client.Read();
-          InBuffer.push_back(in_word);
-          if (in_word == '\0') {
-            const auto message = MiTcpMessage::decodeMessage(InBuffer);
-            if (!message.second) {
-              ConnectorUsb.SendLine("Failed to decode message");
-            } else {
-              ConnectorUsb.SendLine(message.first.to_string().c_str());
-            }
-            InBuffer.clear();
-          }
-          if (InBuffer.size() >= MITCP_MESSAGE_BUFFER_SIZE) {
-            InBuffer.clear();
-            ConnectorUsb.SendLine("Buffer Overflow, received 4096 bytes with no null");
-          }
-        }
-      }
-    }
-    ConnectorUsb.SendLine("connection ended, retrying");
+  if (!dhcpSuccess) {
+    ConnectorUsb.SendLine("DHCP failed to establish");
   }
+
+  ConnectorUsb.Send("DHCP Success. IP: ");
+  ConnectorUsb.SendLine(EthernetMgr.LocalIp().StringValue());
+
+
+  // Start a TCP connection with the server on port 8888.
+  if (client.Connect(IpAddress(192, 168, 1, 15), 8888)) {
+
+  }
+  ConnectorUsb.SendLine("connection ended, retrying");
+
 
   read_job_from_nvram();
 
@@ -325,6 +322,12 @@ void setup() {
 
 
 void loop() {
+
+  if (client.Connected()) {
+    mitcp_check();
+  } else {
+    client.Connect(IpAddress(192, 168, 1, 15), 8888);
+  }
 
   if (ESTOP_SW.State() != ESTOP_SW_SAFE_STATE) { // make sure e-stop wasn't already depressed before interrupt was registered
     ConnectorUsb.SendLine("E-Stop was triggered by button from the main loop check");
@@ -360,6 +363,64 @@ void loop() {
   }
 
 }
+
+void command_router(MiTcpMessage &message) {
+  if (message.header == MessageHeader::ReadRequest) {
+    MiTcpReadRequestHandler(message);
+    return;
+  }
+  ConnectorUsb.SendLine("only read request implemented now");
+}
+
+void MiTcpReadRequestHandler(MiTcpMessage &message) {
+  if (message.target == "finger_state") {
+    const uint8_t value = Fingers.get_commanded_state() ? 1 : 0;
+    ConnectorUsb.Send("Get finger state");
+    ConnectorUsb.SendLine(value);
+    message.header = MessageHeader::ReadSuccess;
+    message.data.push_back(value);
+    send_mitcp_message(message);
+  } else {
+    ConnectorUsb.SendLine("Unknown command");
+  }
+}
+
+
+void send_mitcp_message(const MiTcpMessage &message) {
+  const auto result = MiTcpMessage::encodeMessage(message);
+  if (!result.second) {
+    ConnectorUsb.SendLine("Failed to encode message");
+    return;
+  }
+  ConnectorUsb.Send("Sending message. Sent ");
+
+  const uint32_t bytes_sent = client.Send(result.first.data(), result.first.size());
+  ConnectorUsb.Send(bytes_sent);
+  ConnectorUsb.SendLine(" bytes.");
+}
+
+
+void mitcp_check() {
+  while (client.BytesAvailable()) {
+    const char in_word = client.Read();
+    InBuffer.push_back(in_word);
+    if (in_word == '\0') {
+      auto message = MiTcpMessage::decodeMessage(InBuffer);
+      if (!message.second) {
+        ConnectorUsb.SendLine("Failed to decode message");
+      } else {
+        command_router(message.first);
+        ConnectorUsb.SendLine(message.first.to_string().c_str());
+      }
+      InBuffer.clear();
+    }
+    if (InBuffer.size() >= MITCP_MESSAGE_BUFFER_SIZE) {
+      InBuffer.clear();
+      ConnectorUsb.SendLine("Buffer Overflow, received 4096 bytes with no null");
+    }
+  }
+}
+
 
 PlanishState state_machine(const PlanishState state_in) {
   switch (state_in) {

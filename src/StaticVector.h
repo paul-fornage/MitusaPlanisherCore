@@ -1,6 +1,7 @@
 #ifndef STATIC_VECTOR_H
 #define STATIC_VECTOR_H
 
+#include <cstdint>
 #include <cstddef>  // size_t
 
 template <typename T, size_t MaxSize>
@@ -64,6 +65,11 @@ public:
     void clear() {
         m_size = 0;
     }
+
+    const uint8_t* data() const {
+        return reinterpret_cast<const uint8_t*>(m_data);
+    }
+
 
 private:
     T m_data[MaxSize];  // Fixed-size array to store elements
