@@ -281,9 +281,11 @@ void check_modbus();
 std::pair<uint16_t, bool> job_progress(PlanishState state_to_check);
 void mb_read_hreg(HmiReg<uint16_t> *reg);
 void mb_read_coil(HmiReg<bool> *reg);
+double constexpr steps_to_f64_inch(uint32_t steps);
 uint16_t constexpr steps_to_hundreths(uint32_t steps);
 uint16_t constexpr steps_per_sec_to_inches_per_minute(uint32_t steps_per_second);
 const char *get_state_name(PlanishState state);
+void update_modbus_buttons();
 
 extern "C" void TCC2_0_Handler(void) __attribute__((
             alias("PeriodicInterrupt")));
@@ -399,6 +401,8 @@ void check_modbus() {
 
     mb_read_coil(&hmi_commanded_fingers_value);
     mb_read_coil(&hmi_commanded_roller_value);
+
+    update_modbus_buttons();
 
     mb.writeHreg(remote, HregAddr::CC_COMMANDED_POSITION_REG_ADDR, steps_to_hundreths(CARRIAGE_MOTOR.PositionRefCommanded()));
     mb.writeHreg(remote, HregAddr::JOB_PROGRESS_REG_ADDR, job_progress(machine_state).second);
