@@ -23,6 +23,7 @@ namespace CoilAddr {
         IS_SET_JOB_START_BUTTON_LATCHED = 32,    // R/W  Has the 'Set start to current position' button been pressed. Resets to 0 on completion
         IS_SET_JOB_END_BUTTON_LATCHED   = 33,    // R/W  Has the 'Set end to current position' button been pressed. Resets to 0 on completion
         IS_SET_JOB_PARK_BUTTON_LATCHED  = 34,    // R/W  Has the 'Set park to current position' button been pressed. Resets to 0 on completion
+        IS_COMMIT_JOB_BUTTON_LATCHED    = 35,    // R/W  Has the 'Commit job' button been pressed. Resets to 0 on completion
         HMI_COMMANDED_FINGERS           = 40,    // W    Finger state commanded by the HMI, true means engaged, false means disengaged
         IS_COMMANDED_FINGER_LATCHED     = 41,    // R/W  signals that `HMI_COMMANDED_FINGERS` has been changed and need to be read
         HMI_COMMANDED_ROLLER            = 42,    // W    Roller state commanded by the HMI, true means engaged, false means disengaged
