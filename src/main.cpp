@@ -376,13 +376,13 @@ void loop() {
     // Also make sure that the state wasn't already set to something more severe
     if (machine_state != PlanishState::e_stop_wait && machine_state != PlanishState::error) {
       machine_state = PlanishState::e_stop_begin;
-
       MOTOR_COMMAND(CARRIAGE_MOTOR.MoveStopAbrupt(););
-
     }
   }
   loop_num++;
-  mb.task(); // modbus tick
+  for (uint8_t i=0; i<32; i++){
+    mb.task(); // modbus tick
+  }
   last_iteration_time = millis();
 
   PERIODIC_PRINT(
@@ -427,7 +427,6 @@ void check_modbus() {
 
     if (millis() - last_modbus_print > 1000) {
       last_modbus_print = millis();
-
     }
     update_modbus_buttons();
 
@@ -449,7 +448,6 @@ void check_modbus() {
 
 void mb_read_hreg(HmiReg<uint16_t> *reg) {
   mb.readHreg(remote, reg->address, &reg->value);
-  mb.task();
 }
 
 void mb_read_unlatch_coil(HmiReg<bool> *reg) {
@@ -459,17 +457,14 @@ void mb_read_unlatch_coil(HmiReg<bool> *reg) {
 
 void mb_read_coil(HmiReg<bool> *reg) {
   mb.readCoil(remote, reg->address, &reg->value);
-  mb.task();
 }
 
 void mb_write_coil(const uint16_t address, const bool val) {
   mb.writeCoil(remote, address, val);
-  mb.task();
 }
 
 void mb_write_hreg(const uint16_t address, const uint16_t val) {
   mb.writeCoil(remote, address, val);
-  mb.task();
 }
 
 void update_modbus_buttons() {
