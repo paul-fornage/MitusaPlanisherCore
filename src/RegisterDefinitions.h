@@ -15,14 +15,18 @@ namespace CoilAddr {
         IS_JOB_ACTIVE                   = 6,     // R    Is the clearcore executing its program
         IS_READY_FOR_MANUAL_CONTROL     = 7,     // R    Is the clearcore ready for manual control, ensuring safety checks and no cycle in progress
         IS_ROLLER_DOWN                  = 8,     // R    Is the roller down/engaged
-        IS_COMMANDED_POS                = 20,    // R/W  Has the HMI requested a new commanded position. If true, reads the commanded position
+        CC_COMMANDED_ROLLER             = 9,     // R    Roller state commanded by the CC, true means engaged, false means disengaged
+        CC_COMMANDED_FINGERS            = 10,    // R    Finger state commanded by the CC, true means engaged, false means disengaged
+        IS_COMMANDED_POS_LATCHED        = 20,    // R/W  Has the HMI requested a new commanded position. If true, reads the commanded position
         IS_RTH_BUTTON_LATCHED           = 30,    // R/W  Has the 'return to home' button been pressed. Resets to 0 on completion
         IS_AXIS_HOMING_BUTTON_LATCHED   = 31,    // R/W  Has the 'run axis homing sequence' button been pressed. Resets to 0 on completion
         IS_SET_JOB_START_BUTTON_LATCHED = 32,    // R/W  Has the 'Set start to current position' button been pressed. Resets to 0 on completion
         IS_SET_JOB_END_BUTTON_LATCHED   = 33,    // R/W  Has the 'Set end to current position' button been pressed. Resets to 0 on completion
         IS_SET_JOB_PARK_BUTTON_LATCHED  = 34,    // R/W  Has the 'Set park to current position' button been pressed. Resets to 0 on completion
-        COMMANDED_FINGERS               = 40,    // R/W  Finger state commanded by the HMI, true means engaged, false means disengaged
-        COMMANDED_ROLLER                = 41,    // R/W  Roller state commanded by the HMI, true means engaged, false means disengaged
+        HMI_COMMANDED_FINGERS           = 40,    // W    Finger state commanded by the HMI, true means engaged, false means disengaged
+        IS_COMMANDED_FINGER_LATCHED     = 41,    // R/W  signals that `HMI_COMMANDED_FINGERS` has been changed and need to be read
+        HMI_COMMANDED_ROLLER            = 42,    // W    Roller state commanded by the HMI, true means engaged, false means disengaged
+        IS_COMMANDED_ROLLER_LATCHED     = 43,    // R/W  signals that `HMI_COMMANDED_ROLLER` has been changed and need to be read
     };
 }
 namespace HregAddr {
