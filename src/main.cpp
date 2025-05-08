@@ -20,10 +20,40 @@
 // TODO: https://piolabs.com/blog/insights/unit-testing-part-1.html#introduction, https://docs.platformio.org/en/latest/advanced/unit-testing/frameworks/doctest.html
 
 
+#include <Ethernet.h>       // Ethernet library v2 is required
+#include <ModbusAPI.h>
+#include <ModbusTCPTemplate.h>
+
+#include "HmiReg.h"
+#include "RegisterDefinitions.h"
+
+// ModBus TCP stuff
+class ModbusEthernet : public ModbusAPI<ModbusTCPTemplate<EthernetServer, EthernetClient>> {};
+const IPAddress remote(192, 168, 0, 211);  // Address of Modbus Slave device
+byte mac[] = { 0x24, 0x15, 0x10, 0xB0, 0x45, 0xA4 }; // MAC address is ignored but because of C++ types, you still need to give it garbage
+IPAddress ip(192, 168, 0, 178); // The IP address will be dependent on your local network
+ModbusEthernet mb;               // Declare ModbusTCP instance
+
+bool is_HMI_comm_good = false;
+
+Button HmiIsRthButton(false, false);
+Button HmiIsAxisHomingButton(false, false);
+Button HmiIsSetJobStartButton(false, false);
+Button HmiIsSetJobEndButton(false, false);
+Button HmiIsSetJobParkButton(false, false);
+
+bool HmiIsRth_state = false;
+bool HmiIsAxisHoming_state = false;
+bool HmiIsSetJobStart_state = false;
+bool HmiIsSetJobEnd_state = false;
+bool HmiIsSetJobPark_state = false;
+
+
 bool is_homed = false;                  // Has the axis been homed
 volatile bool is_e_stop = false;               // Is the Emergency Stop currently active
 
 bool io_configured = false;                  // Has the IO been configured
+bool is_mandrel_safe = false;
 
 int32_t current_jog_speed = 0;              // Current speed the motor should use for jogging. Steps/second
 int32_t current_planish_speed = 0;          // Current speed the motor should use for planishing. Steps/second
@@ -170,6 +200,7 @@ volatile EstopReason estop_reason = EstopReason::NONE;
 #define ITERATION_TIME_WARNING_MS 50 // after this many milliseconds stuck on one iteration of the state machine, give a warning.
 #define ITERATION_TIME_ERROR_MS 100  // after this many milliseconds stuck on one iteration of the state machine, declare an error
 #define SERIAL_ESTABLISH_TIMEOUT 5000 // Number of ms to wait for serial to establish before failing POST
+#define HMI_CONNECTION_TRIES_BEFORE_ERROR 5
 
 /// Interrupt priority for the periodic interrupt. 0 is highest priority, 7 is lowest.
 #define PERIODIC_INTERRUPT_PRIORITY 5
@@ -177,8 +208,6 @@ volatile EstopReason estop_reason = EstopReason::NONE;
 #define ESTOP_COOLDOWN_MS 1000
 #define ESTOP_SW_SAFE_STATE 1
 #define MANDREL_LATCH_LMT_SAFE_STATE 1 // MANDREL_LATCH_LMT.State() should return this when it's safe/down/engaged
-
-#define IS_MANDREL_SAFE (MANDREL_LATCH_LMT.State() == MANDREL_LATCH_LMT_SAFE_STATE)
 
 #define JOG_FWD_SW_ACTIVE_STATE 1
 #define JOG_REV_SW_ACTIVE_STATE 1
@@ -189,8 +218,11 @@ volatile EstopReason estop_reason = EstopReason::NONE;
 #define MOTOR_EN_DIS_DELAY_MS 10    // during homing the motor needs to be disabled for this many ms to actually do it
 
 #define STATE_MACHINE_LOOPS_POT_UPDATE_INTERVAL 32 // number of loops of the main state machine between speed pot updates
+#define STATE_MACHINE_LOOPS_HMI_UPDATE_INTERVAL 32 // number of loops of the main state machine between Modbus Hmi updates
 #define STATE_MACHINE_LOOPS_LOG_INTERVAL 1024 // number of loops of the main state machine between
 // logging from 'wait' states. Too low will flood the logs
+
+#define PERIODIC_PRINT(statements) if (loop_num%STATE_MACHINE_LOOPS_LOG_INTERVAL==0) { statements }
 
 Button LearnButton;
 Button HomeButton;
@@ -223,6 +255,8 @@ void e_stop_handler(EstopReason reason);
 PlanishState secure_system(PlanishState last_state);
 PlanishState state_machine(PlanishState state_in);
 const char *get_estop_reason_name(EstopReason state);
+void check_modbus();
+bool is_state_job(PlanishState state_to_check);
 
 const char *get_state_name(PlanishState state);
 
@@ -250,7 +284,7 @@ void setup() {
   // Debug delay to be able to restart motor before program starts
 //  delay(2000);
 
-
+  Ethernet.begin(mac, ip);
 
 
   read_job_from_nvram();
@@ -282,6 +316,7 @@ void setup() {
 
 
 void loop() {
+  is_mandrel_safe = MANDREL_LATCH_LMT.State() == MANDREL_LATCH_LMT_SAFE_STATE;
 
   if (ESTOP_SW.State() != ESTOP_SW_SAFE_STATE) { // make sure e-stop wasn't already depressed before interrupt was registered
     ConnectorUsb.SendLine("E-Stop was triggered by button from the main loop check");
@@ -300,10 +335,8 @@ void loop() {
 
     }
   }
-
   loop_num++;
-
-
+  mb.task(); // modbus tick
   last_iteration_time = millis();
 
   // state machine state machine machine state
@@ -315,13 +348,83 @@ void loop() {
   if (loop_num%STATE_MACHINE_LOOPS_POT_UPDATE_INTERVAL==0) {
     update_speed_pot();
   }
+  if (loop_num%STATE_MACHINE_LOOPS_HMI_UPDATE_INTERVAL==15) {
+    check_modbus();
+  }
+}
 
+/**
+ * Checks modbus
+ * @pre IO configured successfully
+ */
+void check_modbus() {
+  if (mb.isConnected(remote)) {   // Check if connection to Modbus Slave is established
+    is_HMI_comm_good = true;
+    mb.writeCoil(remote, CoilAddr::IS_MANDREL_LATCH_CLOSED, is_mandrel_safe);  // Initiate Read Hreg from Modbus Slave
+    mb.writeCoil(remote, CoilAddr::IS_FINGERS_DOWN, Fingers.get_measured_state());
+    mb.writeCoil(remote, CoilAddr::IS_HOMED, is_homed);
+    mb.writeCoil(remote, CoilAddr::IS_FAULT, machine_state==PlanishState::error);
+    mb.writeCoil(remote, CoilAddr::IS_READY_FOR_CYCLE, Fingers.is_fully_engaged() && is_homed && is_mandrel_safe && machine_state == PlanishState::idle);
+    mb.writeCoil(remote, CoilAddr::IS_E_STOP, is_e_stop);
+    mb.writeCoil(remote, CoilAddr::IS_JOB_ACTIVE, is_state_job(machine_state));
+    mb.writeCoil(remote, CoilAddr::IS_READY_FOR_MANUAL_CONTROL, is_mandrel_safe && is_homed && machine_state == PlanishState::idle);
+    mb.writeCoil(remote, CoilAddr::IS_ROLLER_DOWN, Head.get_measured_state());
+    mb.readCoil(remote, CoilAddr::IS_COMMANDED_POS, &temp_coil);
+    
+  } else {
+    is_HMI_comm_good = false;
+    mb.connect(remote);           // Try to connect if not connected
+  }
+}
+
+void update_modbus_buttons() {
+  mb.readCoil(remote, CoilAddr::IS_RTH_BUTTON_LATCHED, &HmiIsRth_state);
+  mb.writeCoil(remote, CoilAddr::IS_RTH_BUTTON_LATCHED, false);
+  mb.readCoil(remote, CoilAddr::IS_AXIS_HOMING_BUTTON_LATCHED, &HmiIsAxisHoming_state);
+  mb.readCoil(remote, CoilAddr::IS_SET_JOB_START_BUTTON_LATCHED, &HmiIsSetJobStart_state);
+  mb.readCoil(remote, CoilAddr::IS_SET_JOB_END_BUTTON_LATCHED, &HmiIsSetJobEnd_state);
+  mb.readCoil(remote, CoilAddr::IS_SET_JOB_PARK_BUTTON_LATCHED, &HmiIsSetJobPark_state);
+}
+
+bool is_state_job(const PlanishState state_to_check) {
+  switch (state_to_check) {
+    case PlanishState::job_begin:
+    case PlanishState::job_begin_lifting_head:
+    case PlanishState::job_jog_to_start:
+    case PlanishState::job_jog_to_start_wait:
+    case PlanishState::job_head_down:
+    case PlanishState::job_head_down_wait:
+    case PlanishState::job_planish_to_end:
+    case PlanishState::job_planish_to_end_wait:
+    case PlanishState::job_planish_to_start:
+    case PlanishState::job_planish_to_start_wait:
+    case PlanishState::job_head_up:
+    case PlanishState::job_head_up_wait:
+    case PlanishState::job_jog_to_park:
+    case PlanishState::job_jog_to_park_wait:
+      return true;
+    default:
+      return false;
+  }
 }
 
 PlanishState state_machine(const PlanishState state_in) {
   switch (state_in) {
     case PlanishState::post:  // Not used anymore but could be in the future
-      ConnectorUsb.SendLine("Power on self test");
+      PERIODIC_PRINT(ConnectorUsb.SendLine("post state"););
+      is_HMI_comm_good = false;
+      if (Ethernet.linkStatus() == LinkOFF) {
+        delay(10);
+        return PlanishState::post;
+      }
+      mb.client();
+      if(!mb.isConnected(remote)) {
+        mb.connect(remote);
+        delay(10);
+        return PlanishState::post;
+      }
+      is_HMI_comm_good = true;
+      ConnectorUsb.SendLine("POSTed up. HMI seems connected");
       return PlanishState::idle;
 
     case PlanishState::begin_homing:
@@ -342,7 +445,7 @@ PlanishState state_machine(const PlanishState state_in) {
       return PlanishState::homing_wait_for_disable;
 
     case PlanishState::wait_for_homing:
-      if (!IS_MANDREL_SAFE) {
+      if (!is_mandrel_safe) {
         e_stop_handler(EstopReason::mandrel_latch);
         return PlanishState::e_stop_begin;
       }
@@ -372,7 +475,7 @@ PlanishState state_machine(const PlanishState state_in) {
 
     case PlanishState::idle:
       if (HomeButton.is_rising()) {
-        if (IS_MANDREL_SAFE) {
+        if (is_mandrel_safe) {
           if (Head.is_fully_disengaged()) {
             return PlanishState::begin_homing;
           } else {
@@ -385,7 +488,7 @@ PlanishState state_machine(const PlanishState state_in) {
 
       if (FingerButton.is_rising()) {
         const bool new_finger_state = !Fingers.get_commanded_state(); // < doesn't necessarily get acted on or set.
-        if (IS_MANDREL_SAFE || !new_finger_state) {
+        if (is_mandrel_safe || !new_finger_state) {
           if(Head.is_fully_disengaged() || new_finger_state) {
             // make sure the head is up and not engaged, and also not in the process of lowering.
             // OR the user is trying to engage the fingers because the head somehow was already down
@@ -405,7 +508,7 @@ PlanishState state_machine(const PlanishState state_in) {
         // unexpected moves when relinquishing head control to user after a job
         const bool new_head_state = HeadButton.get_current_state(); // < doesn't necessarily get acted on or set.
 
-        if((IS_MANDREL_SAFE && Fingers.is_fully_engaged()) || !new_head_state) {
+        if((is_mandrel_safe && Fingers.is_fully_engaged()) || !new_head_state) {
           // if safety checks for lowering head pass, or the user is trying to raise the head
           Head.set_commanded_state(new_head_state);
           return PlanishState::wait_for_head;
@@ -416,7 +519,7 @@ PlanishState state_machine(const PlanishState state_in) {
       }
 
       if (LearnButton.is_rising()) {
-        if (IS_MANDREL_SAFE) {
+        if (is_mandrel_safe) {
           if (Head.is_fully_disengaged()) {
             if (is_homed) {
               return PlanishState::learn_start_pos;
@@ -433,7 +536,7 @@ PlanishState state_machine(const PlanishState state_in) {
 
       if (JOG_FWD_SW.State() == JOG_FWD_SW_ACTIVE_STATE
           || JOG_REV_SW.State() == JOG_REV_SW_ACTIVE_STATE) {
-        if (IS_MANDREL_SAFE) {
+        if (is_mandrel_safe) {
           if (is_homed) {
             // This is weird, while there is nothing that depends on the motor's absolute position for this,
             // it needs to be enabled, and enabling is what starts the homing process.
@@ -449,7 +552,7 @@ PlanishState state_machine(const PlanishState state_in) {
       }
 
       if (CycleButton.is_rising()) {
-        if (Fingers.is_fully_engaged() && is_homed && IS_MANDREL_SAFE) {
+        if (Fingers.is_fully_engaged() && is_homed && is_mandrel_safe) {
           return PlanishState::job_begin;
         } else if (!Fingers.is_fully_engaged()) {
           ConnectorUsb.SendLine("Tried to start cycle without fingers engaged");
@@ -466,7 +569,7 @@ PlanishState state_machine(const PlanishState state_in) {
         ConnectorUsb.Send("Waiting for head. Currently commanded ");
         ConnectorUsb.SendLine(Head.get_commanded_state() ? "down." : "up.");
       }
-      if (!IS_MANDREL_SAFE) {
+      if (!is_mandrel_safe) {
         e_stop_handler(EstopReason::mandrel_latch);
         return PlanishState::e_stop_begin;
       }
@@ -495,7 +598,7 @@ PlanishState state_machine(const PlanishState state_in) {
         ConnectorUsb.Send("Waiting for fingers. Currently commanded ");
         ConnectorUsb.SendLine(Fingers.get_commanded_state() ? "down." : "up.");
       }
-      if (!IS_MANDREL_SAFE) {
+      if (!is_mandrel_safe) {
         e_stop_handler(EstopReason::mandrel_latch);
         return PlanishState::e_stop_begin;
       }
@@ -513,7 +616,7 @@ PlanishState state_machine(const PlanishState state_in) {
       return PlanishState::wait_for_fingers;
 
     case PlanishState::manual_jog:
-      if (IS_MANDREL_SAFE && is_homed) {
+      if (is_mandrel_safe && is_homed) {
         if (JOG_FWD_SW.State() == JOG_FWD_SW_ACTIVE_STATE) {
           motor_jog(false);
           return PlanishState::manual_jog;
@@ -556,7 +659,7 @@ PlanishState state_machine(const PlanishState state_in) {
         case EstopReason::mandrel_latch:
           if ((ESTOP_SW.State() == ESTOP_SW_SAFE_STATE)
               && (millis() - last_estop_millis > ESTOP_COOLDOWN_MS)
-              && (IS_MANDREL_SAFE))
+              && (is_mandrel_safe))
           {
             // if the latch was fixed and the button hasn't been pressed,
             // and the estop was activated more than `ESTOP_COOLDOWN_MS` ago
@@ -573,7 +676,7 @@ PlanishState state_machine(const PlanishState state_in) {
         case EstopReason::motor_error:
           if ((ESTOP_SW.State() == ESTOP_SW_SAFE_STATE)
               && (millis() - last_estop_millis > ESTOP_COOLDOWN_MS)
-              && (IS_MANDREL_SAFE)
+              && (is_mandrel_safe)
               && HomeButton.is_rising())
           {
             // if the latch was fixed and the button hasn't been pressed,
@@ -611,7 +714,7 @@ PlanishState state_machine(const PlanishState state_in) {
       }
 
     case PlanishState::job_begin_lifting_head:
-      if (!IS_MANDREL_SAFE) {
+      if (!is_mandrel_safe) {
         ConnectorUsb.SendLine("mandrel limit precondition failed since starting job");
         e_stop_handler(EstopReason::mandrel_latch);
         return PlanishState::e_stop_begin;
@@ -645,7 +748,7 @@ PlanishState state_machine(const PlanishState state_in) {
       return PlanishState::job_head_down_wait;
 
     case PlanishState::job_head_down_wait:
-      if (!IS_MANDREL_SAFE) {
+      if (!is_mandrel_safe) {
         ConnectorUsb.SendLine("mandrel limit precondition failed since starting job");
         e_stop_handler(EstopReason::mandrel_latch);
         return PlanishState::e_stop_begin;
@@ -702,7 +805,7 @@ PlanishState state_machine(const PlanishState state_in) {
       return PlanishState::job_head_up_wait;
 
     case PlanishState::job_head_up_wait:
-      if (!IS_MANDREL_SAFE) {
+      if (!is_mandrel_safe) {
         ConnectorUsb.SendLine("mandrel limit precondition failed since starting job");
         e_stop_handler(EstopReason::mandrel_latch);
         return PlanishState::e_stop_begin;
@@ -737,7 +840,7 @@ PlanishState state_machine(const PlanishState state_in) {
       return PlanishState::learn_jog_to_end_pos;
 
     case PlanishState::learn_jog_to_end_pos:
-      if (!IS_MANDREL_SAFE) {
+      if (!is_mandrel_safe) {
         e_stop_handler(EstopReason::mandrel_latch);
         return PlanishState::e_stop_begin;
       }
@@ -760,7 +863,7 @@ PlanishState state_machine(const PlanishState state_in) {
       return PlanishState::learn_jog_to_park_pos;
 
     case PlanishState::learn_jog_to_park_pos:
-      if (!IS_MANDREL_SAFE) {
+      if (!is_mandrel_safe) {
         e_stop_handler(EstopReason::mandrel_latch);
         return PlanishState::e_stop_begin;
       }
@@ -908,7 +1011,7 @@ bool wait_for_motion() {
     return false;
   }
 
-  if (!IS_MANDREL_SAFE) {
+  if (!is_mandrel_safe) {
     e_stop_handler(EstopReason::mandrel_latch);
   }
   return false;
@@ -1230,6 +1333,12 @@ void update_buttons() {
   CycleButton.new_reading(CYCLE_SW.State());
   FingerButton.new_reading(FINGER_SW.State());
   HeadButton.new_reading(HEAD_SW.State());
+
+  HmiIsRthButton.new_reading(HmiIsRth_state);
+  HmiIsAxisHomingButton.new_reading(HmiIsAxisHoming_state);
+  HmiIsSetJobStartButton.new_reading(HmiIsSetJobStart_state);
+  HmiIsSetJobEndButton.new_reading(HmiIsSetJobEnd_state);
+  HmiIsSetJobParkButton.new_reading(HmiIsSetJobPark_state);
 }
 
 /**
