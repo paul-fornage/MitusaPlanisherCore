@@ -31,7 +31,7 @@
 
 // ModBus TCP stuff
 class ModbusEthernet : public ModbusAPI<ModbusTCPTemplate<EthernetServer, EthernetClient>> {};
-const IPAddress remote(192, 168, 0, 211);  // Address of Modbus Slave device
+const IPAddress remote(192, 168, 1, 100);  // Address of Modbus Slave device
 byte mac[] = { 0x24, 0x15, 0x10, 0xB0, 0x45, 0xA4 }; // MAC address is ignored but because of C++ types, you still need to give it garbage
 IPAddress ip(192, 168, 0, 178); // The IP address will be dependent on your local network
 ModbusEthernet mb;               // Declare ModbusTCP instance
@@ -44,8 +44,10 @@ Button HmiIsSetJobStartButton(false, false);
 Button HmiIsSetJobEndButton(false, false);
 Button HmiIsSetJobParkButton(false, false);
 Button HmiCommitJobButton(false, false);
-Button HmiIsCommandedFingersButton(false, false);
-Button HmiIsCommandedRollerButton(false, false);
+Button HmiIsCommandedFingersUpButton(false, false);
+Button HmiIsCommandedFingersDownButton(false, false);
+Button HmiIsCommandedRollerUpButton(false, false);
+Button HmiIsCommandedRollerDownButton(false, false);
 Button HmiIsCommandedPosButton(false, false); // TODO
 
 HmiReg<bool> hmi_is_rth_state(CoilAddr::IS_RTH_BUTTON_LATCHED, false);
@@ -54,10 +56,10 @@ HmiReg<bool> hmi_is_set_job_start_state(CoilAddr::IS_SET_JOB_START_BUTTON_LATCHE
 HmiReg<bool> hmi_is_set_job_end_state(CoilAddr::IS_SET_JOB_END_BUTTON_LATCHED, false);
 HmiReg<bool> hmi_is_set_job_park_state(CoilAddr::IS_SET_JOB_PARK_BUTTON_LATCHED, false);
 HmiReg<bool> hmi_commit_job_state(CoilAddr::IS_COMMIT_JOB_BUTTON_LATCHED, false);
-HmiReg<bool> hmi_is_commanded_fingers_state(CoilAddr::IS_COMMANDED_FINGER_LATCHED, false); // indicates that `hmi_commanded_fingers_value` has been updated on rising edge
-HmiReg<bool> hmi_is_commanded_roller_state(CoilAddr::IS_COMMANDED_ROLLER_LATCHED, false);  // indicates that `hmi_commanded_roller_value` has been updated on rising edge
-HmiReg<bool> hmi_commanded_fingers_value(CoilAddr::HMI_COMMANDED_FINGERS, false); // not to be confused with `hmi_is_commanded_fingers_state`, this is the value, not the latch/flag
-HmiReg<bool> hmi_commanded_roller_value(CoilAddr::HMI_COMMANDED_ROLLER, false);   // not to be confused with `hmi_is_commanded_roller_state`, this is the value, not the latch/flag
+HmiReg<bool> hmi_finger_up_state(CoilAddr::IS_FINGER_UP_LATCHED, false);
+HmiReg<bool> hmi_finger_down_state(CoilAddr::IS_FINGER_DOWN_LATCHED, false);
+HmiReg<bool> hmi_roller_up_state(CoilAddr::IS_ROLLER_UP_LATCHED, false);
+HmiReg<bool> hmi_roller_down_state(CoilAddr::IS_ROLLER_DOWN_LATCHED, false);
 HmiReg<bool> hmi_is_commanded_pos_state(CoilAddr::IS_COMMANDED_POS_LATCHED, false);
 
 HmiReg<uint16_t> HmiCommandedPosition(HregAddr::HMI_COMMANDED_POSITION_REG_ADDR, 0);
@@ -69,6 +71,8 @@ volatile bool is_e_stop = false;               // Is the Emergency Stop currentl
 
 bool io_configured = false;                  // Has the IO been configured
 bool is_mandrel_safe = false;
+
+uint32_t last_modbus_print = 0;
 
 int32_t current_jog_speed = 0;              // Current speed the motor should use for jogging. Steps/second
 int32_t current_planish_speed = 0;          // Current speed the motor should use for planishing. Steps/second
@@ -224,8 +228,8 @@ volatile EstopReason estop_reason = EstopReason::NONE;
 #define ESTOP_SW_SAFE_STATE 1
 #define MANDREL_LATCH_LMT_SAFE_STATE 1 // MANDREL_LATCH_LMT.State() should return this when it's safe/down/engaged
 
-#define JOG_FWD_SW_ACTIVE_STATE 1
-#define JOG_REV_SW_ACTIVE_STATE 1
+#define JOG_FWD_SW_ACTIVE_STATE 0
+#define JOG_REV_SW_ACTIVE_STATE 0
 
 #define ADC_RES_BITS 12
 #define ADC_MAX_VALUE ((1 << ADC_RES_BITS)-1)
@@ -281,9 +285,11 @@ void check_modbus();
 std::pair<uint16_t, bool> job_progress(PlanishState state_to_check);
 void mb_read_hreg(HmiReg<uint16_t> *reg);
 void mb_read_coil(HmiReg<bool> *reg);
-double constexpr steps_to_f64_inch(uint32_t steps);
-uint16_t constexpr steps_to_hundreths(uint32_t steps);
-uint16_t constexpr steps_per_sec_to_inches_per_minute(uint32_t steps_per_second);
+void mb_write_coil(uint16_t address, bool val);
+void mb_write_hreg(uint16_t address, uint16_t val);
+double steps_to_f64_inch(uint32_t steps);
+uint16_t steps_to_hundreths(uint32_t steps);
+uint16_t steps_per_sec_to_inches_per_minute(uint32_t steps_per_second);
 const char *get_state_name(PlanishState state);
 void update_modbus_buttons();
 
@@ -311,7 +317,20 @@ void setup() {
   // Debug delay to be able to restart motor before program starts
 //  delay(2000);
 
-  Ethernet.begin(mac, ip);
+  if (!Ethernet.begin(mac)) {
+    ConnectorUsb.SendLine("DHCP failed, using static IP");
+  } else {
+    ConnectorUsb.Send("DHCP gives IP: ");
+    const auto temp_ip = Ethernet.localIP();
+    ConnectorUsb.Send(temp_ip[0]);
+    ConnectorUsb.SendChar('.');
+    ConnectorUsb.Send(temp_ip[1]);
+    ConnectorUsb.SendChar('.');
+    ConnectorUsb.Send(temp_ip[2]);
+    ConnectorUsb.SendChar('.');
+    ConnectorUsb.SendLine(temp_ip[3]);
+  }
+
 
 
   read_job_from_nvram();
@@ -366,6 +385,12 @@ void loop() {
   mb.task(); // modbus tick
   last_iteration_time = millis();
 
+  PERIODIC_PRINT(
+    if (!is_HMI_comm_good) {
+      ConnectorUsb.SendLine("HMI communication not established");
+    }
+  )
+
   // state machine state machine machine state
   // Run one instance of the state machine
   machine_state = state_machine(machine_state);
@@ -375,11 +400,11 @@ void loop() {
   if (loop_num%STATE_MACHINE_LOOPS_POT_UPDATE_INTERVAL==0) {
     update_speed_pot();
   }
-  if (loop_num%STATE_MACHINE_LOOPS_HMI_UPDATE_INTERVAL==15) {
+  if (loop_num%STATE_MACHINE_LOOPS_HMI_UPDATE_INTERVAL==0) {
     check_modbus();
   }
 }
-
+// TODO: Probably too many mb.task() calls
 /**
  * Checks modbus
  * @pre IO configured successfully
@@ -387,31 +412,33 @@ void loop() {
 void check_modbus() {
   if (mb.isConnected(remote)) {   // Check if connection to Modbus Slave is established
     is_HMI_comm_good = true;
-    mb.writeCoil(remote, CoilAddr::IS_MANDREL_LATCH_CLOSED, is_mandrel_safe);  // Initiate Read Hreg from Modbus Slave
-    mb.writeCoil(remote, CoilAddr::IS_FINGERS_DOWN, Fingers.get_measured_state());
-    mb.writeCoil(remote, CoilAddr::IS_HOMED, is_homed);
-    mb.writeCoil(remote, CoilAddr::IS_FAULT, machine_state==PlanishState::error);
-    mb.writeCoil(remote, CoilAddr::IS_READY_FOR_CYCLE, Fingers.is_fully_engaged() && is_homed && is_mandrel_safe && machine_state == PlanishState::idle);
-    mb.writeCoil(remote, CoilAddr::IS_E_STOP, is_e_stop);
-    mb.writeCoil(remote, CoilAddr::IS_JOB_ACTIVE, job_progress(machine_state).first);
-    mb.writeCoil(remote, CoilAddr::IS_READY_FOR_MANUAL_CONTROL, is_mandrel_safe && is_homed && machine_state == PlanishState::idle);
-    mb.writeCoil(remote, CoilAddr::IS_ROLLER_DOWN, Head.get_measured_state());
-    mb.writeCoil(remote, CoilAddr::CC_COMMANDED_FINGERS, Fingers.get_commanded_state());
-    mb.writeCoil(remote, CoilAddr::CC_COMMANDED_ROLLER, Head.get_commanded_state());
+    mb_write_coil(CoilAddr::IS_MANDREL_LATCH_CLOSED, is_mandrel_safe);  // Initiate Read Hreg from Modbus Slave
+    mb_write_coil(CoilAddr::IS_FINGERS_DOWN, Fingers.get_measured_state());
+    mb_write_coil(CoilAddr::IS_HOMED, is_homed);
+    mb_write_coil(CoilAddr::IS_FAULT, machine_state==PlanishState::error);
+    // TODO: Abstract those lists of conditions
+    mb_write_coil(CoilAddr::IS_READY_FOR_CYCLE, Fingers.is_fully_engaged() && is_homed && is_mandrel_safe && machine_state == PlanishState::idle);
+    mb_write_coil(CoilAddr::IS_E_STOP, is_e_stop);
+    mb_write_coil(CoilAddr::IS_JOB_ACTIVE, job_progress(machine_state).first);
+    mb_write_coil(CoilAddr::IS_READY_FOR_MANUAL_CONTROL, is_mandrel_safe && is_homed && machine_state == PlanishState::idle);
+    mb_write_coil(CoilAddr::IS_ROLLER_DOWN, Head.get_measured_state());
+    mb_write_coil(CoilAddr::CC_COMMANDED_FINGERS, Fingers.get_commanded_state());
+    mb_write_coil(CoilAddr::CC_COMMANDED_ROLLER, Head.get_commanded_state());
 
-    mb_read_coil(&hmi_commanded_fingers_value);
-    mb_read_coil(&hmi_commanded_roller_value);
+    if (millis() - last_modbus_print > 1000) {
+      last_modbus_print = millis();
 
+    }
     update_modbus_buttons();
 
-    mb.writeHreg(remote, HregAddr::CC_COMMANDED_POSITION_REG_ADDR, steps_to_hundreths(CARRIAGE_MOTOR.PositionRefCommanded()));
-    mb.writeHreg(remote, HregAddr::JOB_PROGRESS_REG_ADDR, job_progress(machine_state).second);
-    mb.writeHreg(remote, HregAddr::JOB_START_POS_REG_ADDR, steps_to_hundreths(saved_job_start_pos));
-    mb.writeHreg(remote, HregAddr::JOB_END_POS_REG_ADDR, steps_to_hundreths(saved_job_end_pos));
-    mb.writeHreg(remote, HregAddr::JOB_PARK_POS_REG_ADDR, steps_to_hundreths(saved_job_park_pos));
-    mb.writeHreg(remote, HregAddr::JOG_SPEED_REG_ADDR, steps_per_sec_to_inches_per_minute(current_jog_speed));
-    mb.writeHreg(remote, HregAddr::PLANISH_SPEED_REG_ADDR, steps_per_sec_to_inches_per_minute(current_planish_speed));
-    mb.writeHreg(remote, HregAddr::FAULT_CODE_REG_ADDR, fault_code);
+    mb_write_hreg(HregAddr::CC_COMMANDED_POSITION_REG_ADDR, steps_to_hundreths(CARRIAGE_MOTOR.PositionRefCommanded()));
+    mb_write_hreg(HregAddr::JOB_PROGRESS_REG_ADDR, job_progress(machine_state).second);
+    mb_write_hreg(HregAddr::JOB_START_POS_REG_ADDR, steps_to_hundreths(saved_job_start_pos));
+    mb_write_hreg(HregAddr::JOB_END_POS_REG_ADDR, steps_to_hundreths(saved_job_end_pos));
+    mb_write_hreg(HregAddr::JOB_PARK_POS_REG_ADDR, steps_to_hundreths(saved_job_park_pos));
+    mb_write_hreg(HregAddr::JOG_SPEED_REG_ADDR, steps_per_sec_to_inches_per_minute(current_jog_speed));
+    mb_write_hreg(HregAddr::PLANISH_SPEED_REG_ADDR, steps_per_sec_to_inches_per_minute(current_planish_speed));
+    mb_write_hreg(HregAddr::FAULT_CODE_REG_ADDR, fault_code);
     mb_read_hreg(&HmiCommandedPosition);
     
   } else {
@@ -422,15 +449,27 @@ void check_modbus() {
 
 void mb_read_hreg(HmiReg<uint16_t> *reg) {
   mb.readHreg(remote, reg->address, &reg->value);
+  mb.task();
 }
 
 void mb_read_unlatch_coil(HmiReg<bool> *reg) {
-  mb.readCoil(remote, reg->address, &reg->value);
-  mb.writeCoil(remote, reg->address, false);
+  mb_read_coil(reg);
+  mb_write_coil(reg->address, false);
 }
 
 void mb_read_coil(HmiReg<bool> *reg) {
   mb.readCoil(remote, reg->address, &reg->value);
+  mb.task();
+}
+
+void mb_write_coil(const uint16_t address, const bool val) {
+  mb.writeCoil(remote, address, val);
+  mb.task();
+}
+
+void mb_write_hreg(const uint16_t address, const uint16_t val) {
+  mb.writeCoil(remote, address, val);
+  mb.task();
 }
 
 void update_modbus_buttons() {
@@ -439,8 +478,10 @@ void update_modbus_buttons() {
   mb_read_unlatch_coil(&hmi_is_set_job_start_state);
   mb_read_unlatch_coil(&hmi_is_set_job_end_state);
   mb_read_unlatch_coil(&hmi_is_set_job_park_state);
-  mb_read_unlatch_coil(&hmi_is_commanded_fingers_state);
-  mb_read_unlatch_coil(&hmi_is_commanded_roller_state);
+  mb_read_unlatch_coil(&hmi_finger_up_state);
+  mb_read_unlatch_coil(&hmi_finger_down_state);
+  mb_read_unlatch_coil(&hmi_roller_up_state);
+  mb_read_unlatch_coil(&hmi_roller_down_state);
   mb_read_unlatch_coil(&hmi_is_commanded_pos_state);
 }
 
@@ -492,13 +533,13 @@ PlanishState state_machine(const PlanishState state_in) {
       PERIODIC_PRINT(ConnectorUsb.SendLine("post state"););
       is_HMI_comm_good = false;
       if (Ethernet.linkStatus() == LinkOFF) {
-        delay(10);
+        PERIODIC_PRINT(ConnectorUsb.SendLine("Eth link off"););
         return PlanishState::post;
       }
       mb.client();
       if(!mb.isConnected(remote)) {
         mb.connect(remote);
-        delay(10);
+        ConnectorUsb.SendChar('.');
         return PlanishState::post;
       }
       is_HMI_comm_good = true;
@@ -564,10 +605,17 @@ PlanishState state_machine(const PlanishState state_in) {
         }
       }
 
-      if (FingerButton.is_rising() || HmiIsCommandedFingersButton.is_rising()) {
-        bool new_finger_state = !Fingers.get_commanded_state(); // < doesn't necessarily get acted on or set.
-        if(HmiIsCommandedFingersButton.is_rising()) {
-          new_finger_state = hmi_commanded_fingers_value.value;
+      if (FingerButton.is_rising()
+          || HmiIsCommandedFingersUpButton.is_rising()
+          || HmiIsCommandedFingersDownButton.is_rising())
+        {
+        bool new_finger_state; // < doesn't necessarily get acted on or set.
+        if(HmiIsCommandedFingersUpButton.is_rising()) {
+          new_finger_state = true;
+        } else if (HmiIsCommandedFingersDownButton.is_rising()) {
+          new_finger_state = false;
+        } else {
+          new_finger_state = !Fingers.get_commanded_state();
         }
         if (is_mandrel_safe || !new_finger_state) {
           if(Head.is_fully_disengaged() || new_finger_state) {
@@ -584,13 +632,20 @@ PlanishState state_machine(const PlanishState state_in) {
         }
       }
 
-      if (HeadButton.is_changing() || HmiIsCommandedRollerButton.is_rising()) {
+      if (HeadButton.is_changing()
+          || HmiIsCommandedRollerUpButton.is_rising()
+          || HmiIsCommandedRollerDownButton.is_rising())
+        {
         // Although the head switch is not momentary, changes should only be made when the user commands it, to avoid
         // unexpected moves when relinquishing head control to user after a job
 
-        bool new_head_state = HeadButton.get_current_state(); // < doesn't necessarily get acted on or set.
-        if (HmiIsCommandedRollerButton.is_rising()) {
-          new_head_state = hmi_commanded_roller_value.value;
+        bool new_head_state; // < doesn't necessarily get acted on or set.
+        if (HmiIsCommandedRollerUpButton.is_rising()) {
+          new_head_state = true;
+        } else if (HmiIsCommandedRollerDownButton.is_rising()) {
+          new_head_state = false;
+        } else {
+          new_head_state = HeadButton.get_current_state();
         }
 
         if((is_mandrel_safe && Fingers.is_fully_engaged()) || !new_head_state) {
@@ -683,7 +738,8 @@ PlanishState state_machine(const PlanishState state_in) {
         ConnectorUsb.Send("Waiting for head. Currently commanded ");
         ConnectorUsb.SendLine(Head.get_commanded_state() ? "down." : "up.");
       }
-      if (!is_mandrel_safe) {
+      if (!is_mandrel_safe && Head.get_commanded_state()) {
+        // if the mandrel latch is not engaged and the head is being lowered
         e_stop_handler(EstopReason::mandrel_latch);
         return PlanishState::e_stop_begin;
       }
@@ -810,6 +866,7 @@ PlanishState state_machine(const PlanishState state_in) {
       fault_code = FaultCodes::Error;
       home_indicator_light.setPattern(LightPattern::STROBE);
       learn_indicator_light.setPattern(LightPattern::STROBE);
+      check_modbus(); // last words, if able
       while (true) {
         ConnectorUsb.SendLine("reached error state.");
         ConnectorUsb.Send("estop reason: ");
@@ -1455,8 +1512,10 @@ void update_buttons() {
   HmiIsSetJobStartButton.new_reading(hmi_is_set_job_start_state.value);
   HmiIsSetJobEndButton.new_reading(hmi_is_set_job_end_state.value);
   HmiIsSetJobParkButton.new_reading(hmi_is_set_job_park_state.value);
-  HmiIsCommandedFingersButton.new_reading(hmi_is_commanded_fingers_state.value);
-  HmiIsCommandedRollerButton.new_reading(hmi_is_commanded_roller_state.value);
+  HmiIsCommandedFingersUpButton.new_reading(hmi_finger_up_state.value);
+  HmiIsCommandedFingersDownButton.new_reading(hmi_finger_down_state.value);
+  HmiIsCommandedRollerUpButton.new_reading(hmi_roller_up_state.value);
+  HmiIsCommandedRollerDownButton.new_reading(hmi_roller_down_state.value);
   HmiIsCommandedPosButton.new_reading(hmi_is_commanded_pos_state.value);
   HmiCommitJobButton.new_reading(hmi_commit_job_state.value);
 }
@@ -1653,7 +1712,7 @@ const char *get_estop_reason_name(const EstopReason state) {
   return "INVALID_STATE";
 }
 
-double constexpr steps_to_f64_inch(const uint32_t steps) {
+double steps_to_f64_inch(const uint32_t steps) {
   const double motor_revs = static_cast<double>(steps)/STEPS_PER_REV;
   const double pinion_revs = motor_revs * GEARBOX_RATIO;
   const double teeth = pinion_revs / PINION_TEETH_PER_REV;
@@ -1661,13 +1720,13 @@ double constexpr steps_to_f64_inch(const uint32_t steps) {
   return inches;
 }
 
-uint16_t constexpr steps_to_hundreths(const uint32_t steps) {
+uint16_t steps_to_hundreths(const uint32_t steps) {
   const double hundreths = steps_to_f64_inch(steps) * 100;
 
   return static_cast<uint16_t>(hundreths);
 }
 
-uint16_t constexpr steps_per_sec_to_inches_per_minute(const uint32_t steps_per_second) {
+uint16_t steps_per_sec_to_inches_per_minute(const uint32_t steps_per_second) {
   const double inches_per_second = steps_to_f64_inch(steps_per_second);
   const double inches_per_minute = inches_per_second * 60;
 
