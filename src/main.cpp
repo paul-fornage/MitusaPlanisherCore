@@ -13,6 +13,13 @@
 #include "indicator_light.h"
 #include "button.h"
 #include "actuator.h"
+#include "FaultCodes.h"
+#include <Ethernet.h>       // Ethernet library v2 is required
+#include <ModbusAPI.h>
+#include <ModbusTCPTemplate.h>
+#include <utility>
+#include "HmiReg.h"
+#include "RegisterDefinitions.h"
 
 
 // TODO: Bug when booting with e-stop on
@@ -20,12 +27,7 @@
 // TODO: https://piolabs.com/blog/insights/unit-testing-part-1.html#introduction, https://docs.platformio.org/en/latest/advanced/unit-testing/frameworks/doctest.html
 
 
-#include <Ethernet.h>       // Ethernet library v2 is required
-#include <ModbusAPI.h>
-#include <ModbusTCPTemplate.h>
 
-#include "HmiReg.h"
-#include "RegisterDefinitions.h"
 
 // ModBus TCP stuff
 class ModbusEthernet : public ModbusAPI<ModbusTCPTemplate<EthernetServer, EthernetClient>> {};
@@ -43,17 +45,20 @@ Button HmiIsSetJobEndButton(false, false);
 Button HmiIsSetJobParkButton(false, false);
 Button HmiIsCommandedFingersButton(false, false);
 Button HmiIsCommandedRollerButton(false, false);
-Button HmiIsCommandedPosState(false, false);
+Button HmiIsCommandedPosButton(false, false);
 
-bool hmi_is_rth_state = false;
-bool hmi_is_axis_homing_state = false;
-bool hmi_is_set_job_start_state = false;
-bool hmi_is_set_job_end_state = false;
-bool hmi_is_set_job_park_state = false;
-bool hmi_is_commanded_fingers_state = false;
-bool hmi_is_commanded_roller_state = false;
-bool hmi_is_commanded_pos_state = false;
+HmiReg<bool> hmi_is_rth_state(CoilAddr::IS_RTH_BUTTON_LATCHED, false);
+HmiReg<bool> hmi_is_axis_homing_state(CoilAddr::IS_AXIS_HOMING_BUTTON_LATCHED, false);
+HmiReg<bool> hmi_is_set_job_start_state(CoilAddr::IS_SET_JOB_START_BUTTON_LATCHED, false);
+HmiReg<bool> hmi_is_set_job_end_state(CoilAddr::IS_SET_JOB_END_BUTTON_LATCHED, false);
+HmiReg<bool> hmi_is_set_job_park_state(CoilAddr::IS_SET_JOB_PARK_BUTTON_LATCHED, false);
+HmiReg<bool> hmi_is_commanded_fingers_state(CoilAddr::IS_COMMANDED_FINGER_LATCHED, false);
+HmiReg<bool> hmi_is_commanded_roller_state(CoilAddr::IS_COMMANDED_ROLLER_LATCHED, false);
+HmiReg<bool> hmi_is_commanded_pos_state(CoilAddr::IS_COMMANDED_POS_LATCHED, false);
 
+HmiReg<uint16_t> HmiCommandedPosition(HregAddr::HMI_COMMANDED_POSITION_REG_ADDR, 0);
+
+auto fault_code = FaultCodes::None;
 
 bool is_homed = false;                  // Has the axis been homed
 volatile bool is_e_stop = false;               // Is the Emergency Stop currently active
@@ -262,7 +267,8 @@ PlanishState secure_system(PlanishState last_state);
 PlanishState state_machine(PlanishState state_in);
 const char *get_estop_reason_name(EstopReason state);
 void check_modbus();
-bool is_state_job(PlanishState state_to_check);
+std::pair<uint16_t, bool> job_progress(PlanishState state_to_check);
+void mb_read_hreg(HmiReg<uint16_t> *reg);
 
 const char *get_state_name(PlanishState state);
 
@@ -372,11 +378,21 @@ void check_modbus() {
     mb.writeCoil(remote, CoilAddr::IS_FAULT, machine_state==PlanishState::error);
     mb.writeCoil(remote, CoilAddr::IS_READY_FOR_CYCLE, Fingers.is_fully_engaged() && is_homed && is_mandrel_safe && machine_state == PlanishState::idle);
     mb.writeCoil(remote, CoilAddr::IS_E_STOP, is_e_stop);
-    mb.writeCoil(remote, CoilAddr::IS_JOB_ACTIVE, is_state_job(machine_state));
+    mb.writeCoil(remote, CoilAddr::IS_JOB_ACTIVE, job_progress(machine_state).first);
     mb.writeCoil(remote, CoilAddr::IS_READY_FOR_MANUAL_CONTROL, is_mandrel_safe && is_homed && machine_state == PlanishState::idle);
     mb.writeCoil(remote, CoilAddr::IS_ROLLER_DOWN, Head.get_measured_state());
     mb.writeCoil(remote, CoilAddr::CC_COMMANDED_FINGERS, Fingers.get_commanded_state());
     mb.writeCoil(remote, CoilAddr::CC_COMMANDED_ROLLER, Head.get_commanded_state());
+
+    mb.writeHreg(remote, HregAddr::CC_COMMANDED_POSITION_REG_ADDR, CARRIAGE_MOTOR.PositionRefCommanded());
+    mb.writeHreg(remote, HregAddr::JOB_PROGRESS_REG_ADDR, job_progress(machine_state).second);
+    mb.writeHreg(remote, HregAddr::JOB_START_POS_REG_ADDR, saved_job_start_pos);
+    mb.writeHreg(remote, HregAddr::JOB_END_POS_REG_ADDR, saved_job_end_pos);
+    mb.writeHreg(remote, HregAddr::JOB_PARK_POS_REG_ADDR, saved_job_park_pos);
+    mb.writeHreg(remote, HregAddr::JOG_SPEED_REG_ADDR, current_jog_speed);
+    mb.writeHreg(remote, HregAddr::PLANISH_SPEED_REG_ADDR, current_planish_speed);
+    mb.writeHreg(remote, HregAddr::FAULT_CODE_REG_ADDR, fault_code);
+    mb_read_hreg(&HmiCommandedPosition);
     
   } else {
     is_HMI_comm_good = false;
@@ -384,42 +400,66 @@ void check_modbus() {
   }
 }
 
-void mb_read_unlatch(const uint16_t address, bool *val) {
-  mb.readCoil(remote, address, val);
-  mb.writeCoil(remote, address, false);
+void mb_read_hreg(HmiReg<uint16_t> *reg) {
+  mb.readHreg(remote, reg->address, &reg->value);
+}
+
+void mb_read_unlatch_coil(HmiReg<bool> *reg) {
+  mb.readCoil(remote, reg->address, &reg->value);
+  mb.writeCoil(remote, reg->address, false);
 }
 
 void update_modbus_buttons() {
-  mb_read_unlatch(CoilAddr::IS_RTH_BUTTON_LATCHED, &hmi_is_rth_state);
-  mb_read_unlatch(CoilAddr::IS_AXIS_HOMING_BUTTON_LATCHED, &hmi_is_axis_homing_state);
-  mb_read_unlatch(CoilAddr::IS_SET_JOB_START_BUTTON_LATCHED, &hmi_is_set_job_start_state);
-  mb_read_unlatch(CoilAddr::IS_SET_JOB_END_BUTTON_LATCHED, &hmi_is_set_job_end_state);
-  mb_read_unlatch(CoilAddr::IS_SET_JOB_PARK_BUTTON_LATCHED, &hmi_is_set_job_park_state);
-  mb_read_unlatch(CoilAddr::IS_COMMANDED_FINGER_LATCHED, &hmi_is_commanded_fingers_state);
-  mb_read_unlatch(CoilAddr::IS_COMMANDED_ROLLER_LATCHED, &hmi_is_commanded_roller_state);
-  mb_read_unlatch(CoilAddr::IS_COMMANDED_POS_LATCHED, &hmi_is_commanded_pos_state);
+  mb_read_unlatch_coil(&hmi_is_rth_state);
+  mb_read_unlatch_coil(&hmi_is_axis_homing_state);
+  mb_read_unlatch_coil(&hmi_is_set_job_start_state);
+  mb_read_unlatch_coil(&hmi_is_set_job_end_state);
+  mb_read_unlatch_coil(&hmi_is_set_job_park_state);
+  mb_read_unlatch_coil(&hmi_is_commanded_fingers_state);
+  mb_read_unlatch_coil(&hmi_is_commanded_roller_state);
+  mb_read_unlatch_coil(&hmi_is_commanded_pos_state);
 }
 
-bool is_state_job(const PlanishState state_to_check) {
+/**
+ * Get the progress of the current job, if there is one
+ * @param state_to_check current machine state
+ * @return Pair(progress 0..2^16, is there even a job going on)
+ */
+std::pair<uint16_t, bool> job_progress(const PlanishState state_to_check) {
+  uint16_t progress = 0;
   switch (state_to_check) {
     case PlanishState::job_begin:
     case PlanishState::job_begin_lifting_head:
+      progress = 2;
+      break;
     case PlanishState::job_jog_to_start:
     case PlanishState::job_jog_to_start_wait:
+      progress = 4;
+      break;
     case PlanishState::job_head_down:
     case PlanishState::job_head_down_wait:
+      progress = 6;
+      break;
     case PlanishState::job_planish_to_end:
     case PlanishState::job_planish_to_end_wait:
+      progress = 8;
+      break;
     case PlanishState::job_planish_to_start:
     case PlanishState::job_planish_to_start_wait:
+      progress = 10;
+      break;
     case PlanishState::job_head_up:
     case PlanishState::job_head_up_wait:
+      progress = 12;
+      break;
     case PlanishState::job_jog_to_park:
     case PlanishState::job_jog_to_park_wait:
-      return true;
+      progress = 15;
+      break;
     default:
-      return false;
+      return std::make_pair(0, false);
   }
+  return std::make_pair(progress << 12, true);
 }
 
 PlanishState state_machine(const PlanishState state_in) {
@@ -488,7 +528,7 @@ PlanishState state_machine(const PlanishState state_in) {
       return PlanishState::wait_for_homing;
 
     case PlanishState::idle:
-      if (HomeButton.is_rising()) {
+      if (HomeButton.is_rising() || HmiIsAxisHomingButton.is_rising()) {
         if (is_mandrel_safe) {
           if (Head.is_fully_disengaged()) {
             return PlanishState::begin_homing;
@@ -707,6 +747,7 @@ PlanishState state_machine(const PlanishState state_in) {
       return PlanishState::e_stop_wait;
 
     case PlanishState::error:
+      fault_code = FaultCodes::Error;
       home_indicator_light.setPattern(LightPattern::STROBE);
       learn_indicator_light.setPattern(LightPattern::STROBE);
       while (true) {
@@ -1066,6 +1107,7 @@ void iteration_time_check() {
     ConnectorUsb.Send(last_iteration_delta);
     ConnectorUsb.Send("ms. Engaging E-Stop and stopping execution. Last state: ");
     ConnectorUsb.SendLine(get_state_name(machine_state));
+    fault_code = FaultCodes::SmTimeout;
     e_stop_handler(EstopReason::internal_error);
   } else if (last_iteration_delta >= ITERATION_TIME_WARNING_MS) {
     ConnectorUsb.Send("Last iteration of the state machine took more than `ITERATION_TIME_WARNING_MS` (");
@@ -1348,14 +1390,14 @@ void update_buttons() {
   FingerButton.new_reading(FINGER_SW.State());
   HeadButton.new_reading(HEAD_SW.State());
 
-  HmiIsRthButton.new_reading(hmi_is_rth_state);
-  HmiIsAxisHomingButton.new_reading(hmi_is_axis_homing_state);
-  HmiIsSetJobStartButton.new_reading(hmi_is_set_job_start_state);
-  HmiIsSetJobEndButton.new_reading(hmi_is_set_job_end_state);
-  HmiIsSetJobParkButton.new_reading(hmi_is_set_job_park_state);
-  HmiIsCommandedFingersButton.new_reading(hmi_is_commanded_fingers_state);
-  HmiIsCommandedRollerButton.new_reading(hmi_is_commanded_roller_state);
-  HmiIsCommandedPosState.new_reading(hmi_is_commanded_pos_state);
+  HmiIsRthButton.new_reading(hmi_is_rth_state.value);
+  HmiIsAxisHomingButton.new_reading(hmi_is_axis_homing_state.value);
+  HmiIsSetJobStartButton.new_reading(hmi_is_set_job_start_state.value);
+  HmiIsSetJobEndButton.new_reading(hmi_is_set_job_end_state.value);
+  HmiIsSetJobParkButton.new_reading(hmi_is_set_job_park_state.value);
+  HmiIsCommandedFingersButton.new_reading(hmi_is_commanded_fingers_state.value);
+  HmiIsCommandedRollerButton.new_reading(hmi_is_commanded_roller_state.value);
+  HmiIsCommandedPosButton.new_reading(hmi_is_commanded_pos_state.value);
 }
 
 /**
