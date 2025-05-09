@@ -30,14 +30,20 @@
 
 
 // ModBus TCP stuff
+const byte mac[] = { 0x24, 0x15, 0x10, 0xB0, 0x45, 0xA4 }; // MAC address is ignored but because of C++ types, you still need to give it garbage
+const IpAddress remote_ip(192, 168, 1, 100);  // Address of Modbus Slave device
+constexpr uint16_t remote_port = 502;
 
-// TODO: DHCP as option
+EthernetTcpClient client;
 
-class ModbusEthernet : public ModbusAPI<ModbusTCPTemplate<EthernetServer, EthernetClient>> {};
-const IPAddress remote(192, 168, 1, 100);  // Address of Modbus Slave device
-byte mac[] = { 0x24, 0x15, 0x10, 0xB0, 0x45, 0xA4 }; // MAC address is ignored but because of C++ types, you still need to give it garbage
-IPAddress ip(192, 168, 0, 178); // The IP address will be dependent on your local network
-ModbusEthernet mb;               // Declare ModbusTCP instance
+bool use_dhcp = true; // this will get disabled at runtime if DHCP fails `dhcp_attempts` times
+uint8_t dhcp_attempts = 5;
+
+// these are not used in DHCP
+const IpAddress ip(192, 168, 1, 128); // Local IP for non DHCP mode
+const IpAddress gateway(192, 168, 1, 1); // Gateway IP for non DHCP mode
+const IpAddress subnet(255, 255, 255, 0); // Subnet mask for non DHCP mode
+
 
 bool is_HMI_comm_good = false;
 
@@ -165,7 +171,7 @@ volatile EstopReason estop_reason = EstopReason::NONE;
 
 #ifdef TEST_MODE_DISABLE_MOTOR
 // Wrapper for commands to the motor that will print them instead if motor is disabled for test mode
-#define MOTOR_COMMAND(code) ConnectorUsb.SendLine(#code)
+#define MOTOR_COMMAND(code) USB_PRINTLN(#code)
 #define MOTOR_ASSERTED true
 #define MOTOR_HAS_ERRORS false
 #define MOTOR_ERROR_COMMANDED_WHEN_DISABLED false
@@ -245,6 +251,10 @@ volatile EstopReason estop_reason = EstopReason::NONE;
 // logging from 'wait' states. Too low will flood the logs
 
 #define PERIODIC_PRINT(statements) if (loop_num%STATE_MACHINE_LOOPS_LOG_INTERVAL==0) { statements }
+
+#define USB_PRINT(statements) ConnectorUsb.Send(statements);
+#define USB_PRINTLN(statements) ConnectorUsb.SendLine(statements);
+#define USB_PRINT_CHAR(statements) ConnectorUsb.SendChar(statements);
 
 // TODO: Verify this WAGNER
 #define STEPS_PER_REV 800
