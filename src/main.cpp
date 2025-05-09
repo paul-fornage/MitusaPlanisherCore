@@ -121,6 +121,7 @@ enum class PlanishState {
   wait_for_homing,            // Wait for homing to complete
   idle,                       // Idle await instructions
   manual_jog,                 // manually commanded jog
+  manual_jog_absolute,        // manually commanded jog to absolute position
   e_stop_begin,               // E-stop was activated, secure system and save current config to be resumed
   e_stop_wait,                // E-stop is active, wait for it to end
   error,                      // unrecoverable error has occurred and machine needs to reboot. should be a dead end state
@@ -863,6 +864,13 @@ PlanishState state_machine(const PlanishState state_in) {
       MOTOR_COMMAND(CARRIAGE_MOTOR.MoveStopDecel(););
 
       return PlanishState::idle;
+
+    case PlanishState::manual_jog_absolute:
+      if (wait_for_motion()) {
+        return PlanishState::idle;
+        USB_PRINTLN("Manual jog absolute done")
+      }
+      return PlanishState::manual_jog_absolute;
 
     case PlanishState::e_stop_begin:
       estop_resume_state = secure_system(estop_last_state);
@@ -1631,8 +1639,8 @@ PlanishState secure_system(const PlanishState last_state) {
       return PlanishState::idle;
 
     case PlanishState::manual_jog:
+    case PlanishState::manual_jog_absolute:
       return PlanishState::idle;
-
     case PlanishState::e_stop_begin:
     case PlanishState::e_stop_wait:
       // This is not a valid state. The state before the E-stop ran should never be e-stop
