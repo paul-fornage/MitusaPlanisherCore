@@ -31,7 +31,7 @@
 
 // ModBus TCP stuff
 const byte mac[] = { 0x24, 0x15, 0x10, 0xB0, 0x45, 0xA4 }; // MAC address is ignored but because of C++ types, you still need to give it garbage
-const IpAddress remote_ip(192, 168, 1, 100);  // Address of Modbus Slave device
+const IPAddress remote_ip(192, 168, 1, 100);  // Address of Modbus Slave device
 constexpr uint16_t remote_port = 502;
 
 EthernetTcpClient client;
@@ -40,9 +40,9 @@ bool use_dhcp = true; // this will get disabled at runtime if DHCP fails `dhcp_a
 uint8_t dhcp_attempts = 5;
 
 // these are not used in DHCP
-const IpAddress ip(192, 168, 1, 128); // Local IP for non DHCP mode
-const IpAddress gateway(192, 168, 1, 1); // Gateway IP for non DHCP mode
-const IpAddress subnet(255, 255, 255, 0); // Subnet mask for non DHCP mode
+const IPAddress ip(192, 168, 1, 128); // Local IP for non DHCP mode
+const IPAddress gateway(192, 168, 1, 1); // Gateway IP for non DHCP mode
+const IPAddress subnet(255, 255, 255, 0); // Subnet mask for non DHCP mode
 
 
 bool is_HMI_comm_good = false;
