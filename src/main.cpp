@@ -30,6 +30,9 @@
 
 
 // ModBus TCP stuff
+
+// TODO: DHCP as option
+
 class ModbusEthernet : public ModbusAPI<ModbusTCPTemplate<EthernetServer, EthernetClient>> {};
 const IPAddress remote(192, 168, 1, 100);  // Address of Modbus Slave device
 byte mac[] = { 0x24, 0x15, 0x10, 0xB0, 0x45, 0xA4 }; // MAC address is ignored but because of C++ types, you still need to give it garbage
