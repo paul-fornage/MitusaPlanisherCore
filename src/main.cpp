@@ -14,12 +14,10 @@
 #include "button.h"
 #include "actuator.h"
 #include "FaultCodes.h"
-#include <Ethernet.h>       // Ethernet library v2 is required
-#include <ModbusAPI.h>
-#include <ModbusTCPTemplate.h>
 #include <utility>
 #include "HmiReg.h"
 #include "RegisterDefinitions.h"
+#include "EthernetTcpClient.h"
 
 
 // TODO: Bug when booting with e-stop on
@@ -30,11 +28,20 @@
 
 
 // ModBus TCP stuff
-class ModbusEthernet : public ModbusAPI<ModbusTCPTemplate<EthernetServer, EthernetClient>> {};
-const IPAddress remote(192, 168, 1, 100);  // Address of Modbus Slave device
-byte mac[] = { 0x24, 0x15, 0x10, 0xB0, 0x45, 0xA4 }; // MAC address is ignored but because of C++ types, you still need to give it garbage
-IPAddress ip(192, 168, 0, 178); // The IP address will be dependent on your local network
-ModbusEthernet mb;               // Declare ModbusTCP instance
+const byte mac[] = { 0x24, 0x15, 0x10, 0xB0, 0x45, 0xA4 }; // MAC address is ignored but because of C++ types, you still need to give it garbage
+const IpAddress remote_ip(192, 168, 1, 100);  // Address of Modbus Slave device
+constexpr uint16_t remote_port = 502;
+
+EthernetTcpClient client;
+
+bool use_dhcp = true; // this will get disabled at runtime if DHCP fails `dhcp_attempts` times
+uint8_t dhcp_attempts = 5;
+
+// these are not used in DHCP
+const IpAddress ip(192, 168, 1, 128); // Local IP for non DHCP mode
+const IpAddress gateway(192, 168, 1, 1); // Gateway IP for non DHCP mode
+const IpAddress subnet(255, 255, 255, 0); // Subnet mask for non DHCP mode
+
 
 bool is_HMI_comm_good = false;
 
@@ -50,19 +57,19 @@ Button HmiIsCommandedRollerUpButton(false, false);
 Button HmiIsCommandedRollerDownButton(false, false);
 Button HmiIsCommandedPosButton(false, false); // TODO
 
-HmiReg<bool> hmi_is_rth_state(CoilAddr::IS_RTH_BUTTON_LATCHED, false);
-HmiReg<bool> hmi_is_axis_homing_state(CoilAddr::IS_AXIS_HOMING_BUTTON_LATCHED, false);
-HmiReg<bool> hmi_is_set_job_start_state(CoilAddr::IS_SET_JOB_START_BUTTON_LATCHED, false);
-HmiReg<bool> hmi_is_set_job_end_state(CoilAddr::IS_SET_JOB_END_BUTTON_LATCHED, false);
-HmiReg<bool> hmi_is_set_job_park_state(CoilAddr::IS_SET_JOB_PARK_BUTTON_LATCHED, false);
-HmiReg<bool> hmi_commit_job_state(CoilAddr::IS_COMMIT_JOB_BUTTON_LATCHED, false);
-HmiReg<bool> hmi_finger_up_state(CoilAddr::IS_FINGER_UP_LATCHED, false);
-HmiReg<bool> hmi_finger_down_state(CoilAddr::IS_FINGER_DOWN_LATCHED, false);
-HmiReg<bool> hmi_roller_up_state(CoilAddr::IS_ROLLER_UP_LATCHED, false);
-HmiReg<bool> hmi_roller_down_state(CoilAddr::IS_ROLLER_DOWN_LATCHED, false);
-HmiReg<bool> hmi_is_commanded_pos_state(CoilAddr::IS_COMMANDED_POS_LATCHED, false);
+HmiHreg<bool> hmi_is_rth_state(CoilAddr::IS_RTH_BUTTON_LATCHED, false);
+HmiHreg<bool> hmi_is_axis_homing_state(CoilAddr::IS_AXIS_HOMING_BUTTON_LATCHED, false);
+HmiHreg<bool> hmi_is_set_job_start_state(CoilAddr::IS_SET_JOB_START_BUTTON_LATCHED, false);
+HmiHreg<bool> hmi_is_set_job_end_state(CoilAddr::IS_SET_JOB_END_BUTTON_LATCHED, false);
+HmiHreg<bool> hmi_is_set_job_park_state(CoilAddr::IS_SET_JOB_PARK_BUTTON_LATCHED, false);
+HmiHreg<bool> hmi_commit_job_state(CoilAddr::IS_COMMIT_JOB_BUTTON_LATCHED, false);
+HmiHreg<bool> hmi_finger_up_state(CoilAddr::IS_FINGER_UP_LATCHED, false);
+HmiHreg<bool> hmi_finger_down_state(CoilAddr::IS_FINGER_DOWN_LATCHED, false);
+HmiHreg<bool> hmi_roller_up_state(CoilAddr::IS_ROLLER_UP_LATCHED, false);
+HmiHreg<bool> hmi_roller_down_state(CoilAddr::IS_ROLLER_DOWN_LATCHED, false);
+HmiHreg<bool> hmi_is_commanded_pos_state(CoilAddr::IS_COMMANDED_POS_LATCHED, false);
 
-HmiReg<uint16_t> HmiCommandedPosition(HregAddr::HMI_COMMANDED_POSITION_REG_ADDR, 0);
+HmiHreg<uint16_t> HmiCommandedPosition(HregAddr::HMI_COMMANDED_POSITION_REG_ADDR, 0);
 
 auto fault_code = FaultCodes::None;
 
@@ -71,6 +78,8 @@ volatile bool is_e_stop = false;               // Is the Emergency Stop currentl
 
 bool io_configured = false;                  // Has the IO been configured
 bool is_mandrel_safe = false;
+
+bool client_success = false; // is TCP established? not necessarily updated often, check yourself if you need to know
 
 uint32_t last_modbus_print = 0;
 
@@ -162,7 +171,7 @@ volatile EstopReason estop_reason = EstopReason::NONE;
 
 #ifdef TEST_MODE_DISABLE_MOTOR
 // Wrapper for commands to the motor that will print them instead if motor is disabled for test mode
-#define MOTOR_COMMAND(code) ConnectorUsb.SendLine(#code)
+#define MOTOR_COMMAND(code) USB_PRINTLN(#code)
 #define MOTOR_ASSERTED true
 #define MOTOR_HAS_ERRORS false
 #define MOTOR_ERROR_COMMANDED_WHEN_DISABLED false
@@ -243,6 +252,10 @@ volatile EstopReason estop_reason = EstopReason::NONE;
 
 #define PERIODIC_PRINT(statements) if (loop_num%STATE_MACHINE_LOOPS_LOG_INTERVAL==0) { statements }
 
+#define USB_PRINT(statements) ConnectorUsb.Send(statements);
+#define USB_PRINTLN(statements) ConnectorUsb.SendLine(statements);
+#define USB_PRINT_CHAR(statements) ConnectorUsb.SendChar(statements);
+
 // TODO: Verify this WAGNER
 #define STEPS_PER_REV 800
 #define GEARBOX_RATIO 100.0 // number of input revs for one output revs
@@ -283,8 +296,8 @@ PlanishState state_machine(PlanishState state_in);
 const char *get_estop_reason_name(EstopReason state);
 void check_modbus();
 std::pair<uint16_t, bool> job_progress(PlanishState state_to_check);
-void mb_read_hreg(HmiReg<uint16_t> *reg);
-void mb_read_coil(HmiReg<bool> *reg);
+void mb_read_hreg(HmiHreg<uint16_t> *reg);
+void mb_read_coil(HmiHreg<bool> *reg);
 void mb_write_coil(uint16_t address, bool val);
 void mb_write_hreg(uint16_t address, uint16_t val);
 double steps_to_f64_inch(uint32_t steps);
@@ -292,6 +305,7 @@ uint16_t steps_to_hundreths(uint32_t steps);
 uint16_t steps_per_sec_to_inches_per_minute(uint32_t steps_per_second);
 const char *get_state_name(PlanishState state);
 void update_modbus_buttons();
+bool establish_tcp_client();
 
 extern "C" void TCC2_0_Handler(void) __attribute__((
             alias("PeriodicInterrupt")));
@@ -316,34 +330,22 @@ void setup() {
 
   // Debug delay to be able to restart motor before program starts
 //  delay(2000);
-
-  if (!Ethernet.begin(mac)) {
-    ConnectorUsb.SendLine("DHCP failed, using static IP");
-  } else {
-    ConnectorUsb.Send("DHCP gives IP: ");
-    const auto temp_ip = Ethernet.localIP();
-    ConnectorUsb.Send(temp_ip[0]);
-    ConnectorUsb.SendChar('.');
-    ConnectorUsb.Send(temp_ip[1]);
-    ConnectorUsb.SendChar('.');
-    ConnectorUsb.Send(temp_ip[2]);
-    ConnectorUsb.SendChar('.');
-    ConnectorUsb.SendLine(temp_ip[3]);
-  }
-
-
+  
+  client_success = establish_tcp_client();
+  // TODO: check and potentially reconnect from the main loop, but mind watchdog
+  USB_PRINTLN(client_success ? "TCP good" : "TCP failed");
 
   read_job_from_nvram();
 
-  ConnectorUsb.SendLine("job retrieved from NVRAM");
-  ConnectorUsb.SendLine(saved_job_start_pos);
-  ConnectorUsb.SendLine(saved_job_end_pos);
-  ConnectorUsb.SendLine(saved_job_park_pos);
+  USB_PRINTLN("job retrieved from NVRAM");
+  USB_PRINTLN(saved_job_start_pos);
+  USB_PRINTLN(saved_job_end_pos);
+  USB_PRINTLN(saved_job_park_pos);
 
   io_configured = configure_io();
 
   if (!io_configured) {           // if the IO failed to configure properly
-    ConnectorUsb.SendLine("IO was not configured successfully, hanging");
+    USB_PRINTLN("IO was not configured successfully, hanging");
     e_stop_handler(EstopReason::internal_error);
     return;
   }
@@ -356,8 +358,6 @@ void setup() {
 
 //  ESTOP_SW.InterruptHandlerSet(e_stop_button_handler, InputManager::InterruptTrigger::CHANGE);
 
-
-
 }
 
 
@@ -365,7 +365,7 @@ void loop() {
   is_mandrel_safe = MANDREL_LATCH_LMT.State() == MANDREL_LATCH_LMT_SAFE_STATE;
 
   if (ESTOP_SW.State() != ESTOP_SW_SAFE_STATE) { // make sure e-stop wasn't already depressed before interrupt was registered
-    ConnectorUsb.SendLine("E-Stop was triggered by button from the main loop check");
+    USB_PRINTLN("E-Stop was triggered by button from the main loop check");
     e_stop_handler(EstopReason::button);
   }
 
@@ -380,16 +380,13 @@ void loop() {
     }
   }
   loop_num++;
-  for (uint8_t i=0; i<32; i++){
-    mb.task(); // modbus tick
-  }
   last_iteration_time = millis();
 
-  PERIODIC_PRINT(
-    if (!is_HMI_comm_good) {
-      ConnectorUsb.SendLine("HMI communication not established");
-    }
-  )
+  // PERIODIC_PRINT(
+  //   if (!is_HMI_comm_good) {
+  //     USB_PRINTLN("HMI communication not established");
+  //   }
+  // )
 
   // state machine state machine machine state
   // Run one instance of the state machine
@@ -401,10 +398,42 @@ void loop() {
     update_speed_pot();
   }
   if (loop_num%STATE_MACHINE_LOOPS_HMI_UPDATE_INTERVAL==0) {
-    check_modbus();
+    // check_modbus();
   }
 }
-// TODO: Probably too many mb.task() calls
+
+bool establish_tcp_client() {
+  if (!EthernetMgr.PhyLinkActive()) {
+    USB_PRINTLN("Ethernet PHY link not active");
+    return false;
+  }
+  if (!client.Connected()) {
+    EthernetMgr.Setup();
+    if (use_dhcp && dhcp_attempts > 0) {
+      const bool dhcpSuccess = EthernetMgr.DhcpBegin();
+      if (dhcpSuccess) {
+        USB_PRINT("DHCP gives IP: ");
+        IpAddress temp_ip = EthernetMgr.LocalIp();
+        USB_PRINTLN(temp_ip.StringValue());
+      } else {
+        dhcp_attempts--;
+        USB_PRINTLN("DHCP failed.");
+        USB_PRINT(dhcp_attempts);
+        USB_PRINTLN(" attempts remaining.")
+      }
+    } else {
+      EthernetMgr.LocalIp(ip);
+      EthernetMgr.GatewayIp(gateway);
+      EthernetMgr.NetmaskIp(subnet);
+    }
+    return client.Connect(remote_ip, remote_port);
+  }
+  return true;
+}
+
+
+
+
 /**
  * Checks modbus
  * @pre IO configured successfully
@@ -439,23 +468,23 @@ void check_modbus() {
     mb_write_hreg(HregAddr::PLANISH_SPEED_REG_ADDR, steps_per_sec_to_inches_per_minute(current_planish_speed));
     mb_write_hreg(HregAddr::FAULT_CODE_REG_ADDR, fault_code);
     mb_read_hreg(&HmiCommandedPosition);
-    
+
   } else {
     is_HMI_comm_good = false;
     mb.connect(remote);           // Try to connect if not connected
   }
 }
 
-void mb_read_hreg(HmiReg<uint16_t> *reg) {
+void mb_read_hreg(HmiHreg<uint16_t> *reg) {
   mb.readHreg(remote, reg->address, &reg->value);
 }
 
-void mb_read_unlatch_coil(HmiReg<bool> *reg) {
+void mb_read_unlatch_coil(HmiHreg<bool> *reg) {
   mb_read_coil(reg);
   mb_write_coil(reg->address, false);
 }
 
-void mb_read_coil(HmiReg<bool> *reg) {
+void mb_read_coil(HmiHreg<bool> *reg) {
   mb.readCoil(remote, reg->address, &reg->value);
 }
 
@@ -525,24 +554,11 @@ std::pair<uint16_t, bool> job_progress(const PlanishState state_to_check) {
 PlanishState state_machine(const PlanishState state_in) {
   switch (state_in) {
     case PlanishState::post:  // Not used anymore but could be in the future
-      PERIODIC_PRINT(ConnectorUsb.SendLine("post state"););
-      is_HMI_comm_good = false;
-      if (Ethernet.linkStatus() == LinkOFF) {
-        PERIODIC_PRINT(ConnectorUsb.SendLine("Eth link off"););
-        return PlanishState::post;
-      }
-      mb.client();
-      if(!mb.isConnected(remote)) {
-        mb.connect(remote);
-        ConnectorUsb.SendChar('.');
-        return PlanishState::post;
-      }
-      is_HMI_comm_good = true;
-      ConnectorUsb.SendLine("POSTed up. HMI seems connected");
+      PERIODIC_PRINT(USB_PRINTLN("post state"););
       return PlanishState::idle;
 
     case PlanishState::begin_homing:
-      ConnectorUsb.SendLine("begin homing");
+      USB_PRINTLN("begin homing");
 
       MOTOR_COMMAND(CARRIAGE_MOTOR.EnableRequest(false));
       is_homed = false;
@@ -566,7 +582,7 @@ PlanishState state_machine(const PlanishState state_in) {
 
       if (MOTOR_ASSERTED) {
         // homing done no errors
-        ConnectorUsb.SendLine("homing complete");
+        USB_PRINTLN("homing complete");
         // the position saved in the local motor instance is not neccesarily the same of the motor FW.
         // this line ensures they are set to the same thing, but when there seems to be a rounding error between the two
         // can confirm they don't desync over the course of at least ~20,000 steps
@@ -578,10 +594,10 @@ PlanishState state_machine(const PlanishState state_in) {
 
       if (MOTOR_HAS_ERRORS) {
         if(MOTOR_ERROR_COMMANDED_WHEN_DISABLED) {
-          ConnectorUsb.SendLine("Motor was commanded to move before enabling."
+          USB_PRINTLN("Motor was commanded to move before enabling."
                                 "depending on how the code turns out this might not be problematic");
         }
-        ConnectorUsb.SendLine("Motor alert detected during homing.");
+        USB_PRINTLN("Motor alert detected during homing.");
         print_motor_alerts();
         e_stop_handler(EstopReason::motor_error);
       }
@@ -593,10 +609,10 @@ PlanishState state_machine(const PlanishState state_in) {
           if (Head.is_fully_disengaged()) {
             return PlanishState::begin_homing;
           } else {
-            ConnectorUsb.SendLine("Tried to home while head engaged");
+            USB_PRINTLN("Tried to home while head engaged");
           }
         } else {
-          ConnectorUsb.SendLine("Tried to home without mandrel latch engaged");
+          USB_PRINTLN("Tried to home without mandrel latch engaged");
         }
       }
 
@@ -616,14 +632,14 @@ PlanishState state_machine(const PlanishState state_in) {
           if(Head.is_fully_disengaged() || new_finger_state) {
             // make sure the head is up and not engaged, and also not in the process of lowering.
             // OR the user is trying to engage the fingers because the head somehow was already down
-            ConnectorUsb.SendLine(new_finger_state ? "Engaging fingers" : "Disengaging fingers");
+            USB_PRINTLN(new_finger_state ? "Engaging fingers" : "Disengaging fingers");
             Fingers.set_commanded_state(new_finger_state);
             return PlanishState::wait_for_fingers;
           } else {
-            ConnectorUsb.SendLine("Tried to disengage fingers while head was down or lowering");
+            USB_PRINTLN("Tried to disengage fingers while head was down or lowering");
           }
         } else {
-          ConnectorUsb.SendLine("tried to engage fingers without mandrel latch engaged");
+          USB_PRINTLN("tried to engage fingers without mandrel latch engaged");
         }
       }
 
@@ -648,7 +664,7 @@ PlanishState state_machine(const PlanishState state_in) {
           Head.set_commanded_state(new_head_state);
           return PlanishState::wait_for_head;
         } else {
-          ConnectorUsb.SendLine("Tried to lower head while fingers not down or mandrel latch not engaged");
+          USB_PRINTLN("Tried to lower head while fingers not down or mandrel latch not engaged");
           return PlanishState::idle;
         }
       }
@@ -659,13 +675,13 @@ PlanishState state_machine(const PlanishState state_in) {
             if (is_homed) {
               return PlanishState::learn_start_pos;
             } else {
-              ConnectorUsb.SendLine("Tried to start learn without homed");
+              USB_PRINTLN("Tried to start learn without homed");
             }
           } else {
-            ConnectorUsb.SendLine("Tried to learn job while the head was not fully down");
+            USB_PRINTLN("Tried to learn job while the head was not fully down");
           }
         } else {
-          ConnectorUsb.SendLine("Tried to learn job without mandrel being in safe position");
+          USB_PRINTLN("Tried to learn job without mandrel being in safe position");
         }
       }
 
@@ -679,59 +695,59 @@ PlanishState state_machine(const PlanishState state_in) {
             // because otherwise it will put the motor FW in an error state
             return PlanishState::manual_jog;
           } else {
-            ConnectorUsb.SendLine("Tried to start jog without being homed");
+            USB_PRINTLN("Tried to start jog without being homed");
           }
         } else {
-          ConnectorUsb.SendLine("Tried to jog without mandrel switch engaged");
+          USB_PRINTLN("Tried to jog without mandrel switch engaged");
         }
       }
 
       if (HmiIsSetJobStartButton.is_rising()) {
         if (MOTOR_ASSERTED && MOTOR_STEPS_COMPLETE) {
           temp_job_start_pos = CARRIAGE_MOTOR.PositionRefCommanded();
-          ConnectorUsb.SendLine("saved start position");
+          USB_PRINTLN("saved start position");
         } else {
-          ConnectorUsb.SendLine("HMI tried to save current position as job start, but the carriage is still in motion!");
+          USB_PRINTLN("HMI tried to save current position as job start, but the carriage is still in motion!");
         }
       }
       if (HmiIsSetJobEndButton.is_rising()) {
         if (MOTOR_ASSERTED && MOTOR_STEPS_COMPLETE) {
           temp_job_end_pos = CARRIAGE_MOTOR.PositionRefCommanded();
-          ConnectorUsb.SendLine("saved end position");
+          USB_PRINTLN("saved end position");
         } else {
-          ConnectorUsb.SendLine("HMI tried to save current position as job end, but the carriage is still in motion!");
+          USB_PRINTLN("HMI tried to save current position as job end, but the carriage is still in motion!");
         }
       }
       if (HmiIsSetJobParkButton.is_rising()) {
         if (MOTOR_ASSERTED && MOTOR_STEPS_COMPLETE) {
           temp_job_park_pos = CARRIAGE_MOTOR.PositionRefCommanded();
-          ConnectorUsb.SendLine("saved park position");
+          USB_PRINTLN("saved park position");
         } else {
-          ConnectorUsb.SendLine("HMI tried to save current position as job park, but the carriage is still in motion!");
+          USB_PRINTLN("HMI tried to save current position as job park, but the carriage is still in motion!");
         }
       }
       if (HmiCommitJobButton.is_rising()) {
         save_job_to_nvram();
-        ConnectorUsb.SendLine("Saved job to NVRAM and memory");
+        USB_PRINTLN("Saved job to NVRAM and memory");
       }
 
       if (CycleButton.is_rising()) {
         if (Fingers.is_fully_engaged() && is_homed && is_mandrel_safe) {
           return PlanishState::job_begin;
         } else if (!Fingers.is_fully_engaged()) {
-          ConnectorUsb.SendLine("Tried to start cycle without fingers engaged");
+          USB_PRINTLN("Tried to start cycle without fingers engaged");
         } else if (!is_homed){
-          ConnectorUsb.SendLine("Tried to start cycle without being homed");
+          USB_PRINTLN("Tried to start cycle without being homed");
         } else {
-          ConnectorUsb.SendLine("Tried to start cycle without Mandrel latch being engaged");
+          USB_PRINTLN("Tried to start cycle without Mandrel latch being engaged");
         }
       }
       return PlanishState::idle;
 
     case PlanishState::wait_for_head:
       if (loop_num%STATE_MACHINE_LOOPS_LOG_INTERVAL==0) {
-        ConnectorUsb.Send("Waiting for head. Currently commanded ");
-        ConnectorUsb.SendLine(Head.get_commanded_state() ? "down." : "up.");
+        USB_PRINT("Waiting for head. Currently commanded ");
+        USB_PRINTLN(Head.get_commanded_state() ? "down." : "up.");
       }
       if (!is_mandrel_safe && Head.get_commanded_state()) {
         // if the mandrel latch is not engaged and the head is being lowered
@@ -748,7 +764,7 @@ PlanishState state_machine(const PlanishState state_in) {
           Head.set_commanded_state(new_head_state);
           return PlanishState::wait_for_head;
         } else {
-          ConnectorUsb.SendLine("Tried to lower head while fingers not down");
+          USB_PRINTLN("Tried to lower head while fingers not down");
           return PlanishState::idle;
         }
       }
@@ -760,8 +776,8 @@ PlanishState state_machine(const PlanishState state_in) {
     case PlanishState::wait_for_fingers:
 
       if (loop_num%STATE_MACHINE_LOOPS_LOG_INTERVAL==0) {
-        ConnectorUsb.Send("Waiting for fingers. Currently commanded ");
-        ConnectorUsb.SendLine(Fingers.get_commanded_state() ? "down." : "up.");
+        USB_PRINT("Waiting for fingers. Currently commanded ");
+        USB_PRINTLN(Fingers.get_commanded_state() ? "down." : "up.");
       }
       if (!is_mandrel_safe) {
         e_stop_handler(EstopReason::mandrel_latch);
@@ -770,7 +786,7 @@ PlanishState state_machine(const PlanishState state_in) {
 
       if (FingerButton.is_rising()) { // still let the user change the finger state even if in motion
         const bool new_finger_state = !Fingers.get_commanded_state(); // < doesn't necessarily get acted on or set.
-        ConnectorUsb.SendLine(new_finger_state ? "Engaging fingers" : "Disengaging fingers");
+        USB_PRINTLN(new_finger_state ? "Engaging fingers" : "Disengaging fingers");
         Fingers.set_commanded_state(new_finger_state);
         return PlanishState::wait_for_fingers;
       }
@@ -802,21 +818,21 @@ PlanishState state_machine(const PlanishState state_in) {
 
     case PlanishState::e_stop_begin:
       estop_resume_state = secure_system(estop_last_state);
-      ConnectorUsb.Send("secure_system returns");
-      ConnectorUsb.Send(get_state_name(estop_resume_state));
+      USB_PRINT("secure_system returns");
+      USB_PRINT(get_state_name(estop_resume_state));
       return PlanishState::e_stop_wait;
 
     case PlanishState::e_stop_wait:
       switch (estop_reason) {
         case EstopReason::NONE:
-          ConnectorUsb.SendLine("E-Stop was triggered without setting the reason, changing to error");
+          USB_PRINTLN("E-Stop was triggered without setting the reason, changing to error");
           estop_reason = EstopReason::internal_error;
           return PlanishState::e_stop_wait;
         case EstopReason::button:
           if ((ESTOP_SW.State() == ESTOP_SW_SAFE_STATE)
               && (millis() - last_estop_millis > ESTOP_COOLDOWN_MS))
           { // if the button was released and the estop has been active for over a second
-            ConnectorUsb.SendLine("Emergency Stop Released, resuming");
+            USB_PRINTLN("Emergency Stop Released, resuming");
             is_e_stop = false;
             return estop_resume_state;
           }
@@ -828,7 +844,7 @@ PlanishState state_machine(const PlanishState state_in) {
           {
             // if the latch was fixed and the button hasn't been pressed,
             // and the estop was activated more than `ESTOP_COOLDOWN_MS` ago
-            ConnectorUsb.SendLine("Mandrel put back, resuming");
+            USB_PRINTLN("Mandrel put back, resuming");
             is_e_stop = false;
             return estop_resume_state;
           }
@@ -846,7 +862,7 @@ PlanishState state_machine(const PlanishState state_in) {
           {
             // if the latch was fixed and the button hasn't been pressed,
             // and the estop was activated more than `ESTOP_COOLDOWN_MS` ago, AND the user is homing again
-            ConnectorUsb.SendLine("Motor error cleared by homing, resuming");
+            USB_PRINTLN("Motor error cleared by homing, resuming");
             home_indicator_light.setPattern(LightPattern::OFF);
             is_e_stop = false;
             return PlanishState::begin_homing; // this estop can only be recovered from if they press the home button
@@ -861,11 +877,11 @@ PlanishState state_machine(const PlanishState state_in) {
       fault_code = FaultCodes::Error;
       home_indicator_light.setPattern(LightPattern::STROBE);
       learn_indicator_light.setPattern(LightPattern::STROBE);
-      check_modbus(); // last words, if able
+      // check_modbus(); // last words, if able
       while (true) {
-        ConnectorUsb.SendLine("reached error state.");
-        ConnectorUsb.Send("estop reason: ");
-        ConnectorUsb.SendLine(get_estop_reason_name(estop_reason));
+        USB_PRINTLN("reached error state.");
+        USB_PRINT("estop reason: ");
+        USB_PRINTLN(get_estop_reason_name(estop_reason));
         delay(1000);
       }
 
@@ -873,16 +889,16 @@ PlanishState state_machine(const PlanishState state_in) {
       Head.set_commanded_state(false); // head is supposed to already be raised, but this needs to be called
       // despite the sensor check in case it was in the proccess of lowering already
       if (Head.is_fully_disengaged()) {
-        ConnectorUsb.SendLine("Job started head was already up");
+        USB_PRINTLN("Job started head was already up");
         return PlanishState::job_jog_to_start;
       } else {
-        ConnectorUsb.SendLine("Job was started but the head was already down, raising");
+        USB_PRINTLN("Job was started but the head was already down, raising");
         return PlanishState::job_begin_lifting_head;
       }
 
     case PlanishState::job_begin_lifting_head:
       if (!is_mandrel_safe) {
-        ConnectorUsb.SendLine("mandrel limit precondition failed since starting job");
+        USB_PRINTLN("mandrel limit precondition failed since starting job");
         e_stop_handler(EstopReason::mandrel_latch);
         return PlanishState::e_stop_begin;
       }
@@ -890,12 +906,12 @@ PlanishState state_machine(const PlanishState state_in) {
         return PlanishState::job_jog_to_start;
       }
       if (loop_num%STATE_MACHINE_LOOPS_LOG_INTERVAL==0) {
-        ConnectorUsb.SendLine("Waiting for head to rise for job start");
+        USB_PRINTLN("Waiting for head to rise for job start");
       }
       return PlanishState::job_begin_lifting_head;
 
     case PlanishState::job_jog_to_start:
-      ConnectorUsb.SendLine("Jog to start");
+      USB_PRINTLN("Jog to start");
       move_motor_auto_speed(saved_job_start_pos);
       return PlanishState::job_jog_to_start_wait;
 
@@ -905,18 +921,18 @@ PlanishState state_machine(const PlanishState state_in) {
         return PlanishState::job_head_down;
       }
       if (loop_num%STATE_MACHINE_LOOPS_LOG_INTERVAL==0) {
-        ConnectorUsb.SendLine("waiting for jog to start");
+        USB_PRINTLN("waiting for jog to start");
       }
       return PlanishState::job_jog_to_start_wait;
 
     case PlanishState::job_head_down:
-      ConnectorUsb.SendLine("Lowering head");
+      USB_PRINTLN("Lowering head");
       Head.set_commanded_state(true);
       return PlanishState::job_head_down_wait;
 
     case PlanishState::job_head_down_wait:
       if (!is_mandrel_safe) {
-        ConnectorUsb.SendLine("mandrel limit precondition failed since starting job");
+        USB_PRINTLN("mandrel limit precondition failed since starting job");
         e_stop_handler(EstopReason::mandrel_latch);
         return PlanishState::e_stop_begin;
       }
@@ -924,12 +940,12 @@ PlanishState state_machine(const PlanishState state_in) {
         return PlanishState::job_planish_to_end;
       }
       if (loop_num%STATE_MACHINE_LOOPS_LOG_INTERVAL==0) {
-        ConnectorUsb.SendLine("Waiting for head to lower to begin planish");
+        USB_PRINTLN("Waiting for head to lower to begin planish");
       }
       return PlanishState::job_head_down_wait;
 
     case PlanishState::job_planish_to_end:
-      ConnectorUsb.SendLine("Planishing to end position");
+      USB_PRINTLN("Planishing to end position");
       move_motor_auto_speed(saved_job_end_pos);
       return PlanishState::job_planish_to_end_wait;
 
@@ -937,22 +953,22 @@ PlanishState state_machine(const PlanishState state_in) {
       MOTOR_COMMAND(CARRIAGE_MOTOR.VelMax(current_planish_speed););
       if (wait_for_motion()) {
         if (HALF_CYCLE_SW.State()) {
-          ConnectorUsb.SendLine("half cycle detected, go to park");
+          USB_PRINTLN("half cycle detected, go to park");
           // if only doing a half-cycle, the single pass thus far is sufficient. retract head and return to park
           return PlanishState::job_head_up;
         } else {
-          ConnectorUsb.SendLine("full cycle detected, do second pass");
+          USB_PRINTLN("full cycle detected, do second pass");
           // otherwise do the other pass
           return PlanishState::job_planish_to_start;
         }
       }
       if (loop_num%STATE_MACHINE_LOOPS_LOG_INTERVAL==0) {
-        ConnectorUsb.SendLine("Planishing to end position");
+        USB_PRINTLN("Planishing to end position");
       }
       return PlanishState::job_planish_to_end_wait;
 
     case PlanishState::job_planish_to_start:
-      ConnectorUsb.SendLine("Begin planishing to start position");
+      USB_PRINTLN("Begin planishing to start position");
       move_motor_auto_speed(saved_job_start_pos);
       return PlanishState::job_planish_to_start_wait;
 
@@ -962,18 +978,18 @@ PlanishState state_machine(const PlanishState state_in) {
         return PlanishState::job_head_up;
       }
       if (loop_num%STATE_MACHINE_LOOPS_LOG_INTERVAL==0) {
-        ConnectorUsb.SendLine("Planishing to start position");
+        USB_PRINTLN("Planishing to start position");
       }
       return PlanishState::job_planish_to_start_wait;
 
     case PlanishState::job_head_up:
-      ConnectorUsb.SendLine("Raising head");
+      USB_PRINTLN("Raising head");
       Head.set_commanded_state(false);
       return PlanishState::job_head_up_wait;
 
     case PlanishState::job_head_up_wait:
       if (!is_mandrel_safe) {
-        ConnectorUsb.SendLine("mandrel limit precondition failed since starting job");
+        USB_PRINTLN("mandrel limit precondition failed since starting job");
         e_stop_handler(EstopReason::mandrel_latch);
         return PlanishState::e_stop_begin;
       }
@@ -981,12 +997,12 @@ PlanishState state_machine(const PlanishState state_in) {
         return PlanishState::job_jog_to_park;
       }
       if (loop_num%STATE_MACHINE_LOOPS_LOG_INTERVAL==0) {
-        ConnectorUsb.SendLine("Waiting for head to raise to park");
+        USB_PRINTLN("Waiting for head to raise to park");
       }
       return PlanishState::job_head_up_wait;
 
     case PlanishState::job_jog_to_park:
-      ConnectorUsb.SendLine("Begin jogging to park position");
+      USB_PRINTLN("Begin jogging to park position");
       move_motor_auto_speed(saved_job_park_pos);
       return PlanishState::job_jog_to_park_wait;
 
@@ -996,13 +1012,13 @@ PlanishState state_machine(const PlanishState state_in) {
         return PlanishState::idle;
       }
       if (loop_num%STATE_MACHINE_LOOPS_LOG_INTERVAL==0) {
-        ConnectorUsb.SendLine("Jogging to park position");
+        USB_PRINTLN("Jogging to park position");
       }
       return PlanishState::job_jog_to_park_wait;
 
     case PlanishState::learn_start_pos:
       learn_indicator_light.setPattern(LightPattern::FLASH1);
-      ConnectorUsb.SendLine("learn start pos");
+      USB_PRINTLN("learn start pos");
       temp_job_start_pos = MOTOR_COMMANDED_POSITION;
       return PlanishState::learn_jog_to_end_pos;
 
@@ -1025,7 +1041,7 @@ PlanishState state_machine(const PlanishState state_in) {
 
     case PlanishState::learn_end_pos:
       learn_indicator_light.setPattern(LightPattern::FLASH2);
-      ConnectorUsb.SendLine("learn end pos");
+      USB_PRINTLN("learn end pos");
       temp_job_end_pos = MOTOR_COMMANDED_POSITION;
       return PlanishState::learn_jog_to_park_pos;
 
@@ -1048,15 +1064,15 @@ PlanishState state_machine(const PlanishState state_in) {
 
     case PlanishState::learn_park_pos:
       learn_indicator_light.setPattern(LightPattern::FLASH3);
-      ConnectorUsb.SendLine("learn park pos");
+      USB_PRINTLN("learn park pos");
       temp_job_park_pos = MOTOR_COMMANDED_POSITION;
       return PlanishState::saving_job_to_nvram;
 
     case PlanishState::saving_job_to_nvram:
-      ConnectorUsb.SendLine("saving job to nvram");
-      ConnectorUsb.SendLine(temp_job_start_pos);
-      ConnectorUsb.SendLine(temp_job_end_pos);
-      ConnectorUsb.SendLine(temp_job_park_pos);
+      USB_PRINTLN("saving job to nvram");
+      USB_PRINTLN(temp_job_start_pos);
+      USB_PRINTLN(temp_job_end_pos);
+      USB_PRINTLN(temp_job_park_pos);
       save_job_to_nvram();
       learn_indicator_light.setPattern(LightPattern::OFF);
       return PlanishState::idle;
@@ -1064,9 +1080,9 @@ PlanishState state_machine(const PlanishState state_in) {
 
   }
   // this means the state machine did not already give a state
-  ConnectorUsb.SendLine("State machine iteration executed without explicitly returning the next state");
-  ConnectorUsb.Send("Previous state: ");
-  ConnectorUsb.SendLine(get_state_name(state_in));
+  USB_PRINTLN("State machine iteration executed without explicitly returning the next state");
+  USB_PRINT("Previous state: ");
+  USB_PRINTLN(get_state_name(state_in));
   e_stop_handler(EstopReason::internal_error);
   return PlanishState::e_stop_begin;
 }
@@ -1097,24 +1113,24 @@ bool configure_io() {
 
   if (CcioMgr.LinkBroken()) {
     uint32_t lastStatusTime = Milliseconds();
-    ConnectorUsb.SendLine("The CCIO-8 link is broken!");
+    USB_PRINTLN("The CCIO-8 link is broken!");
 
     while (CcioMgr.LinkBroken() && Milliseconds() - lastStatusTime < CCIO_TIMEOUT_MS) {
       if (Milliseconds() - lastStatusTime > 1000) {
-        ConnectorUsb.SendLine("The CCIO-8 link is still broken!");
+        USB_PRINTLN("The CCIO-8 link is still broken!");
         lastStatusTime = Milliseconds();
       }
     }
     if (CcioMgr.LinkBroken()) {
-      ConnectorUsb.SendLine("Timed out waiting for CCIO");
+      USB_PRINTLN("Timed out waiting for CCIO");
       return false;
     }
-    ConnectorUsb.SendLine("The CCIO-8 link is online again!");
+    USB_PRINTLN("The CCIO-8 link is online again!");
   }
 
   if (CcioMgr.CcioCount() != EXPECTED_NUM_CCIO) {
-    ConnectorUsb.Send("Expected to find exactly one CCIO connector, found ");
-    ConnectorUsb.SendLine(CcioMgr.CcioCount());
+    USB_PRINT("Expected to find exactly one CCIO connector, found ");
+    USB_PRINTLN(CcioMgr.CcioCount());
     return false;
   }
 
@@ -1167,12 +1183,12 @@ bool configure_io() {
  */
 bool wait_for_motion() {
   if (MOTOR_ASSERTED && MOTOR_STEPS_COMPLETE) {
-    ConnectorUsb.SendLine("Motor has completed motion");
+    USB_PRINTLN("Motor has completed motion");
     return true;
   }
   if (MOTOR_HAS_ERRORS) {
     // motor has an error
-    ConnectorUsb.SendLine("Motor alert detected during homing.");
+    USB_PRINTLN("Motor alert detected during homing.");
     print_motor_alerts();
     e_stop_handler(EstopReason::motor_error);
     return false;
@@ -1213,21 +1229,21 @@ void iteration_time_check() {
   }
 
   if (last_iteration_delta >= ITERATION_TIME_ERROR_MS) {
-    ConnectorUsb.Send("Last iteration of the state machine took more than `ITERATION_TIME_ERROR_MS` (");
-    ConnectorUsb.Send(ITERATION_TIME_ERROR_MS);
-    ConnectorUsb.Send("ms) to complete. This is likely a bug. Last iteration took ");
-    ConnectorUsb.Send(last_iteration_delta);
-    ConnectorUsb.Send("ms. Engaging E-Stop and stopping execution. Last state: ");
-    ConnectorUsb.SendLine(get_state_name(machine_state));
+    USB_PRINT("Last iteration of the state machine took more than `ITERATION_TIME_ERROR_MS` (");
+    USB_PRINT(ITERATION_TIME_ERROR_MS);
+    USB_PRINT("ms) to complete. This is likely a bug. Last iteration took ");
+    USB_PRINT(last_iteration_delta);
+    USB_PRINT("ms. Engaging E-Stop and stopping execution. Last state: ");
+    USB_PRINTLN(get_state_name(machine_state));
     fault_code = FaultCodes::SmTimeout;
     e_stop_handler(EstopReason::internal_error);
   } else if (last_iteration_delta >= ITERATION_TIME_WARNING_MS) {
-    ConnectorUsb.Send("Last iteration of the state machine took more than `ITERATION_TIME_WARNING_MS` (");
-    ConnectorUsb.Send(ITERATION_TIME_WARNING_MS);
-    ConnectorUsb.Send("ms) to complete. This is likely a bug. Last iteration took ");
-    ConnectorUsb.Send(last_iteration_delta);
-    ConnectorUsb.Send("ms. Continuing execution. Last state: ");
-    ConnectorUsb.SendLine(get_state_name(machine_state));
+    USB_PRINT("Last iteration of the state machine took more than `ITERATION_TIME_WARNING_MS` (");
+    USB_PRINT(ITERATION_TIME_WARNING_MS);
+    USB_PRINT("ms) to complete. This is likely a bug. Last iteration took ");
+    USB_PRINT(last_iteration_delta);
+    USB_PRINT("ms. Continuing execution. Last state: ");
+    USB_PRINTLN(get_state_name(machine_state));
   }
 }
 
@@ -1328,7 +1344,7 @@ void set_ccio_pin(
  */
 void e_stop_button_handler() {
   e_stop_handler(EstopReason::button);
-  ConnectorUsb.SendLine("ISR");
+  USB_PRINTLN("ISR");
 }
 
 /**
@@ -1343,9 +1359,9 @@ void e_stop_handler(const EstopReason reason) {
     MOTOR_COMMAND(CARRIAGE_MOTOR.MoveStopAbrupt(););
     machine_state = PlanishState::e_stop_begin;
     last_estop_millis = millis();
-    ConnectorUsb.SendLine("Emergency Stop");
+    USB_PRINTLN("Emergency Stop");
   } else {
-    ConnectorUsb.SendLine("Emergency Stop Handler called when e-stop was already active");
+    USB_PRINTLN("Emergency Stop Handler called when e-stop was already active");
   }
 }
 
@@ -1357,21 +1373,21 @@ void e_stop_handler(const EstopReason reason) {
 void print_motor_alerts(){
   // report status of alerts
 #ifdef TEST_MODE_DISABLE_MOTOR
-  ConnectorUsb.SendLine("print_motor_alerts()");
+  USB_PRINTLN("print_motor_alerts()");
 #else
-  ConnectorUsb.SendLine("ClearPath Alerts present: ");
+  USB_PRINTLN("ClearPath Alerts present: ");
   if(CARRIAGE_MOTOR.AlertReg().bit.MotionCanceledInAlert){
-    ConnectorUsb.SendLine("    MotionCanceledInAlert "); }
+    USB_PRINTLN("    MotionCanceledInAlert "); }
   if(CARRIAGE_MOTOR.AlertReg().bit.MotionCanceledPositiveLimit){
-    ConnectorUsb.SendLine("    MotionCanceledPositiveLimit "); }
+    USB_PRINTLN("    MotionCanceledPositiveLimit "); }
   if(CARRIAGE_MOTOR.AlertReg().bit.MotionCanceledNegativeLimit){
-    ConnectorUsb.SendLine("    MotionCanceledNegativeLimit "); }
+    USB_PRINTLN("    MotionCanceledNegativeLimit "); }
   if(CARRIAGE_MOTOR.AlertReg().bit.MotionCanceledSensorEStop){
-    ConnectorUsb.SendLine("    MotionCanceledSensorEStop "); }
+    USB_PRINTLN("    MotionCanceledSensorEStop "); }
   if(CARRIAGE_MOTOR.AlertReg().bit.MotionCanceledMotorDisabled){
-    ConnectorUsb.SendLine("    MotionCanceledMotorDisabled "); }
+    USB_PRINTLN("    MotionCanceledMotorDisabled "); }
   if(CARRIAGE_MOTOR.AlertReg().bit.MotorFaulted){
-    ConnectorUsb.SendLine("    MotorFaulted ");
+    USB_PRINTLN("    MotorFaulted ");
   }
 #endif
 }
@@ -1445,11 +1461,11 @@ void save_job_to_nvram() {
  * @return whatever `CARRIAGE_MOTOR.Move` returns. (no one knows atm)
  */
 bool move_motor_with_speed(const int32_t position, const int32_t speed) {
-  ConnectorUsb.Send("move_motor_with_speed(");
-  ConnectorUsb.Send(position);
-  ConnectorUsb.Send(", ");
-  ConnectorUsb.Send(speed);
-  ConnectorUsb.Send(");");
+  USB_PRINT("move_motor_with_speed(");
+  USB_PRINT(position);
+  USB_PRINT(", ");
+  USB_PRINT(speed);
+  USB_PRINT(");");
   MOTOR_COMMAND(CARRIAGE_MOTOR.VelMax(speed););
   return MOTOR_COMMAND(CARRIAGE_MOTOR.Move(position, StepGenerator::MOVE_TARGET_ABSOLUTE););
 }
@@ -1460,9 +1476,9 @@ bool move_motor_with_speed(const int32_t position, const int32_t speed) {
  * @return whatever `CARRIAGE_MOTOR.Move` returns. (no one knows atm)
  */
 bool move_motor_auto_speed(const int32_t position) {
-  ConnectorUsb.Send("move_motor_auto_speed(");
-  ConnectorUsb.Send(position);
-  ConnectorUsb.Send(");");
+  USB_PRINT("move_motor_auto_speed(");
+  USB_PRINT(position);
+  USB_PRINT(");");
   const int32_t speed = Head.is_fully_disengaged() ? current_jog_speed : current_planish_speed;
   MOTOR_COMMAND(CARRIAGE_MOTOR.VelMax(speed););
   return MOTOR_COMMAND(CARRIAGE_MOTOR.Move(position, StepGenerator::MOVE_TARGET_ABSOLUTE););
@@ -1471,17 +1487,17 @@ bool move_motor_auto_speed(const int32_t position) {
 void motor_jog(const bool reverse) {
   if (Head.is_fully_disengaged()) {
 #ifdef TEST_MODE_DISABLE_MOTOR
-    ConnectorUsb.Send("Jog mode CARRIAGE_MOTOR.MoveVelocity(");
-    ConnectorUsb.Send(reverse ? -current_jog_speed : current_jog_speed);
-    ConnectorUsb.SendLine(");");
+    USB_PRINT("Jog mode CARRIAGE_MOTOR.MoveVelocity(");
+    USB_PRINT(reverse ? -current_jog_speed : current_jog_speed);
+    USB_PRINTLN(");");
 #else
     CARRIAGE_MOTOR.MoveVelocity(reverse ? -current_jog_speed : current_jog_speed);
 #endif
   } else {
 #ifdef TEST_MODE_DISABLE_MOTOR
-    ConnectorUsb.Send("Planish Mode CARRIAGE_MOTOR.MoveVelocity(");
-    ConnectorUsb.Send(reverse ? -current_planish_speed : current_planish_speed);
-    ConnectorUsb.SendLine(");");
+    USB_PRINT("Planish Mode CARRIAGE_MOTOR.MoveVelocity(");
+    USB_PRINT(reverse ? -current_planish_speed : current_planish_speed);
+    USB_PRINTLN(");");
 #else
     CARRIAGE_MOTOR.MoveVelocity(reverse ? -current_planish_speed : current_planish_speed);
 #endif
@@ -1546,8 +1562,8 @@ void update_speed_pot() {
  * @return The state to resume to once the E-stop cause was rectified
  */
 PlanishState secure_system(const PlanishState last_state) {
-  ConnectorUsb.Send("secure_system called with state: ");
-  ConnectorUsb.Send(get_state_name(last_state));
+  USB_PRINT("secure_system called with state: ");
+  USB_PRINT(get_state_name(last_state));
   switch (last_state) {
     case PlanishState::post:
       // can happen if E-stop ISR goes off erroneously on boot
