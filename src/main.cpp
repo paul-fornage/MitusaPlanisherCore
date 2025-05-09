@@ -30,7 +30,7 @@
 
 
 // ModBus TCP stuff
-const byte mac[] = { 0x24, 0x15, 0x10, 0xB0, 0x45, 0xA4 }; // MAC address is ignored but because of C++ types, you still need to give it garbage
+uint8_t mac[6] = {0x24, 0x15, 0x10, 0xB0, 0x45, 0xA4}; // MAC address is ignored but because of C++ types, you still need to give it garbage
 const IPAddress remote_ip(192, 168, 1, 100);  // Address of Modbus Slave device
 constexpr uint16_t remote_port = 502;
 
@@ -39,11 +39,17 @@ EthernetTcpClient client;
 bool use_dhcp = true; // this will get disabled at runtime if DHCP fails `dhcp_attempts` times
 uint8_t dhcp_attempts = 5;
 
-// these are not used in DHCP
+// not used in DHCP
 const IPAddress ip(192, 168, 1, 128); // Local IP for non DHCP mode
-const IPAddress gateway(192, 168, 1, 1); // Gateway IP for non DHCP mode
-const IPAddress subnet(255, 255, 255, 0); // Subnet mask for non DHCP mode
 
+
+class ModbusEthernet : public ModbusAPI<ModbusTCPTemplate<EthernetServer, EthernetClient>> {};
+ModbusEthernet mb;  //ModbusTCP object
+
+// uint16_t mb_hreg_read_trans;
+// uint16_t mb_hreg_write_trans;
+// uint16_t mb_coil_read_trans;
+// uint16_t mb_coil_write_trans;
 
 bool is_HMI_comm_good = false;
 
@@ -72,6 +78,11 @@ HmiReg<bool> hmi_roller_down_state(CoilAddr::IS_ROLLER_DOWN_LATCHED, false);
 HmiReg<bool> hmi_is_commanded_pos_state(CoilAddr::IS_COMMANDED_POS_LATCHED, false);
 
 HmiReg<uint16_t> HmiCommandedPosition(HregAddr::HMI_COMMANDED_POSITION_REG_ADDR, 0);
+
+#define MB_MAX_COIL 64
+#define MB_MAX_HREG 64
+bool local_mb_coil[MB_MAX_COIL];
+uint16_t local_mb_hreg[MB_MAX_HREG];
 
 auto fault_code = FaultCodes::None;
 
@@ -246,7 +257,7 @@ volatile EstopReason estop_reason = EstopReason::NONE;
 #define MOTOR_EN_DIS_DELAY_MS 10    // during homing the motor needs to be disabled for this many ms to actually do it
 
 #define STATE_MACHINE_LOOPS_POT_UPDATE_INTERVAL 32 // number of loops of the main state machine between speed pot updates
-#define STATE_MACHINE_LOOPS_HMI_UPDATE_INTERVAL 32 // number of loops of the main state machine between Modbus Hmi updates
+#define STATE_MACHINE_LOOPS_HMI_UPDATE_INTERVAL 32 // number of loops of the main state machine between Modbus Hmi updates. must be more than 2 and preferably even
 #define STATE_MACHINE_LOOPS_LOG_INTERVAL 1024 // number of loops of the main state machine between
 // logging from 'wait' states. Too low will flood the logs
 
@@ -298,13 +309,19 @@ void check_modbus();
 std::pair<uint16_t, bool> job_progress(PlanishState state_to_check);
 void mb_read_hreg(HmiReg<uint16_t> *reg);
 void mb_read_coil(HmiReg<bool> *reg);
-void mb_write_coil(uint16_t address, bool val);
+void mb_read_unlatch_coil(HmiReg<bool> *reg);
+void mb_write_hreg(HmiReg<uint16_t> reg);
 void mb_write_hreg(uint16_t address, uint16_t val);
+void mb_write_coil(HmiReg<bool> reg);
+void mb_write_coil(uint16_t address, bool val);
 double steps_to_f64_inch(uint32_t steps);
 uint16_t steps_to_hundreths(uint32_t steps);
 uint16_t steps_per_sec_to_inches_per_minute(uint32_t steps_per_second);
 const char *get_state_name(PlanishState state);
 void update_modbus_buttons();
+bool ethernet_setup();
+void read_modbus_registers();
+void write_modbus_registers();
 
 extern "C" void TCC2_0_Handler(void) __attribute__((
             alias("PeriodicInterrupt")));
@@ -330,21 +347,8 @@ void setup() {
   // Debug delay to be able to restart motor before program starts
 //  delay(2000);
 
-  if (!Ethernet.begin(mac)) {
-    ConnectorUsb.SendLine("DHCP failed, using static IP");
-  } else {
-    ConnectorUsb.Send("DHCP gives IP: ");
-    const auto temp_ip = Ethernet.localIP();
-    ConnectorUsb.Send(temp_ip[0]);
-    ConnectorUsb.SendChar('.');
-    ConnectorUsb.Send(temp_ip[1]);
-    ConnectorUsb.SendChar('.');
-    ConnectorUsb.Send(temp_ip[2]);
-    ConnectorUsb.SendChar('.');
-    ConnectorUsb.SendLine(temp_ip[3]);
-  }
-
-
+  const bool eth_setup_succeed = ethernet_setup();
+  USB_PRINTLN(eth_setup_succeed?"ethernet set up correctly":"ethernet link failed")
 
   read_job_from_nvram();
 
@@ -368,9 +372,6 @@ void setup() {
   machine_state = PlanishState::post;
 
 //  ESTOP_SW.InterruptHandlerSet(e_stop_button_handler, InputManager::InterruptTrigger::CHANGE);
-
-
-
 }
 
 
@@ -393,7 +394,8 @@ void loop() {
     }
   }
   loop_num++;
-  for (uint8_t i=0; i<32; i++){
+  for (uint8_t i=0; i<16; i++){
+    // tick modbus every loop, and make sure it's done by the end
     mb.task(); // modbus tick
   }
   last_iteration_time = millis();
@@ -414,73 +416,66 @@ void loop() {
     update_speed_pot();
   }
   if (loop_num%STATE_MACHINE_LOOPS_HMI_UPDATE_INTERVAL==0) {
+    read_modbus_registers();
     check_modbus();
   }
+  if (loop_num%STATE_MACHINE_LOOPS_HMI_UPDATE_INTERVAL==STATE_MACHINE_LOOPS_HMI_UPDATE_INTERVAL/2) {
+    write_modbus_registers();
+  }
 }
+
+bool ethernet_setup() {
+  if (Ethernet.linkStatus()==EthernetLinkStatus::LinkON) {
+    return true;
+  }
+  while (use_dhcp && dhcp_attempts > 0) {
+    if (!Ethernet.begin(mac)) {
+      dhcp_attempts--;
+      ConnectorUsb.Send("DHCP failed. ");
+      USB_PRINT(dhcp_attempts);
+      USB_PRINTLN(" attempts remaining");
+    } else {
+      ConnectorUsb.Send("DHCP gives IP: ");
+      const auto temp_ip = Ethernet.localIP();
+      ConnectorUsb.Send(temp_ip[0]);
+      ConnectorUsb.SendChar('.');
+      ConnectorUsb.Send(temp_ip[1]);
+      ConnectorUsb.SendChar('.');
+      ConnectorUsb.Send(temp_ip[2]);
+      ConnectorUsb.SendChar('.');
+      ConnectorUsb.SendLine(temp_ip[3]);
+      return true;
+    }
+  }
+  Ethernet.begin(mac, ip);
+  return Ethernet.linkStatus() == EthernetLinkStatus::LinkON;
+}
+
+
+
 // TODO: Probably too many mb.task() calls
 /**
  * Checks modbus
  * @pre IO configured successfully
  */
 void check_modbus() {
-  if (mb.isConnected(remote)) {   // Check if connection to Modbus Slave is established
-    is_HMI_comm_good = true;
-    mb_write_coil(CoilAddr::IS_MANDREL_LATCH_CLOSED, is_mandrel_safe);  // Initiate Read Hreg from Modbus Slave
-    mb_write_coil(CoilAddr::IS_FINGERS_DOWN, Fingers.get_measured_state());
-    mb_write_coil(CoilAddr::IS_HOMED, is_homed);
-    mb_write_coil(CoilAddr::IS_FAULT, machine_state==PlanishState::error);
-    // TODO: Abstract those lists of conditions
-    mb_write_coil(CoilAddr::IS_READY_FOR_CYCLE, Fingers.is_fully_engaged() && is_homed && is_mandrel_safe && machine_state == PlanishState::idle);
-    mb_write_coil(CoilAddr::IS_E_STOP, is_e_stop);
-    mb_write_coil(CoilAddr::IS_JOB_ACTIVE, job_progress(machine_state).first);
-    mb_write_coil(CoilAddr::IS_READY_FOR_MANUAL_CONTROL, is_mandrel_safe && is_homed && machine_state == PlanishState::idle);
-    mb_write_coil(CoilAddr::IS_ROLLER_DOWN, Head.get_measured_state());
-    mb_write_coil(CoilAddr::CC_COMMANDED_FINGERS, Fingers.get_commanded_state());
-    mb_write_coil(CoilAddr::CC_COMMANDED_ROLLER, Head.get_commanded_state());
+  mb_write_coil(CoilAddr::IS_MANDREL_LATCH_CLOSED, is_mandrel_safe);  // Initiate Read Hreg from Modbus Slave
+  mb_write_coil(CoilAddr::IS_FINGERS_DOWN, Fingers.get_measured_state());
+  mb_write_coil(CoilAddr::IS_HOMED, is_homed);
+  mb_write_coil(CoilAddr::IS_FAULT, machine_state==PlanishState::error);
+  // TODO: Abstract those lists of conditions
+  mb_write_coil(CoilAddr::IS_READY_FOR_CYCLE, Fingers.is_fully_engaged() && is_homed && is_mandrel_safe && machine_state == PlanishState::idle);
+  mb_write_coil(CoilAddr::IS_E_STOP, is_e_stop);
+  mb_write_coil(CoilAddr::IS_JOB_ACTIVE, job_progress(machine_state).first);
+  mb_write_coil(CoilAddr::IS_READY_FOR_MANUAL_CONTROL, is_mandrel_safe && is_homed && machine_state == PlanishState::idle);
+  mb_write_coil(CoilAddr::IS_ROLLER_DOWN, Head.get_measured_state());
+  mb_write_coil(CoilAddr::CC_COMMANDED_FINGERS, Fingers.get_commanded_state());
+  mb_write_coil(CoilAddr::CC_COMMANDED_ROLLER, Head.get_commanded_state());
 
-    if (millis() - last_modbus_print > 1000) {
-      last_modbus_print = millis();
-    }
-    update_modbus_buttons();
-
-    mb_write_hreg(HregAddr::CC_COMMANDED_POSITION_REG_ADDR, steps_to_hundreths(CARRIAGE_MOTOR.PositionRefCommanded()));
-    mb_write_hreg(HregAddr::JOB_PROGRESS_REG_ADDR, job_progress(machine_state).second);
-    mb_write_hreg(HregAddr::JOB_START_POS_REG_ADDR, steps_to_hundreths(saved_job_start_pos));
-    mb_write_hreg(HregAddr::JOB_END_POS_REG_ADDR, steps_to_hundreths(saved_job_end_pos));
-    mb_write_hreg(HregAddr::JOB_PARK_POS_REG_ADDR, steps_to_hundreths(saved_job_park_pos));
-    mb_write_hreg(HregAddr::JOG_SPEED_REG_ADDR, steps_per_sec_to_inches_per_minute(current_jog_speed));
-    mb_write_hreg(HregAddr::PLANISH_SPEED_REG_ADDR, steps_per_sec_to_inches_per_minute(current_planish_speed));
-    mb_write_hreg(HregAddr::FAULT_CODE_REG_ADDR, fault_code);
-    mb_read_hreg(&HmiCommandedPosition);
-    
-  } else {
-    is_HMI_comm_good = false;
-    mb.connect(remote);           // Try to connect if not connected
+  if (millis() - last_modbus_print > 1000) {
+    last_modbus_print = millis();
   }
-}
 
-void mb_read_hreg(HmiReg<uint16_t> *reg) {
-  mb.readHreg(remote, reg->address, &reg->value);
-}
-
-void mb_read_unlatch_coil(HmiReg<bool> *reg) {
-  mb_read_coil(reg);
-  mb_write_coil(reg->address, false);
-}
-
-void mb_read_coil(HmiReg<bool> *reg) {
-  mb.readCoil(remote, reg->address, &reg->value);
-}
-
-void mb_write_coil(const uint16_t address, const bool val) {
-  mb.writeCoil(remote, address, val);
-}
-
-void mb_write_hreg(const uint16_t address, const uint16_t val) {
-  mb.writeCoil(remote, address, val);
-}
-
-void update_modbus_buttons() {
   mb_read_unlatch_coil(&hmi_is_rth_state);
   mb_read_unlatch_coil(&hmi_is_axis_homing_state);
   mb_read_unlatch_coil(&hmi_is_set_job_start_state);
@@ -491,6 +486,72 @@ void update_modbus_buttons() {
   mb_read_unlatch_coil(&hmi_roller_up_state);
   mb_read_unlatch_coil(&hmi_roller_down_state);
   mb_read_unlatch_coil(&hmi_is_commanded_pos_state);
+
+  mb_write_hreg(HregAddr::CC_COMMANDED_POSITION_REG_ADDR, steps_to_hundreths(CARRIAGE_MOTOR.PositionRefCommanded()));
+  mb_write_hreg(HregAddr::JOB_PROGRESS_REG_ADDR, job_progress(machine_state).second);
+  mb_write_hreg(HregAddr::JOB_START_POS_REG_ADDR, steps_to_hundreths(saved_job_start_pos));
+  mb_write_hreg(HregAddr::JOB_END_POS_REG_ADDR, steps_to_hundreths(saved_job_end_pos));
+  mb_write_hreg(HregAddr::JOB_PARK_POS_REG_ADDR, steps_to_hundreths(saved_job_park_pos));
+  mb_write_hreg(HregAddr::JOG_SPEED_REG_ADDR, steps_per_sec_to_inches_per_minute(current_jog_speed));
+  mb_write_hreg(HregAddr::PLANISH_SPEED_REG_ADDR, steps_per_sec_to_inches_per_minute(current_planish_speed));
+  mb_write_hreg(HregAddr::FAULT_CODE_REG_ADDR, fault_code);
+  mb_read_hreg(&HmiCommandedPosition);
+}
+
+void read_modbus_registers() {
+  if (mb.isConnected(remote_ip)) {
+    const uint16_t coil_trans = mb.readCoil(remote_ip, 0, local_mb_coil, MB_MAX_COIL);
+    const uint16_t hreg_trans = mb.readHreg(remote_ip, 0, local_mb_hreg, MB_MAX_HREG);
+    while (mb.isTransaction(coil_trans) || mb.isTransaction(hreg_trans)) {
+      mb.task(); // modbus tick
+    }
+  } else {
+    USB_PRINTLN("Tried to read modbus but not connected.");
+    is_HMI_comm_good = false;
+    mb.connect(remote_ip);           // Try to connect if not connected
+  }
+}
+
+void write_modbus_registers() {
+  if (mb.isConnected(remote_ip)) {
+    const uint16_t coil_trans = mb.writeCoil(remote_ip, 0, local_mb_coil, MB_MAX_COIL);
+    const uint16_t hreg_trans = mb.readHreg(remote_ip, 0, local_mb_hreg, MB_MAX_HREG);
+    while (mb.isTransaction(coil_trans) || mb.isTransaction(hreg_trans)) {
+      mb.task(); // modbus tick
+    }
+  } else {
+    USB_PRINTLN("Tried to read modbus but not connected.");
+    is_HMI_comm_good = false;
+    mb.connect(remote_ip);           // Try to connect if not connected
+  }
+}
+
+void mb_read_hreg(HmiReg<uint16_t> *reg) {
+  reg->value = local_mb_hreg[reg->address];
+}
+
+void mb_read_unlatch_coil(HmiReg<bool> *reg) {
+  mb_read_coil(reg);
+
+  mb_write_coil(reg->address, false);
+}
+
+void mb_read_coil(HmiReg<bool> *reg) {
+  reg->value = local_mb_coil[reg->address];
+}
+
+void mb_write_hreg(const HmiReg<uint16_t> reg) {
+  local_mb_hreg[reg.address] = reg.value;
+}
+void mb_write_hreg(const uint16_t address, const uint16_t val) {
+  local_mb_hreg[address] = val;
+}
+
+void mb_write_coil(const HmiReg<bool> reg) {
+  local_mb_coil[reg.address] = reg.value;
+}
+void mb_write_coil(const uint16_t address, const bool val) {
+  local_mb_coil[address] = val;
 }
 
 /**
@@ -545,8 +606,8 @@ PlanishState state_machine(const PlanishState state_in) {
         return PlanishState::post;
       }
       mb.client();
-      if(!mb.isConnected(remote)) {
-        mb.connect(remote);
+      if(!mb.isConnected(remote_ip)) {
+        mb.connect(remote_ip);
         ConnectorUsb.SendChar('.');
         return PlanishState::post;
       }
