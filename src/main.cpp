@@ -21,6 +21,7 @@
 #include "HmiReg.h"
 #include "MbButton.h"
 #include "RegisterDefinitions.h"
+#include "Message.h"
 
 
 // TODO: Bug when booting with e-stop on
@@ -47,6 +48,8 @@ const IPAddress ip(192, 168, 1, 128); // Local IP for non DHCP mode
 
 class ModbusEthernet : public ModbusAPI<ModbusTCPTemplate<EthernetServer, EthernetClient>> {};
 ModbusEthernet mb;  //ModbusTCP object
+
+Message::MessageClass HmiMessage();
 
 MbButton HmiIsAxisHomingButton(CoilAddr::IS_AXIS_HOMING_BUTTON_LATCHED);
 MbButton HmiIsSetJobStartButton(CoilAddr::IS_SET_JOB_START_BUTTON_LATCHED);
@@ -484,6 +487,8 @@ void check_modbus() {
     // USB_PRINT("steps_per_sec_to_inches_per_minute(current_jog_speed)");
     // USB_PRINTLN(steps_per_sec_to_inches_per_minute(current_jog_speed));
   }
+
+
 
 
   mb.Hreg(HregAddr::CC_COMMANDED_POSITION_REG_ADDR, steps_to_hundreths(CARRIAGE_MOTOR.PositionRefCommanded()));

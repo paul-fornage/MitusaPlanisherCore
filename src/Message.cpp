@@ -13,7 +13,7 @@ static const char* MessageTexts[] = {
 };
 
 const char* GetMessageText(Message::MessageId id) {
-    const uint16_t index = static_cast<uint16_t>(id);
+    const auto index = static_cast<uint16_t>(id);
     if (index < static_cast<uint16_t>(Message::MessageId::COUNT)) {
         return MessageTexts[index];
     }
@@ -30,14 +30,24 @@ inline void MessageClass::set_message(const char* message, const uint16_t ms) {
     set_message(message);
     this->ms_remaining = ms;
 }
-inline void MessageClass::set_message(const Message::MessageId message) {
+inline void MessageClass::set_message(const MessageId message) {
     set_message(GetMessageText(message));
 }
-inline void MessageClass::set_message(Message::MessageId message, uint16_t ms) {
-    set_message(message);
+inline void MessageClass::set_message(const MessageId message, const uint16_t ms) {
+    set_message(GetMessageText(message));
     this->ms_remaining = ms;
 }
-inline void MessageClass::set_time(uint16_t ms);
-inline uint16_t* MessageClass::get_message_u16();
-inline char* MessageClass::get_message_char();
-void MessageClass::tick() volatile;
+inline void MessageClass::set_time(const uint16_t ms) {
+    this->ms_remaining = ms;
+}
+inline uint16_t* MessageClass::get_message_u16() {
+    return this->message_as_uint16;
+}
+inline char* MessageClass::get_message_char() {
+    return this->message;
+}
+void MessageClass::tick() volatile {
+    if (this->ms_remaining > 0) {
+        this->ms_remaining--;
+    }
+}
