@@ -306,6 +306,9 @@ bool ethernet_setup();
 void read_modbus_registers();
 void write_modbus_registers();
 bool cbConn(IPAddress ip);
+uint16_t f64_inch_to_steps(double inches);
+uint16_t hundreths_to_steps(uint16_t hundreths);
+uint16_t inches_per_minute_to_steps_per_sec(uint16_t inches_per_minute);
 
 extern "C" void TCC2_0_Handler(void) __attribute__((
             alias("PeriodicInterrupt")));
@@ -623,7 +626,7 @@ PlanishState state_machine(const PlanishState state_in) {
       if (HmiIsCommandedPosButton.is_rising()) {
         if (is_mandrel_safe) {
           if (is_homed) {
-            move_motor_auto_speed()
+            move_motor_auto_speed(hundreths_to_steps(mb.Hreg(HregAddr::HMI_COMMANDED_POSITION_REG_ADDR)));
             return PlanishState::manual_jog_absolute;
           } else {
             USB_PRINTLN("Tried to jog to position without homed");
