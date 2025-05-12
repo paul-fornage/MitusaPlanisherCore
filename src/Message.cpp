@@ -40,6 +40,9 @@ inline void MessageClass::set_message(const MessageId message, const uint16_t ms
 inline void MessageClass::set_time(const uint16_t ms) {
     this->ms_remaining = ms;
 }
+inline uint16_t MessageClass::get_time() const {
+    return this->ms_remaining;
+}
 inline uint16_t* MessageClass::get_message_u16() {
     return this->message_as_uint16;
 }

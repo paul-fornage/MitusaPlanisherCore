@@ -19,8 +19,7 @@ namespace Message {
     const char* GetMessageText(MessageId id);
 
 
-    static constexpr uint16_t message_u16_len_max = 32;
-    static constexpr uint16_t message_char_len_max = message_u16_len_max * 2;
+
 
     /**
      * A message to display either on an HMI or LCD screen
@@ -29,11 +28,15 @@ namespace Message {
      */
     class MessageClass {
     public:
+        static constexpr uint16_t message_u16_len_max = 32;
+        static constexpr uint16_t message_char_len_max = message_u16_len_max * 2;
+
         void set_message(const char* message);
         void set_message(const char* message, uint16_t ms);
         void set_message(MessageId message);
         void set_message(MessageId message, uint16_t ms);
         void set_time(uint16_t ms);
+        uint16_t get_time() const;
         uint16_t* get_message_u16();
         char* get_message_char();
         void tick() volatile;

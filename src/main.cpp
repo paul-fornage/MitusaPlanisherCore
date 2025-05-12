@@ -49,7 +49,7 @@ const IPAddress ip(192, 168, 1, 128); // Local IP for non DHCP mode
 class ModbusEthernet : public ModbusAPI<ModbusTCPTemplate<EthernetServer, EthernetClient>> {};
 ModbusEthernet mb;  //ModbusTCP object
 
-Message::MessageClass HmiMessage();
+Message::MessageClass HmiMessage;
 
 MbButton HmiIsAxisHomingButton(CoilAddr::IS_AXIS_HOMING_BUTTON_LATCHED);
 MbButton HmiIsSetJobStartButton(CoilAddr::IS_SET_JOB_START_BUTTON_LATCHED);
@@ -480,6 +480,7 @@ void check_modbus() {
   mb.Coil(CoilAddr::CC_COMMANDED_FINGERS, Fingers.get_commanded_state());
   mb.Coil(CoilAddr::CC_COMMANDED_ROLLER, Head.get_commanded_state());
 
+  mb.Coil(CoilAddr::SHOW_MESSAGE, HmiMessage.get_time() > 0);
 
 
   if (millis() - last_modbus_print > 1000) {
@@ -487,9 +488,6 @@ void check_modbus() {
     // USB_PRINT("steps_per_sec_to_inches_per_minute(current_jog_speed)");
     // USB_PRINTLN(steps_per_sec_to_inches_per_minute(current_jog_speed));
   }
-
-
-
 
   mb.Hreg(HregAddr::CC_COMMANDED_POSITION_REG_ADDR, steps_to_hundreths(CARRIAGE_MOTOR.PositionRefCommanded()));
   mb.Hreg(HregAddr::JOB_PROGRESS_REG_ADDR, job_progress(machine_state).second);
@@ -499,7 +497,10 @@ void check_modbus() {
   mb.Hreg(HregAddr::JOG_SPEED_REG_ADDR, steps_per_sec_to_inches_per_minute(current_jog_speed));
   mb.Hreg(HregAddr::PLANISH_SPEED_REG_ADDR, steps_per_sec_to_inches_per_minute(current_planish_speed));
   mb.Hreg(HregAddr::FAULT_CODE_REG_ADDR, fault_code);
-  mb.Hreg(HregAddr::HMI_COMMANDED_POSITION_REG_ADDR);
+
+  mb.Hregs(HregAddr::MESSAGE_START, HmiMessage.get_message_u16(), Message::MessageClass::message_u16_len_max);
+
+
 }
 
 /**
@@ -571,6 +572,8 @@ PlanishState state_machine(const PlanishState state_in) {
 
     case PlanishState::begin_homing:
       USB_PRINTLN("begin homing");
+
+      HmiMessage.set_message("Begin Homing", 500);
 
       MOTOR_COMMAND(CARRIAGE_MOTOR.EnableRequest(false));
       is_homed = false;
@@ -661,9 +664,11 @@ PlanishState state_machine(const PlanishState state_in) {
             Fingers.set_commanded_state(new_finger_state);
             return PlanishState::wait_for_fingers;
           } else {
+            HmiMessage.set_message("Tried to disengage fingers while head was down or lowering", 1000);
             USB_PRINTLN("Tried to disengage fingers while head was down or lowering");
           }
         } else {
+          HmiMessage.set_message("tried to engage fingers without mandrel latch engaged", 1000);
           USB_PRINTLN("tried to engage fingers without mandrel latch engaged");
         }
       }
@@ -688,10 +693,14 @@ PlanishState state_machine(const PlanishState state_in) {
           // if safety checks for lowering head pass, or the user is trying to raise the head
           Head.set_commanded_state(new_head_state);
           return PlanishState::wait_for_head;
+        } else if (!is_mandrel_safe) {
+          USB_PRINTLN("Tried to lower head while mandrel latch not engaged");
+          HmiMessage.set_message("Tried to lower head while mandrel latch not engaged", 1000);
         } else {
-          USB_PRINTLN("Tried to lower head while fingers not down or mandrel latch not engaged");
-          return PlanishState::idle;
+          USB_PRINTLN("Tried to lower head while fingers not down");
+          HmiMessage.set_message("Tried to lower head while fingers not down", 1000);
         }
+        return PlanishState::idle;
       }
 
       if (LearnButton.is_rising()) {
@@ -720,9 +729,11 @@ PlanishState state_machine(const PlanishState state_in) {
             return PlanishState::manual_jog;
           } else {
             USB_PRINTLN("Tried to start jog without being homed");
+            HmiMessage.set_message("Tried to jog without being homed", 1000);
           }
         } else {
           USB_PRINTLN("Tried to jog without mandrel switch engaged");
+          HmiMessage.set_message("Tried to jog without mandrel switch engaged", 1000);
         }
       }
 
@@ -1239,6 +1250,8 @@ extern "C" void PeriodicInterrupt(void) {
   // logic so they can check if they need to be changed
   home_indicator_light.tick();
   learn_indicator_light.tick();
+
+  HmiMessage.tick();
 
   // Check the time since the last loop was run.
   // If it's been too long, then something is wrong.
