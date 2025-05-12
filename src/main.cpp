@@ -51,6 +51,8 @@ uint8_t NV_Ram[12];                    // NVram Max Available is `416 bytes of u
 uint8_t		DisplayBuffer[20];			// Remote Display Character buffer
 uint16_t current_speed = 0;
 
+uint32_t last_disp_update_time;
+
 // Reasons to have an E-stop. Defines what conditions need to be met for the e-stop to end
 // not currently used because ISR must be void
 enum class EstopReason {
@@ -282,6 +284,7 @@ void setup() {
   update_buttons();
 
   last_iteration_time = millis();
+  last_disp_update_time = millis();
   machine_state = PlanishState::post;
 
 //  ESTOP_SW.InterruptHandlerSet(e_stop_button_handler, InputManager::InterruptTrigger::CHANGE);
@@ -320,12 +323,16 @@ void loop() {
   // Run one instance of the state machine
   machine_state = state_machine(machine_state);
 
+  if (millis() - last_disp_update_time > 1000) {
+    last_disp_update_time = millis();
+    current_speed = Head.get_measured_state() ? current_planish_speed : current_jog_speed;
+    send_to_display(60*current_speed/STEPS_PER_REV);
+  }
+
   // both of these calls rely on io being configured but it
   update_buttons();
   if (loop_num%STATE_MACHINE_LOOPS_POT_UPDATE_INTERVAL==0) {
     update_speed_pot();
-    current_speed = Head.get_measured_state() ? current_planish_speed : current_jog_speed;
-    send_to_display(60*current_speed/STEPS_PER_REV);
   }
 }
 
@@ -396,37 +403,37 @@ void send_to_display(uint16_t number_to_display) {
 
     /*
 
-sending to display: 137
-36
-48
-48
-49
-44
-49
-51
-46
-55
-35
-13
-10
+sending to display: 137 ($001,13.7#)
+36 | $
+48 | 0
+48 | 0
+49 | 1
+44 | ,
+49 | 1
+51 | 3
+46 | .
+55 | 7
+35 | #
+13 |
+10 |
 Done
 
 
 
      THEIR CODE:
-Sending to display: 446
-36
-48
-48
-49
-44
-52
-52
-46
-54
-35
-13
-10
+Sending to display: 446 ($001,44.6#)
+36 | $
+48 | 0
+48 | 0
+49 | 1
+44 | ,
+52 | 4
+52 | 4
+46 | .
+54 | 6
+35 | #
+13 |
+10 |
 Done sending to display
 
 
