@@ -29,6 +29,8 @@
 // TODO: https://piolabs.com/blog/insights/unit-testing-part-1.html#introduction, https://docs.platformio.org/en/latest/advanced/unit-testing/frameworks/doctest.html
 
 
+// TODO: Speed from HMI
+// TODO: Maybe set job parameters from GCODE or manual input
 
 
 // ModBus TCP stuff
@@ -984,14 +986,14 @@ PlanishState state_machine(const PlanishState state_in) {
     case PlanishState::job_planish_to_end_wait:
       MOTOR_COMMAND(CARRIAGE_MOTOR.VelMax(current_planish_speed););
       if (wait_for_motion()) {
-        if (HALF_CYCLE_SW.State()) {
-          USB_PRINTLN("half cycle detected, go to park");
-          // if only doing a half-cycle, the single pass thus far is sufficient. retract head and return to park
-          return PlanishState::job_head_up;
-        } else {
+        if (mb.Coil(CoilAddr::IS_DUAL_PASS_MODE)) {
           USB_PRINTLN("full cycle detected, do second pass");
           // otherwise do the other pass
           return PlanishState::job_planish_to_start;
+        } else {
+          USB_PRINTLN("half cycle detected, go to park");
+          // if only doing a half-cycle, the single pass thus far is sufficient. retract head and return to park
+          return PlanishState::job_head_up;
         }
       }
       if (loop_num%STATE_MACHINE_LOOPS_LOG_INTERVAL==0) {
