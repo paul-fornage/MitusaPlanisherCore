@@ -14,20 +14,23 @@ Button::Button(const bool initial_state, const bool past_state)
     , last_state(past_state) {
 }
 
-bool Button::is_rising() const {
+
+inline bool Button::is_rising() const {
     return current_state && !last_state;
 }
-bool Button::is_falling() const {
+
+inline bool Button::is_falling() const {
     return !current_state && last_state;
 }
-bool Button::is_changing() const {
+
+inline bool Button::is_changing() const {
     return current_state ^ last_state;
 }
 
-bool Button::get_current_state() const {
+inline bool Button::get_current_state() const {
     return current_state;
 }
-void Button::new_reading(const bool new_state) {
+inline void Button::new_reading(const bool new_state) {
     last_state = current_state;
     current_state = new_state;
 }

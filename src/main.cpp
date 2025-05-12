@@ -19,6 +19,7 @@
 #include <ModbusTCPTemplate.h>
 #include <utility>
 #include "HmiReg.h"
+#include "MbButton.h"
 #include "RegisterDefinitions.h"
 
 
@@ -47,27 +48,16 @@ const IPAddress ip(192, 168, 1, 128); // Local IP for non DHCP mode
 class ModbusEthernet : public ModbusAPI<ModbusTCPTemplate<EthernetServer, EthernetClient>> {};
 ModbusEthernet mb;  //ModbusTCP object
 
-HmiReg<bool> hmi_is_axis_homing_state(CoilAddr::IS_AXIS_HOMING_BUTTON_LATCHED, false);
-HmiReg<bool> hmi_is_set_job_start_state(CoilAddr::IS_SET_JOB_START_BUTTON_LATCHED, false);
-HmiReg<bool> hmi_is_set_job_end_state(CoilAddr::IS_SET_JOB_END_BUTTON_LATCHED, false);
-HmiReg<bool> hmi_is_set_job_park_state(CoilAddr::IS_SET_JOB_PARK_BUTTON_LATCHED, false);
-HmiReg<bool> hmi_commit_job_state(CoilAddr::IS_COMMIT_JOB_BUTTON_LATCHED, false);
-HmiReg<bool> hmi_finger_up_state(CoilAddr::IS_FINGER_UP_LATCHED, false);
-HmiReg<bool> hmi_finger_down_state(CoilAddr::IS_FINGER_DOWN_LATCHED, false);
-HmiReg<bool> hmi_roller_up_state(CoilAddr::IS_ROLLER_UP_LATCHED, false);
-HmiReg<bool> hmi_roller_down_state(CoilAddr::IS_ROLLER_DOWN_LATCHED, false);
-HmiReg<bool> hmi_is_commanded_pos_state(CoilAddr::IS_COMMANDED_POS_LATCHED, false);
-
-Button HmiIsAxisHomingButton(false, false);
-Button HmiIsSetJobStartButton(false, false);
-Button HmiIsSetJobEndButton(false, false);
-Button HmiIsSetJobParkButton(false, false);
-Button HmiCommitJobButton(false, false);
-Button HmiIsCommandedFingersUpButton(false, false);
-Button HmiIsCommandedFingersDownButton(false, false);
-Button HmiIsCommandedRollerUpButton(false, false);
-Button HmiIsCommandedRollerDownButton(false, false);
-Button HmiIsCommandedPosButton(false, false);
+MbButton HmiIsAxisHomingButton(CoilAddr::IS_AXIS_HOMING_BUTTON_LATCHED);
+MbButton HmiIsSetJobStartButton(CoilAddr::IS_SET_JOB_START_BUTTON_LATCHED);
+MbButton HmiIsSetJobEndButton(CoilAddr::IS_SET_JOB_END_BUTTON_LATCHED);
+MbButton HmiIsSetJobParkButton(CoilAddr::IS_SET_JOB_PARK_BUTTON_LATCHED);
+MbButton HmiCommitJobButton(CoilAddr::IS_COMMIT_JOB_BUTTON_LATCHED);
+MbButton HmiIsCommandedFingersUpButton(CoilAddr::IS_FINGER_UP_LATCHED);
+MbButton HmiIsCommandedFingersDownButton(CoilAddr::IS_FINGER_DOWN_LATCHED);
+MbButton HmiIsCommandedRollerUpButton(CoilAddr::IS_ROLLER_UP_LATCHED);
+MbButton HmiIsCommandedRollerDownButton(CoilAddr::IS_ROLLER_DOWN_LATCHED);
+MbButton HmiIsCommandedPosButton(CoilAddr::IS_COMMANDED_POS_LATCHED);
 
 auto fault_code = FaultCodes::None;
 
@@ -299,7 +289,7 @@ std::pair<uint16_t, bool> job_progress(PlanishState state_to_check);
 void mb_push_local_to_hmi();
 void mb_read_hreg(HmiReg<uint16_t> *reg);
 void mb_read_coil(HmiReg<bool> *reg);
-void mb_read_unlatch_coil(HmiReg<bool> *reg);
+void mb_read_unlatch_coil(MbButton button);
 void mb_write_hreg(uint16_t address, uint16_t val);
 void mb_write_hreg_to_local(uint16_t address, uint16_t val);
 void mb_write_coil(uint16_t address, bool val);
@@ -317,45 +307,6 @@ bool cbConn(IPAddress ip);
 extern "C" void TCC2_0_Handler(void) __attribute__((
             alias("PeriodicInterrupt")));
 
-
-void add_mb_reg() {
-  mb.addCoil(CoilAddr::IS_MANDREL_LATCH_CLOSED);
-  mb.addCoil(CoilAddr::IS_FINGERS_DOWN);
-  mb.addCoil(CoilAddr::IS_HOMED);
-  mb.addCoil(CoilAddr::IS_FAULT);
-  mb.addCoil(CoilAddr::IS_READY_FOR_CYCLE);
-  mb.addCoil(CoilAddr::IS_E_STOP);
-  mb.addCoil(CoilAddr::IS_JOB_ACTIVE);
-  mb.addCoil(CoilAddr::IS_READY_FOR_MANUAL_CONTROL);
-  mb.addCoil(CoilAddr::IS_ROLLER_DOWN);
-  mb.addCoil(CoilAddr::CC_COMMANDED_ROLLER);
-  mb.addCoil(CoilAddr::CC_COMMANDED_FINGERS);
-  mb.addCoil(CoilAddr::IS_COMMANDED_POS_LATCHED);
-  mb.addCoil(CoilAddr::IS_AXIS_HOMING_BUTTON_LATCHED);
-  mb.addCoil(CoilAddr::IS_FINGER_UP_LATCHED);
-  mb.addCoil(CoilAddr::IS_FINGER_DOWN_LATCHED);
-  mb.addCoil(CoilAddr::IS_ROLLER_UP_LATCHED);
-  mb.addCoil(CoilAddr::IS_ROLLER_DOWN_LATCHED);
-  mb.addCoil(CoilAddr::IS_SET_JOB_START_BUTTON_LATCHED);
-  mb.addCoil(CoilAddr::IS_SET_JOB_END_BUTTON_LATCHED);
-  mb.addCoil(CoilAddr::IS_SET_JOB_PARK_BUTTON_LATCHED);
-  mb.addCoil(CoilAddr::IS_COMMIT_JOB_BUTTON_LATCHED);
-
-  mb.addHreg(HregAddr::ACTUAL_POSITION_REG_ADDR);
-  mb.addHreg(HregAddr::CC_COMMANDED_POSITION_REG_ADDR);
-  mb.addHreg(HregAddr::HMI_COMMANDED_POSITION_REG_ADDR);
-  mb.addHreg(HregAddr::JOB_PROGRESS_REG_ADDR);
-  mb.addHreg(HregAddr::JOB_START_POS_REG_ADDR);
-  mb.addHreg(HregAddr::JOB_END_POS_REG_ADDR);
-  mb.addHreg(HregAddr::JOB_PARK_POS_REG_ADDR);
-  mb.addHreg(HregAddr::MIN_POS_REG_ADDR);
-  mb.addHreg(HregAddr::MAX_POS_REG_ADDR);
-  mb.addHreg(HregAddr::JOG_SPEED_REG_ADDR);
-  mb.addHreg(HregAddr::PLANISH_SPEED_REG_ADDR);
-  mb.addHreg(HregAddr::FAULT_CODE_REG_ADDR);
-  mb.addHreg(HregAddr::HEARTBEAT_IN_REG_ADDR);
-  mb.addHreg(HregAddr::HEARTBEAT_OUT_REG_ADDR);
-}
 
 void setup() {
 
@@ -382,7 +333,12 @@ void setup() {
 
   mb.server();
   mb.onConnect(cbConn);
-  add_mb_reg();
+
+  // Add all Coil Registers
+  mb.addCoil(0, false, CoilAddr::NULL_TERM);
+
+  // Add all Holding Registers
+  mb.addHreg(0, 0, HregAddr::NULL_TERM);
 
   read_job_from_nvram();
 
@@ -451,6 +407,16 @@ void loop() {
   }
 }
 
+void printIp(IPAddress ip) {
+  USB_PRINT(ip[0]);
+  USB_PRINT('.');
+  USB_PRINT(ip[1]);
+  USB_PRINT('.');
+  USB_PRINT(ip[2]);
+  USB_PRINT('.');
+  USB_PRINT(ip[3]);
+}
+
 bool ethernet_setup() {
   if (Ethernet.linkStatus() == EthernetLinkStatus::LinkOFF) {
     USB_PRINTLN("Ethernet has no link, `ethernet_setup()` fails")
@@ -467,37 +433,22 @@ bool ethernet_setup() {
       dhcp_attempts = MAX_DHCP_ATTEMPTS;
       USB_PRINT("DHCP gives IP: ");
       const auto temp_ip = Ethernet.localIP();
-      USB_PRINT(temp_ip[0]);
-      USB_PRINT_CHAR('.');
-      USB_PRINT(temp_ip[1]);
-      USB_PRINT_CHAR('.');
-      USB_PRINT(temp_ip[2]);
-      USB_PRINT_CHAR('.');
-      USB_PRINTLN(temp_ip[3]);
+      printIp(temp_ip);
+      USB_PRINTLN();
       return true;
     }
   }
   Ethernet.begin(mac, ip);
   USB_PRINT("Ethernet set up static on ");
-  USB_PRINT(ip[0]);
-  USB_PRINT_CHAR('.');
-  USB_PRINT(ip[1]);
-  USB_PRINT_CHAR('.');
-  USB_PRINT(ip[2]);
-  USB_PRINT_CHAR('.');
-  USB_PRINTLN(ip[3]);
+  printIp(ip);
+  USB_PRINTLN();
   return true;
 }
 
 bool cbConn(IPAddress ip) {
   USB_PRINT("Connection from: ")
-  USB_PRINT(ip[0]);
-  USB_PRINT('.');
-  USB_PRINT(ip[1]);
-  USB_PRINT('.');
-  USB_PRINT(ip[2]);
-  USB_PRINT('.');
-  USB_PRINTLN(ip[3]);
+  printIp(std::move(ip));
+  USB_PRINTLN();
   return true;
 }
 
@@ -509,16 +460,18 @@ bool cbConn(IPAddress ip) {
 void check_modbus() {
   mb.Coil(CoilAddr::IS_MANDREL_LATCH_CLOSED, is_mandrel_safe);
   mb.Coil(CoilAddr::IS_FINGERS_DOWN, Fingers.get_measured_state());
+  mb.Coil(CoilAddr::IS_ROLLER_DOWN, Head.get_measured_state());
   mb.Coil(CoilAddr::IS_HOMED, is_homed);
   mb.Coil(CoilAddr::IS_FAULT, machine_state==PlanishState::error);
   // TODO: Abstract those lists of conditions
-  mb.Coil(CoilAddr::IS_READY_FOR_CYCLE, Fingers.is_fully_engaged() && is_homed && is_mandrel_safe && machine_state == PlanishState::idle);
+
   mb.Coil(CoilAddr::IS_E_STOP, is_e_stop);
   mb.Coil(CoilAddr::IS_JOB_ACTIVE, job_progress(machine_state).first);
-  mb.Coil(CoilAddr::IS_READY_FOR_MANUAL_CONTROL, is_mandrel_safe && is_homed && machine_state == PlanishState::idle);
-  mb.Coil(CoilAddr::IS_ROLLER_DOWN, Head.get_measured_state());
+
   mb.Coil(CoilAddr::CC_COMMANDED_FINGERS, Fingers.get_commanded_state());
   mb.Coil(CoilAddr::CC_COMMANDED_ROLLER, Head.get_commanded_state());
+
+
 
   if (millis() - last_modbus_print > 1000) {
     last_modbus_print = millis();
@@ -526,15 +479,6 @@ void check_modbus() {
     // USB_PRINTLN(steps_per_sec_to_inches_per_minute(current_jog_speed));
   }
 
-  mb_read_unlatch_coil(&hmi_is_axis_homing_state);
-  mb_read_unlatch_coil(&hmi_is_set_job_start_state);
-  mb_read_unlatch_coil(&hmi_is_set_job_end_state);
-  mb_read_unlatch_coil(&hmi_is_set_job_park_state);
-  mb_read_unlatch_coil(&hmi_finger_up_state);
-  mb_read_unlatch_coil(&hmi_finger_down_state);
-  mb_read_unlatch_coil(&hmi_roller_up_state);
-  mb_read_unlatch_coil(&hmi_roller_down_state);
-  mb_read_unlatch_coil(&hmi_is_commanded_pos_state);
 
   mb.Hreg(HregAddr::CC_COMMANDED_POSITION_REG_ADDR, steps_to_hundreths(CARRIAGE_MOTOR.PositionRefCommanded()));
   mb.Hreg(HregAddr::JOB_PROGRESS_REG_ADDR, job_progress(machine_state).second);
@@ -547,13 +491,21 @@ void check_modbus() {
   mb.Hreg(HregAddr::HMI_COMMANDED_POSITION_REG_ADDR);
 }
 
-
-void mb_read_unlatch_coil(HmiReg<bool> *reg) {
-  reg->value = mb.Coil(reg->address);
-  if (reg->value) {
+/**
+ * reads the value associated with the button from the MB register and if its latched (true), it gets reset to false
+ * updates the button with the reading that was taken.
+ *
+ *
+ * @param button
+ */
+void mb_read_unlatch_coil(MbButton *button) {
+  const uint16_t addr = button->get_address();
+  const bool temp = mb.Coil(addr);
+  button->new_reading(temp);
+  if (temp) {
     USB_PRINT("unlatching coil at address ");
-    USB_PRINTLN(reg->address)
-    mb.Coil(reg->address, false);
+    USB_PRINTLN(addr)
+    mb.Coil(addr, false);
   }
 }
 
@@ -1576,16 +1528,15 @@ void update_buttons() {
   FingerButton.new_reading(FINGER_SW.State());
   HeadButton.new_reading(HEAD_SW.State());
 
-  HmiIsAxisHomingButton.new_reading(hmi_is_axis_homing_state.value);
-  HmiIsSetJobStartButton.new_reading(hmi_is_set_job_start_state.value);
-  HmiIsSetJobEndButton.new_reading(hmi_is_set_job_end_state.value);
-  HmiIsSetJobParkButton.new_reading(hmi_is_set_job_park_state.value);
-  HmiIsCommandedFingersUpButton.new_reading(hmi_finger_up_state.value);
-  HmiIsCommandedFingersDownButton.new_reading(hmi_finger_down_state.value);
-  HmiIsCommandedRollerUpButton.new_reading(hmi_roller_up_state.value);
-  HmiIsCommandedRollerDownButton.new_reading(hmi_roller_down_state.value);
-  HmiIsCommandedPosButton.new_reading(hmi_is_commanded_pos_state.value);
-  HmiCommitJobButton.new_reading(hmi_commit_job_state.value);
+  mb_read_unlatch_coil(HmiIsAxisHomingButton);
+  mb_read_unlatch_coil(HmiIsSetJobStartButton);
+  mb_read_unlatch_coil(HmiIsSetJobEndButton);
+  mb_read_unlatch_coil(HmiIsSetJobParkButton);
+  mb_read_unlatch_coil(HmiCommitJobButton);
+  mb_read_unlatch_coil(HmiIsCommandedFingersUpButton);
+  mb_read_unlatch_coil(HmiIsCommandedFingersDownButton);
+  mb_read_unlatch_coil(HmiIsCommandedRollerUpButton);
+  mb_read_unlatch_coil(HmiIsCommandedRollerDownButton);
 }
 
 /**
@@ -1734,6 +1685,7 @@ const char *get_state_name(const PlanishState state) {
     STATE_NAME(wait_for_homing);
     STATE_NAME(idle);
     STATE_NAME(manual_jog);
+    STATE_NAME(manual_jog_absolute);
     STATE_NAME(e_stop_begin);
     STATE_NAME(e_stop_wait);
     STATE_NAME(error);
