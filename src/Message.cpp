@@ -22,31 +22,31 @@ const char* GetMessageText(Message::MessageId id) {
 
 using namespace Message;
 
-inline void MessageClass::set_message(const char* message) {
+void MessageClass::set_message(const char* message) {
     strncpy(this->message, message, message_char_len_max);
 }
 
-inline void MessageClass::set_message(const char* message, const uint16_t ms) {
+void MessageClass::set_message(const char* message, const uint16_t ms) {
     set_message(message);
     this->ms_remaining = ms;
 }
-inline void MessageClass::set_message(const MessageId message) {
+void MessageClass::set_message(const MessageId message) {
     set_message(GetMessageText(message));
 }
-inline void MessageClass::set_message(const MessageId message, const uint16_t ms) {
+void MessageClass::set_message(const MessageId message, const uint16_t ms) {
     set_message(GetMessageText(message));
     this->ms_remaining = ms;
 }
-inline void MessageClass::set_time(const uint16_t ms) {
+void MessageClass::set_time(const uint16_t ms) {
     this->ms_remaining = ms;
 }
-inline uint16_t MessageClass::get_time() const {
+uint16_t MessageClass::get_time() const {
     return this->ms_remaining;
 }
-inline uint16_t* MessageClass::get_message_u16() {
+uint16_t* MessageClass::get_message_u16() {
     return this->message_as_uint16;
 }
-inline char* MessageClass::get_message_char() {
+char* MessageClass::get_message_char() {
     return this->message;
 }
 void MessageClass::tick() volatile {

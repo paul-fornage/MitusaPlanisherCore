@@ -18,7 +18,7 @@
 #include <ModbusAPI.h>
 #include <ModbusTCPTemplate.h>
 #include <utility>
-#include "HmiReg.h"
+
 #include "MbButton.h"
 #include "RegisterDefinitions.h"
 #include "Message.h"
@@ -270,7 +270,6 @@ SensedActuator Head;
 
 bool configure_io();
 void e_stop_button_handler();
-bool motor_movement_checks();
 void print_motor_alerts();
 void iteration_time_check();
 void config_ccio_pin(ClearCorePins target_pin, Connector::ConnectorModes mode, bool initial_state = false);
@@ -292,22 +291,12 @@ PlanishState state_machine(PlanishState state_in);
 const char *get_estop_reason_name(EstopReason state);
 void check_modbus();
 std::pair<uint16_t, bool> job_progress(PlanishState state_to_check);
-void mb_push_local_to_hmi();
-void mb_read_hreg(HmiReg<uint16_t> *reg);
-void mb_read_coil(HmiReg<bool> *reg);
-void mb_read_unlatch_coil(MbButton button);
-void mb_write_hreg(uint16_t address, uint16_t val);
-void mb_write_hreg_to_local(uint16_t address, uint16_t val);
-void mb_write_coil(uint16_t address, bool val);
-void mb_write_coil_to_local(uint16_t address, bool val);
+void mb_read_unlatch_coil(MbButton *button);
 double steps_to_f64_inch(uint32_t steps);
 uint16_t steps_to_hundreths(uint32_t steps);
 uint16_t steps_per_sec_to_inches_per_minute(uint32_t steps_per_second);
 const char *get_state_name(PlanishState state);
-void update_modbus_buttons();
 bool ethernet_setup();
-void read_modbus_registers();
-void write_modbus_registers();
 bool cbConn(IPAddress ip);
 uint16_t f64_inch_to_steps(double inches);
 uint16_t hundreths_to_steps(uint16_t hundreths);
@@ -472,7 +461,6 @@ void check_modbus() {
   mb.Coil(CoilAddr::IS_ROLLER_DOWN, Head.get_measured_state());
   mb.Coil(CoilAddr::IS_HOMED, is_homed);
   mb.Coil(CoilAddr::IS_FAULT, machine_state==PlanishState::error);
-  // TODO: Abstract those lists of conditions
 
   mb.Coil(CoilAddr::IS_E_STOP, is_e_stop);
   mb.Coil(CoilAddr::IS_JOB_ACTIVE, job_progress(machine_state).first);
@@ -497,10 +485,12 @@ void check_modbus() {
   mb.Hreg(HregAddr::JOG_SPEED_REG_ADDR, steps_per_sec_to_inches_per_minute(current_jog_speed));
   mb.Hreg(HregAddr::PLANISH_SPEED_REG_ADDR, steps_per_sec_to_inches_per_minute(current_planish_speed));
   mb.Hreg(HregAddr::FAULT_CODE_REG_ADDR, fault_code);
+  mb.Hreg(HregAddr::CURRENT_STATE_REG_ADDR, static_cast<uint16_t>(machine_state));
 
-  mb.Hregs(HregAddr::MESSAGE_START, HmiMessage.get_message_u16(), Message::MessageClass::message_u16_len_max);
-
-
+  const auto values = HmiMessage.get_message_u16();
+  for (uint8_t i = 0; i < Message::MessageClass::message_u16_len_max; i++) {
+    mb.Hreg(i+HregAddr::MESSAGE_START, values[i]);
+  }
 }
 
 /**
@@ -682,9 +672,9 @@ PlanishState state_machine(const PlanishState state_in) {
 
         bool new_head_state; // < doesn't necessarily get acted on or set.
         if (HmiIsCommandedRollerUpButton.is_rising()) {
-          new_head_state = true;
-        } else if (HmiIsCommandedRollerDownButton.is_rising()) {
           new_head_state = false;
+        } else if (HmiIsCommandedRollerDownButton.is_rising()) {
+          new_head_state = true;
         } else {
           new_head_state = HeadButton.get_current_state();
         }
@@ -1564,15 +1554,15 @@ void update_buttons() {
   FingerButton.new_reading(FINGER_SW.State());
   HeadButton.new_reading(HEAD_SW.State());
 
-  mb_read_unlatch_coil(HmiIsAxisHomingButton);
-  mb_read_unlatch_coil(HmiIsSetJobStartButton);
-  mb_read_unlatch_coil(HmiIsSetJobEndButton);
-  mb_read_unlatch_coil(HmiIsSetJobParkButton);
-  mb_read_unlatch_coil(HmiCommitJobButton);
-  mb_read_unlatch_coil(HmiIsCommandedFingersUpButton);
-  mb_read_unlatch_coil(HmiIsCommandedFingersDownButton);
-  mb_read_unlatch_coil(HmiIsCommandedRollerUpButton);
-  mb_read_unlatch_coil(HmiIsCommandedRollerDownButton);
+  mb_read_unlatch_coil(&HmiIsAxisHomingButton);
+  mb_read_unlatch_coil(&HmiIsSetJobStartButton);
+  mb_read_unlatch_coil(&HmiIsSetJobEndButton);
+  mb_read_unlatch_coil(&HmiIsSetJobParkButton);
+  mb_read_unlatch_coil(&HmiCommitJobButton);
+  mb_read_unlatch_coil(&HmiIsCommandedFingersUpButton);
+  mb_read_unlatch_coil(&HmiIsCommandedFingersDownButton);
+  mb_read_unlatch_coil(&HmiIsCommandedRollerUpButton);
+  mb_read_unlatch_coil(&HmiIsCommandedRollerDownButton);
 }
 
 /**
