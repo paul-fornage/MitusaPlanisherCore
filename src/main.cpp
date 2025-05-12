@@ -240,6 +240,9 @@ volatile EstopReason estop_reason = EstopReason::NONE;
 #define STATE_MACHINE_LOOPS_LOG_INTERVAL 1024 // number of loops of the main state machine between
 // logging from 'wait' states. Too low will flood the logs
 
+#define IS_JOG_FWD_ACTIVE ((JOG_FWD_SW.State() == JOG_FWD_SW_ACTIVE_STATE) || mb.Coil(CoilAddr::IS_JOG_POS_PRESSED))
+#define IS_JOG_REV_ACTIVE ((JOG_REV_SW.State() == JOG_REV_SW_ACTIVE_STATE) || mb.Coil(CoilAddr::IS_JOG_NEG_PRESSED))
+
 #define PERIODIC_PRINT(statements) if (loop_num%STATE_MACHINE_LOOPS_LOG_INTERVAL==0) { statements }
 
 #define USB_PRINT(statements) ConnectorUsb.Send(statements);
@@ -617,6 +620,19 @@ PlanishState state_machine(const PlanishState state_in) {
         }
       }
 
+      if (HmiIsCommandedPosButton.is_rising()) {
+        if (is_mandrel_safe) {
+          if (is_homed) {
+            move_motor_auto_speed()
+            return PlanishState::manual_jog_absolute;
+          } else {
+            USB_PRINTLN("Tried to jog to position without homed");
+          }
+        } else {
+          USB_PRINTLN("Tried to jog to position without mandrel latch engaged");
+        }
+      }
+
       if (FingerButton.is_rising()
           || HmiIsCommandedFingersUpButton.is_rising()
           || HmiIsCommandedFingersDownButton.is_rising())
@@ -686,8 +702,7 @@ PlanishState state_machine(const PlanishState state_in) {
         }
       }
 
-      if (JOG_FWD_SW.State() == JOG_FWD_SW_ACTIVE_STATE
-          || JOG_REV_SW.State() == JOG_REV_SW_ACTIVE_STATE) {
+      if (IS_JOG_FWD_ACTIVE || IS_JOG_REV_ACTIVE) {
         if (is_mandrel_safe) {
           if (is_homed) {
             // This is weird, while there is nothing that depends on the motor's absolute position for this,
@@ -799,11 +814,11 @@ PlanishState state_machine(const PlanishState state_in) {
 
     case PlanishState::manual_jog:
       if (is_mandrel_safe && is_homed) {
-        if (JOG_FWD_SW.State() == JOG_FWD_SW_ACTIVE_STATE) {
+        if (IS_JOG_FWD_ACTIVE) {
           motor_jog(false);
           return PlanishState::manual_jog;
         }
-        if (JOG_REV_SW.State() == JOG_REV_SW_ACTIVE_STATE) {
+        if (IS_JOG_REV_ACTIVE) {
           motor_jog(true);
           return PlanishState::manual_jog;
         }
@@ -1038,9 +1053,9 @@ PlanishState state_machine(const PlanishState state_in) {
       if (LearnButton.is_rising()) {
         return PlanishState::learn_end_pos;
       }
-      if (JOG_FWD_SW.State() == JOG_FWD_SW_ACTIVE_STATE) {
+      if (IS_JOG_FWD_ACTIVE) {
         motor_jog(false);
-      } else if (JOG_REV_SW.State() == JOG_REV_SW_ACTIVE_STATE) {
+      } else if (IS_JOG_REV_ACTIVE) {
         motor_jog(true);
       } else {
         MOTOR_COMMAND(CARRIAGE_MOTOR.MoveStopDecel(););
@@ -1061,9 +1076,9 @@ PlanishState state_machine(const PlanishState state_in) {
       if (LearnButton.is_rising()) {
         return PlanishState::learn_park_pos;
       }
-      if (JOG_FWD_SW.State() == JOG_FWD_SW_ACTIVE_STATE) {
+      if (IS_JOG_FWD_ACTIVE) {
         motor_jog(false);
-      } else if (JOG_REV_SW.State() == JOG_REV_SW_ACTIVE_STATE) {
+      } else if (IS_JOG_REV_ACTIVE) {
         motor_jog(true);
       } else {
         MOTOR_COMMAND(CARRIAGE_MOTOR.MoveStopDecel(););
@@ -1735,7 +1750,7 @@ const char *get_estop_reason_name(const EstopReason state) {
 double steps_to_f64_inch(const uint32_t steps) {
   const double motor_revs = static_cast<double>(steps)/STEPS_PER_REV;
   const double pinion_revs = motor_revs * GEARBOX_RATIO;
-  const double teeth = pinion_revs / PINION_TEETH_PER_REV;
+  const double teeth = pinion_revs * PINION_TEETH_PER_REV;
   const double inches = teeth / RACK_TEETH_PER_INCH;
   return inches;
 }
@@ -1751,4 +1766,22 @@ uint16_t steps_per_sec_to_inches_per_minute(const uint32_t steps_per_second) {
   const double inches_per_minute = inches_per_second * 60;
 
   return static_cast<uint16_t>(inches_per_minute);
+}
+
+uint16_t f64_inch_to_steps(const double inches) {
+  const double teeth = inches * RACK_TEETH_PER_INCH;
+  const double pinion_revs = teeth / PINION_TEETH_PER_REV;
+  const double motor_revs = pinion_revs / GEARBOX_RATIO;
+  const double steps = (motor_revs * STEPS_PER_REV);
+  return static_cast<uint16_t>(steps);
+}
+
+uint16_t hundreths_to_steps(const uint16_t hundreths) {
+  const double inches = static_cast<double>(hundreths) / 100.0;
+  return f64_inch_to_steps(inches);
+}
+
+uint16_t inches_per_minute_to_steps_per_sec(const uint16_t inches_per_minute) {
+  const double inches_per_second = static_cast<double>(inches_per_minute) / 60.0;
+  return f64_inch_to_steps(inches_per_second);
 }
