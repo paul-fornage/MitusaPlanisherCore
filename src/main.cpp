@@ -163,7 +163,7 @@ volatile EstopReason estop_reason = EstopReason::NONE;
 
 #define SERIAL_DISPLAY ConnectorCOM0
 #define DISPLAY_TIMEOUT_MS 1000 // Number of ms to wait for serial to connect before failing POST
-#define DISP_BAUDRATE 57600
+#define DISP_BAUDRATE 9600
 
 #define CARRIAGE_MOTOR_MAX_ACCEL 50000
 #define CARRIAGE_MOTOR_MAX_VEL 10000
@@ -392,7 +392,49 @@ void send_to_display(uint16_t number_to_display) {
 
   for (uint8_t index = 0; index < i; index++) {
     SERIAL_DISPLAY.SendChar(DisplayBuffer[index]);
+    ConnectorUsb.SendLine((uint8_t) (DisplayBuffer[index]));
+
+    /*
+
+sending to display: 137
+36
+48
+48
+49
+44
+49
+51
+46
+55
+35
+13
+10
+Done
+
+
+
+     THEIR CODE:
+Sending to display: 446
+36
+48
+48
+49
+44
+52
+52
+46
+54
+35
+13
+10
+Done sending to display
+
+
+
+
+     */
   }
+  ConnectorUsb.SendLine("Done");
 }
 
 PlanishState state_machine(const PlanishState state_in) {
@@ -908,10 +950,11 @@ bool configure_io() {
   SERIAL_DISPLAY.StopBits(1);
   SERIAL_DISPLAY.FlowControl(false);
 
+  SERIAL_DISPLAY.PortOpen();
 
   const uint32_t startTime = millis();
 
-  while (!SERIAL_DISPLAY && Milliseconds() - startTime < SERIAL_DISPLAY_EST_TIMEOUT) {}
+  while (!SERIAL_DISPLAY && millis() - startTime < SERIAL_DISPLAY_EST_TIMEOUT) {}
 
   if (CcioMgr.LinkBroken()) {
     uint32_t lastStatusTime = Milliseconds();
