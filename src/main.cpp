@@ -10,6 +10,8 @@
 #include "actuator.h"
 #include "FaultCodes.h"
 #include <Ethernet.h>       // Ethernet library v2 is required
+#define MODBUSIP_TIMEOUT 100
+#define MODBUSIP_MAX_READMS 50
 #include <ModbusAPI.h>
 #include <ModbusTCPTemplate.h>
 #include <utility>
@@ -22,6 +24,14 @@
 // TODO: E-stop ISR
 
 // TODO: Maybe set job parameters from GCODE
+
+// TODO: logger
+
+// TODO: Save translation function with register. (EG steps to inches)
+
+// TODO Register sync dev tool
+
+// TODO: read status reg: https://teknic-inc.github.io/ClearCore-library/_clear_core_status_register_8cpp-example.html
 
 
 // ModBus TCP stuff
@@ -64,8 +74,10 @@ bool is_homed = false;                  // Has the axis been homed
 volatile bool is_e_stop = false;               // Is the Emergency Stop currently active
 
 bool io_configured = false;                  // Has the IO been configured
-
 char message_buffer[64] = "";
+
+volatile bool timeout_warning_since_last_loop = false; // has a warning been printed since the last loop?
+volatile bool timeout_error_since_last_loop = false; // has an error been printed since the last loop?
 
 uint32_t last_modbus_read = 0;
 uint32_t time_since_last_modbus_read = 0;
@@ -227,6 +239,14 @@ volatile EstopReason estop_reason = EstopReason::NONE;
 #define USB_PRINTLN(statements) ConnectorUsb.SendLine(statements);
 #define USB_PRINT_CHAR(statements) ConnectorUsb.SendChar(statements);
 
+std::pair<PlanishState, bool> state_change;
+/**
+ * Wrapper of the function with the same name.
+ */
+#define COMMON_JOB_TASKS()\
+state_change = common_job_tasks();\
+if(state_change.second) {return state_change.first;}\
+
 SensedActuator Fingers;
 SensedActuator Head;
 
@@ -322,6 +342,8 @@ void setup() {
 
 
 void loop() {
+  timeout_warning_since_last_loop = false;
+  timeout_error_since_last_loop = false;
   if (ESTOP_SW.State() != ESTOP_SW_SAFE_STATE) { // make sure e-stop wasn't already depressed before interrupt was registered
     combined_print("E-Stop button pressed, entering e-stop mode. ", 10000);
     e_stop_handler(EstopReason::button);
@@ -427,24 +449,22 @@ void check_modbus() {
   mb.Coil(CoilAddr::IS_JOB_PAUSED, machine_state==PlanishState::job_paused);
   mb.Coil(CoilAddr::SHOW_MESSAGE, HmiMessage.is_active());
 
-  mb.Hreg(HregAddr::CC_COMMANDED_POSITION_REG_ADDR, steps_to_hundreths(CARRIAGE_MOTOR.PositionRefCommanded()));
+  mb.Hreg(HregAddr::CC_COMMANDED_POSITION_REG_ADDR, steps_to_hundreths(MOTOR_COMMANDED_POSITION));
   mb.Hreg(HregAddr::JOB_PROGRESS_REG_ADDR, job_progress(machine_state).second);
   mb.Hreg(HregAddr::JOB_START_POS_REG_ADDR, steps_to_hundreths(saved_job_start_pos));
   mb.Hreg(HregAddr::JOB_END_POS_REG_ADDR, steps_to_hundreths(saved_job_end_pos));
   mb.Hreg(HregAddr::JOB_PARK_POS_REG_ADDR, steps_to_hundreths(saved_job_park_pos));
-  mb.Hreg(HregAddr::JOG_SPEED_REG_ADDR, steps_per_sec_to_inches_per_minute(current_jog_speed));
-  mb.Hreg(HregAddr::PLANISH_SPEED_REG_ADDR, steps_per_sec_to_inches_per_minute(current_planish_speed));
-  mb.Hreg(HregAddr::FAULT_CODE_REG_ADDR, fault_code);
+  mb.Hreg(HregAddr::FAULT_CODE_REG_ADDR, static_cast<uint16_t>(fault_code));
   mb.Hreg(HregAddr::CURRENT_STATE_REG_ADDR, static_cast<uint16_t>(machine_state));
 
   const uint16_t planish_speed_temp = mb.Hreg(HregAddr::PLANISH_SPEED_REG_ADDR);
   const uint16_t jog_speed_temp = mb.Hreg(HregAddr::JOG_SPEED_REG_ADDR);
   current_planish_speed = constrain(
-    planish_speed_temp,
+    inches_per_minute_to_steps_per_sec(planish_speed_temp),
     CARRIAGE_MOTOR_MIN_PLANISH_VEL,
     CARRIAGE_MOTOR_MAX_PLANISH_VEL);
   current_jog_speed = constrain(
-    jog_speed_temp,
+    inches_per_minute_to_steps_per_sec(jog_speed_temp),
     CARRIAGE_MOTOR_MIN_VEL,
     CARRIAGE_MOTOR_MAX_VEL);
 
@@ -661,16 +681,16 @@ PlanishState state_machine(const PlanishState state_in) {
             // because otherwise it will put the motor FW in an error state
             return PlanishState::manual_jog;
           } else {
-            combined_print("Tried to jog without being homed", 2000);
+            combined_print("Home axis before jogging", 2000);
           }
         } else {
-          combined_print("Tried to jog without mandrel switch engaged", 2000);
+          combined_print("Secure mandrel latch before jogging", 2000);
         }
       }
 
       if (HmiSetJobStartButton.is_rising()) {
         if (MOTOR_ASSERTED && MOTOR_STEPS_COMPLETE) {
-          mb.Hreg(HregAddr::HMI_JOB_START_POS_REG_ADDR, CARRIAGE_MOTOR.PositionRefCommanded());
+          mb.Hreg(HregAddr::HMI_JOB_START_POS_REG_ADDR, steps_to_hundreths(MOTOR_COMMANDED_POSITION));
           combined_print("Saved start position", 1000);
         } else {
           combined_print("Carriage still in motion, can't record start position", 2000);
@@ -678,7 +698,7 @@ PlanishState state_machine(const PlanishState state_in) {
       }
       if (HmiSetJobEndButton.is_rising()) {
         if (MOTOR_ASSERTED && MOTOR_STEPS_COMPLETE) {
-          mb.Hreg(HregAddr::HMI_JOB_END_POS_REG_ADDR, CARRIAGE_MOTOR.PositionRefCommanded());
+          mb.Hreg(HregAddr::HMI_JOB_END_POS_REG_ADDR, steps_to_hundreths(MOTOR_COMMANDED_POSITION));
           combined_print("Saved end position", 1000);
         } else {
           combined_print("Carriage still in motion, can't record end position", 2000);
@@ -686,7 +706,7 @@ PlanishState state_machine(const PlanishState state_in) {
       }
       if (HmiSetJobParkButton.is_rising()) {
         if (MOTOR_ASSERTED && MOTOR_STEPS_COMPLETE) {
-          mb.Hreg(HregAddr::HMI_JOB_PARK_POS_REG_ADDR, CARRIAGE_MOTOR.PositionRefCommanded());
+          mb.Hreg(HregAddr::HMI_JOB_PARK_POS_REG_ADDR, steps_to_hundreths(MOTOR_COMMANDED_POSITION));
           combined_print("Saved park position", 1000);
         } else {
           combined_print("Carriage still in motion, can't record park position", 2000);
@@ -711,11 +731,11 @@ PlanishState state_machine(const PlanishState state_in) {
       return PlanishState::idle;
 
     case PlanishState::wait_for_head:
-      if (loop_num%STATE_MACHINE_LOOPS_LOG_INTERVAL==0) {
-        USB_PRINTLN(Head.get_commanded_state() ?
-            "Waiting for head. Currently commanded down." :
-            "Waiting for head. Currently commanded up.");
-      }
+      // if (loop_num%STATE_MACHINE_LOOPS_LOG_INTERVAL==0) {
+      //   USB_PRINTLN(Head.get_commanded_state() ?
+      //       "Waiting for head. Currently commanded down." :
+      //       "Waiting for head. Currently commanded up.");
+      // }
       if (!IS_MANDREL_SAFE && Head.get_commanded_state()) {
         // if the mandrel latch is not engaged and the head is being lowered
         combined_print("Mandrel latch disengaged while head was lowering. ESTOP", 10000);
@@ -750,11 +770,10 @@ PlanishState state_machine(const PlanishState state_in) {
       return PlanishState::wait_for_head;
 
     case PlanishState::wait_for_fingers:
-
-      if (loop_num%STATE_MACHINE_LOOPS_LOG_INTERVAL==0) {
-        USB_PRINT("Waiting for fingers. Currently commanded ");
-        USB_PRINTLN(Fingers.get_commanded_state() ? "down." : "up.");
-      }
+      // if (loop_num%STATE_MACHINE_LOOPS_LOG_INTERVAL==0) {
+      //   USB_PRINT("Waiting for fingers. Currently commanded ");
+      //   USB_PRINTLN(Fingers.get_commanded_state() ? "down." : "up.");
+      // }
       if (!IS_MANDREL_SAFE) {
         combined_print("Mandrel became unsafe while fingers were moving. ESTOP", 10000);
         e_stop_handler(EstopReason::mandrel_latch);
@@ -915,7 +934,7 @@ PlanishState state_machine(const PlanishState state_in) {
       return PlanishState::error;
 
     case PlanishState::job_begin:
-      common_job_tasks();
+      COMMON_JOB_TASKS();
       Head.set_commanded_state(false); // head is supposed to already be raised, but this needs to be called
       // despite the sensor check in case it was in the proccess of lowering already
       if (Head.is_fully_disengaged()) {
@@ -926,7 +945,7 @@ PlanishState state_machine(const PlanishState state_in) {
       return PlanishState::job_begin_lifting_head;
 
     case PlanishState::job_begin_lifting_head:
-      common_job_tasks();
+      COMMON_JOB_TASKS();
       if (!IS_MANDREL_SAFE) {
         combined_print("mandrel limit precondition failed since starting job. ESTOP", 10000);
         e_stop_handler(EstopReason::mandrel_latch);
@@ -944,13 +963,13 @@ PlanishState state_machine(const PlanishState state_in) {
       return PlanishState::job_begin_lifting_head;
 
     case PlanishState::job_jog_to_start:
-      common_job_tasks();
+      COMMON_JOB_TASKS();
       combined_print("Jog to start", 1000);
       move_motor_auto_speed(saved_job_start_pos);
       return PlanishState::job_jog_to_start_wait;
 
     case PlanishState::job_jog_to_start_wait:
-      common_job_tasks();
+      COMMON_JOB_TASKS();
       MOTOR_COMMAND(CARRIAGE_MOTOR.VelMax(current_jog_speed););
       if (wait_for_motion()) {
         return PlanishState::job_head_down;
@@ -961,13 +980,13 @@ PlanishState state_machine(const PlanishState state_in) {
       return PlanishState::job_jog_to_start_wait;
 
     case PlanishState::job_head_down:
-      common_job_tasks();
+      COMMON_JOB_TASKS();
       combined_print("Lower head", 1000);
       Head.set_commanded_state(true);
       return PlanishState::job_head_down_wait;
 
     case PlanishState::job_head_down_wait:
-      common_job_tasks();
+      COMMON_JOB_TASKS();
       if (!IS_MANDREL_SAFE) {
         combined_print("mandrel limit precondition failed since starting job. ESTOP", 10000);
         e_stop_handler(EstopReason::mandrel_latch);
@@ -982,13 +1001,13 @@ PlanishState state_machine(const PlanishState state_in) {
       return PlanishState::job_head_down_wait;
 
     case PlanishState::job_planish_to_end:
-      common_job_tasks();
+      COMMON_JOB_TASKS();
       combined_print("Planishing to end position", 1000);
       move_motor_auto_speed(saved_job_end_pos);
       return PlanishState::job_planish_to_end_wait;
 
     case PlanishState::job_planish_to_end_wait:
-      common_job_tasks();
+      COMMON_JOB_TASKS();
       MOTOR_COMMAND(CARRIAGE_MOTOR.VelMax(current_planish_speed););
       if (wait_for_motion()) {
         if (mb.Coil(CoilAddr::IS_DUAL_PASS_MODE)) {
@@ -1007,13 +1026,13 @@ PlanishState state_machine(const PlanishState state_in) {
       return PlanishState::job_planish_to_end_wait;
 
     case PlanishState::job_planish_to_start:
-      common_job_tasks();
+      COMMON_JOB_TASKS();
       USB_PRINTLN("Begin planishing to start position");
       move_motor_auto_speed(saved_job_start_pos);
       return PlanishState::job_planish_to_start_wait;
 
     case PlanishState::job_planish_to_start_wait:
-      common_job_tasks();
+      COMMON_JOB_TASKS();
       MOTOR_COMMAND(CARRIAGE_MOTOR.VelMax(current_planish_speed););
       if (wait_for_motion()) {
         return PlanishState::job_head_up;
@@ -1024,13 +1043,13 @@ PlanishState state_machine(const PlanishState state_in) {
       return PlanishState::job_planish_to_start_wait;
 
     case PlanishState::job_head_up:
-      common_job_tasks();
+      COMMON_JOB_TASKS();
       USB_PRINTLN("Raising head");
       Head.set_commanded_state(false);
       return PlanishState::job_head_up_wait;
 
     case PlanishState::job_head_up_wait:
-      common_job_tasks();
+      COMMON_JOB_TASKS();
       if (!IS_MANDREL_SAFE) {
         combined_print("mandrel limit precondition failed since starting job. ESTOP", 10000);
         e_stop_handler(EstopReason::mandrel_latch);
@@ -1045,13 +1064,13 @@ PlanishState state_machine(const PlanishState state_in) {
       return PlanishState::job_head_up_wait;
 
     case PlanishState::job_jog_to_park:
-      common_job_tasks();
+      COMMON_JOB_TASKS();
       combined_print("Jog to park position", 2000);
       move_motor_auto_speed(saved_job_park_pos);
       return PlanishState::job_jog_to_park_wait;
 
     case PlanishState::job_jog_to_park_wait:
-      common_job_tasks();
+      COMMON_JOB_TASKS();
       MOTOR_COMMAND(CARRIAGE_MOTOR.VelMax(current_jog_speed););
       if (wait_for_motion()) {
         return PlanishState::idle;
@@ -1062,7 +1081,7 @@ PlanishState state_machine(const PlanishState state_in) {
       return PlanishState::job_jog_to_park_wait;
 
     case PlanishState::job_paused:
-      common_job_tasks();
+      COMMON_JOB_TASKS();
       if (HmiStartCycleButton.is_rising()) {
         if (Fingers.is_fully_engaged() && IS_MANDREL_SAFE) {
           return job_resume_state;
@@ -1075,9 +1094,9 @@ PlanishState state_machine(const PlanishState state_in) {
       return PlanishState::job_paused;
 
     case PlanishState::job_cancel:
-      common_job_tasks();
+      COMMON_JOB_TASKS();
       combined_print("Job cancelled", 2000);
-      CARRIAGE_MOTOR.MoveStopDecel();
+      MOTOR_COMMAND(CARRIAGE_MOTOR.MoveStopDecel(););
       return PlanishState::idle;
   }
   // this means the state machine did not already give a state
@@ -1104,7 +1123,7 @@ std::pair<PlanishState, bool> common_job_tasks() {
 }
 
 void pause_job(const PlanishState state_before_pause) {
-  CARRIAGE_MOTOR.MoveStopDecel();
+  MOTOR_COMMAND(CARRIAGE_MOTOR.MoveStopDecel(););
   job_resume_state = job_pause_get_resume_state(state_before_pause);
 }
 
@@ -1267,11 +1286,16 @@ extern "C" void PeriodicInterrupt(void) {
 #ifdef ENABLE_ITERATION_TIME_CHECK
 void iteration_time_check() {
   last_iteration_delta = millis()-last_iteration_time;
-  if (machine_state == PlanishState::error) {
+  if (
+    machine_state == PlanishState::error ||
+    machine_state == PlanishState::e_stop_begin ||
+    machine_state == PlanishState::e_stop_wait
+  ) {
     // error is intentionally a dead end
     return;
   }
-  if (last_iteration_delta >= ITERATION_TIME_ERROR_MS) {
+  if (last_iteration_delta >= ITERATION_TIME_ERROR_MS && !timeout_error_since_last_loop) {
+    timeout_error_since_last_loop = true;
     USB_PRINT("Last iteration of the state machine took more than `ITERATION_TIME_ERROR_MS` (");
     USB_PRINT(ITERATION_TIME_ERROR_MS);
     USB_PRINT("ms) to complete. This is likely a bug. Last iteration took ");
@@ -1281,7 +1305,8 @@ void iteration_time_check() {
     hmi_print("Watchdog error. loop likely reached dead end", 10000); // this probably will never be seen, but just in case
     fault_code = FaultCodes::SmTimeout;
     e_stop_handler(EstopReason::internal_error);
-  } else if (last_iteration_delta >= ITERATION_TIME_WARNING_MS) {
+  } else if (last_iteration_delta >= ITERATION_TIME_WARNING_MS && !timeout_warning_since_last_loop) {
+    timeout_warning_since_last_loop = true;
     USB_PRINT("Last iteration of the state machine took more than `ITERATION_TIME_WARNING_MS` (");
     USB_PRINT(ITERATION_TIME_WARNING_MS);
     USB_PRINT("ms) to complete. This is likely a bug. Last iteration took ");
@@ -1453,9 +1478,24 @@ void read_job_from_nvram() {
  * `saved_job_start_pos`, `saved_job_end_pos`, and `saved_job_park_pos`
  */
 void save_job_to_nvram() {
-  saved_job_start_pos = mb.Hreg(HregAddr::HMI_JOB_START_POS_REG_ADDR);
-  saved_job_end_pos = mb.Hreg(HregAddr::HMI_JOB_END_POS_REG_ADDR);
-  saved_job_park_pos = mb.Hreg(HregAddr::HMI_JOB_PARK_POS_REG_ADDR);
+
+  const uint16_t temp_job_start_pos_hundreths = mb.Hreg(HregAddr::HMI_JOB_START_POS_REG_ADDR);
+  const uint16_t temp_job_end_pos_hundreths = mb.Hreg(HregAddr::HMI_JOB_END_POS_REG_ADDR);
+  const uint16_t temp_job_park_pos_hundreths = mb.Hreg(HregAddr::HMI_JOB_PARK_POS_REG_ADDR);
+
+  saved_job_start_pos = hundreths_to_steps(temp_job_start_pos_hundreths);
+  saved_job_end_pos = hundreths_to_steps(temp_job_end_pos_hundreths);
+  saved_job_park_pos = hundreths_to_steps(temp_job_park_pos_hundreths);
+
+  USB_PRINTLN("job retrieved from HMI (hundreths/raw)");
+  USB_PRINTLN(temp_job_start_pos_hundreths);
+  USB_PRINTLN(temp_job_end_pos_hundreths);
+  USB_PRINTLN(temp_job_park_pos_hundreths);
+
+  USB_PRINTLN("job retrieved from HMI (steps/final)");
+  USB_PRINTLN(saved_job_start_pos);
+  USB_PRINTLN(saved_job_end_pos);
+  USB_PRINTLN(saved_job_park_pos);
 
   u32_to_bytes(saved_job_start_pos, NV_Ram, 0);
   u32_to_bytes(saved_job_end_pos, NV_Ram, 4);
@@ -1531,6 +1571,10 @@ void update_buttons() {
   mb_read_unlatch_coil(&HmiCommandedFingersDownButton);
   mb_read_unlatch_coil(&HmiCommandedRollerUpButton);
   mb_read_unlatch_coil(&HmiCommandedRollerDownButton);
+  mb_read_unlatch_coil(&HmiCommandedPosButton);
+  mb_read_unlatch_coil(&HmiStartCycleButton);
+  mb_read_unlatch_coil(&HmiCancelCycleButton);
+  mb_read_unlatch_coil(&HmiPauseCycleButton);
 }
 
 
