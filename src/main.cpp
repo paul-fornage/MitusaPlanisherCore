@@ -1,10 +1,5 @@
 /*
-  ModbusTCP Client for ClearCode Arduino wrapper
-
-  (c)2021 Alexander Emelianov (a.m.emelianov@gmail.com)
-  https://github.com/emelianov/modbus-esp8266
-
-  This code is licensed under the BSD New License. See LICENSE.txt for more info.
+  Paul Fornage
 */
 
 #include <Arduino.h>
@@ -24,13 +19,9 @@
 #include "Message.h"
 
 
-// TODO: Bug when booting with e-stop on
 // TODO: E-stop ISR
-// TODO: https://piolabs.com/blog/insights/unit-testing-part-1.html#introduction, https://docs.platformio.org/en/latest/advanced/unit-testing/frameworks/doctest.html
 
-
-// TODO: Speed from HMI
-// TODO: Maybe set job parameters from GCODE or manual input
+// TODO: Maybe set job parameters from GCODE
 
 
 // ModBus TCP stuff
@@ -73,6 +64,8 @@ bool is_homed = false;                  // Has the axis been homed
 volatile bool is_e_stop = false;               // Is the Emergency Stop currently active
 
 bool io_configured = false;                  // Has the IO been configured
+
+char message_buffer[64] = "";
 
 uint32_t last_modbus_read = 0;
 uint32_t time_since_last_modbus_read = 0;
@@ -900,8 +893,8 @@ PlanishState state_machine(const PlanishState state_in) {
     case PlanishState::error:
       fault_code = FaultCodes::Error;
       check_modbus(); // last words, if able
-      char message[64] = "Unrecoverable error.Restart machine.estop reason: ";
-      strncpy(message + 50, get_estop_reason_name(estop_reason), 14); // 14 is max length for estop reason
+      strncpy(message_buffer, "Unrecoverable error.Restart machine.estop reason: ", 50);
+      strncpy(message_buffer + 50, get_estop_reason_name(estop_reason), 14); // 14 is max length for estop reason
 
       mb.Coil(CoilAddr::IS_FAULT, true);
       mb.Coil(CoilAddr::SHOW_MESSAGE, true);
@@ -913,12 +906,13 @@ PlanishState state_machine(const PlanishState state_in) {
           mb.Hreg(i+HregAddr::MESSAGE_START, values[i]);
         }
         if (!HmiMessage.is_active()) {
-          combined_print(message, 1000);
+          combined_print(message_buffer, 1000);
         }
-        USB_PRINTLN(message, 1000);
         mb.task();
         delay(100);
-      }
+      } // </ while(true) >
+      // this should obviously never be reached
+      return PlanishState::error;
 
     case PlanishState::job_begin:
       common_job_tasks();
@@ -927,10 +921,9 @@ PlanishState state_machine(const PlanishState state_in) {
       if (Head.is_fully_disengaged()) {
         USB_PRINTLN("Job started head was already up");
         return PlanishState::job_jog_to_start;
-      } else {
-        combined_print("Job was started but head was already down, raising it to begin", 4000);
-        return PlanishState::job_begin_lifting_head;
       }
+      combined_print("Job was started but head was already down, raising it to begin", 4000);
+      return PlanishState::job_begin_lifting_head;
 
     case PlanishState::job_begin_lifting_head:
       common_job_tasks();
