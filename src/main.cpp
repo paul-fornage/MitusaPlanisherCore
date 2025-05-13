@@ -75,7 +75,7 @@ volatile bool is_e_stop = false;               // Is the Emergency Stop currentl
 bool io_configured = false;                  // Has the IO been configured
 
 uint32_t last_modbus_read = 0;
-uint32_t last_modbus_print = 0;
+uint32_t time_since_last_modbus_read = 0;
 
 int32_t current_jog_speed = 100;              // Current speed the motor should use for jogging. Steps/second
 int32_t current_planish_speed = 100;          // Current speed the motor should use for planishing. Steps/second
@@ -202,7 +202,7 @@ volatile EstopReason estop_reason = EstopReason::NONE;
 #define ITERATION_TIME_ERROR_MS 1000  // after this many milliseconds stuck on one iteration of the state machine, declare an error
 #define SERIAL_ESTABLISH_TIMEOUT 5000 // Number of ms to wait for serial to establish before failing POST
 #define HMI_CONNECTION_TRIES_BEFORE_ERROR 5
-#define MODBUS_CHECK_INTERVAL_MS 200
+#define MODBUS_CHECK_INTERVAL_MS 100
 
 /// Interrupt priority for the periodic interrupt. 0 is highest priority, 7 is lowest.
 #define PERIODIC_INTERRUPT_PRIORITY 5
@@ -330,7 +330,7 @@ void setup() {
 
 void loop() {
   if (ESTOP_SW.State() != ESTOP_SW_SAFE_STATE) { // make sure e-stop wasn't already depressed before interrupt was registered
-    USB_PRINTLN("E-Stop was triggered by button from the main loop check");
+    combined_print("E-Stop button pressed, entering e-stop mode. ", 10000);
     e_stop_handler(EstopReason::button);
   }
 
@@ -358,9 +358,14 @@ void loop() {
   // both of these calls rely on io being configured but it
   update_buttons();
 
-  if (mb.transactionsIsEmpty() && millis()-last_modbus_read > MODBUS_CHECK_INTERVAL_MS) {
+
+  time_since_last_modbus_read = millis()-last_modbus_read;
+  if (time_since_last_modbus_read > MODBUS_CHECK_INTERVAL_MS) {
     check_modbus();
     last_modbus_read = millis();
+    if (time_since_last_modbus_read > MODBUS_CHECK_INTERVAL_MS + 100) {
+      USB_PRINTLN("Modbus check falling behind interval");
+    }
   }
 }
 
@@ -427,14 +432,7 @@ void check_modbus() {
   mb.Coil(CoilAddr::CC_COMMANDED_FINGERS, Fingers.get_commanded_state());
   mb.Coil(CoilAddr::CC_COMMANDED_ROLLER, Head.get_commanded_state());
   mb.Coil(CoilAddr::IS_JOB_PAUSED, machine_state==PlanishState::job_paused);
-  mb.Coil(CoilAddr::SHOW_MESSAGE, HmiMessage.get_time() > 0);
-
-
-  if (millis() - last_modbus_print > 1000) {
-    last_modbus_print = millis();
-    // USB_PRINT("steps_per_sec_to_inches_per_minute(current_jog_speed)");
-    // USB_PRINTLN(steps_per_sec_to_inches_per_minute(current_jog_speed));
-  }
+  mb.Coil(CoilAddr::SHOW_MESSAGE, HmiMessage.is_active());
 
   mb.Hreg(HregAddr::CC_COMMANDED_POSITION_REG_ADDR, steps_to_hundreths(CARRIAGE_MOTOR.PositionRefCommanded()));
   mb.Hreg(HregAddr::JOB_PROGRESS_REG_ADDR, job_progress(machine_state).second);
@@ -457,7 +455,7 @@ void check_modbus() {
     CARRIAGE_MOTOR_MIN_VEL,
     CARRIAGE_MOTOR_MAX_VEL);
 
-  if (HmiMessage.get_time() > 0 && HmiMessage.has_been_updated()) {
+  if (HmiMessage.is_active() && HmiMessage.has_been_updated()) {
     const auto values = HmiMessage.get_message_u16();
     for (uint8_t i = 0; i < Message::MessageClass::message_u16_len_max; i++) {
       mb.Hreg(i+HregAddr::MESSAGE_START, values[i]);
@@ -541,7 +539,7 @@ std::pair<uint16_t, bool> job_progress(const PlanishState state_to_check) {
 PlanishState state_machine(const PlanishState state_in) {
   switch (state_in) {
     case PlanishState::post:  // Not used anymore but could be in the future
-      PERIODIC_PRINT(USB_PRINTLN("post state"););
+      USB_PRINTLN("POST");
       return PlanishState::idle;
 
     case PlanishState::begin_homing:
@@ -562,13 +560,14 @@ PlanishState state_machine(const PlanishState state_in) {
 
     case PlanishState::wait_for_homing:
       if (!IS_MANDREL_SAFE) {
+        combined_print("Mandrel latch became unsafe since homing. ESTOP", 2000);
         e_stop_handler(EstopReason::mandrel_latch);
         return PlanishState::e_stop_begin;
       }
 
       if (MOTOR_ASSERTED) {
         // homing done no errors
-        USB_PRINTLN("homing complete");
+        combined_print("homing complete", 2000);
         // the position saved in the local motor instance is not neccesarily the same of the motor FW.
         // this line ensures they are set to the same thing, but when there seems to be a rounding error between the two
         // can confirm they don't desync over the course of at least ~20,000 steps
@@ -582,7 +581,7 @@ PlanishState state_machine(const PlanishState state_in) {
           USB_PRINTLN("Motor was commanded to move before enabling."
                                 "depending on how the code turns out this might not be problematic");
         }
-        USB_PRINTLN("Motor alert detected during homing.");
+        combined_print("Motor alert detected during homing HOME again to clear ESTOP", 2000);
         print_motor_alerts();
         e_stop_handler(EstopReason::motor_error);
       }
@@ -594,10 +593,10 @@ PlanishState state_machine(const PlanishState state_in) {
           if (Head.is_fully_disengaged()) {
             return PlanishState::begin_homing;
           } else {
-            USB_PRINTLN("Tried to home while head engaged");
+            combined_print("Tried to home while head engaged", 2000);
           }
         } else {
-          USB_PRINTLN("Tried to home without mandrel latch engaged");
+          combined_print("Tried to home without mandrel latch engaged", 2000);
         }
       }
 
@@ -607,10 +606,10 @@ PlanishState state_machine(const PlanishState state_in) {
             move_motor_auto_speed(hundreths_to_steps(mb.Hreg(HregAddr::HMI_COMMANDED_POSITION_REG_ADDR)));
             return PlanishState::manual_jog_absolute;
           } else {
-            USB_PRINTLN("Tried to jog to position without homed");
+            combined_print("Tried to jog to position without homed", 2000);
           }
         } else {
-          USB_PRINTLN("Tried to jog to position without mandrel latch engaged");
+          combined_print("Tried to jog to position without mandrel latch engaged", 2000);
         }
       }
 
@@ -829,8 +828,13 @@ PlanishState state_machine(const PlanishState state_in) {
         case EstopReason::NONE:
           USB_PRINTLN("E-Stop was triggered without setting the reason, changing to error");
           estop_reason = EstopReason::internal_error;
-          return PlanishState::e_stop_wait;
+        case EstopReason::internal_error:
+          return PlanishState::error;
+
         case EstopReason::button:
+          if (!HmiMessage.is_active()) {
+            combined_print("E-stopped by button. Release it to resume", 2000);
+          }
           if ((ESTOP_SW.State() == ESTOP_SW_SAFE_STATE)
               && (millis() - last_estop_millis > ESTOP_COOLDOWN_MS))
           { // if the button was released and the estop has been active for over a second
@@ -839,51 +843,78 @@ PlanishState state_machine(const PlanishState state_in) {
             return estop_resume_state;
           }
           return PlanishState::e_stop_wait;
+
         case EstopReason::mandrel_latch:
+          if (!HmiMessage.is_active()) {
+            combined_print("E-stopped by mandrel latch unsafe. Make sure it is secure", 2000);
+          }
           if ((ESTOP_SW.State() == ESTOP_SW_SAFE_STATE)
               && (millis() - last_estop_millis > ESTOP_COOLDOWN_MS)
               && (IS_MANDREL_SAFE))
           {
             // if the latch was fixed and the button hasn't been pressed,
             // and the estop was activated more than `ESTOP_COOLDOWN_MS` ago
-            USB_PRINTLN("Mandrel put back, resuming");
+            combined_print("Mandrel put back, resuming", 2000);
             is_e_stop = false;
             return estop_resume_state;
           }
           return PlanishState::e_stop_wait;
-        case EstopReason::internal_error:
-          return PlanishState::error;
+
         case EstopReason::motor_error:
-          if ((ESTOP_SW.State() == ESTOP_SW_SAFE_STATE)
-              && (millis() - last_estop_millis > ESTOP_COOLDOWN_MS)
-              && (IS_MANDREL_SAFE)
-              && HmiAxisHomingButton.is_rising())
-          {
-            // if the latch was fixed and the button hasn't been pressed,
-            // and the estop was activated more than `ESTOP_COOLDOWN_MS` ago, AND the user is homing again
-            USB_PRINTLN("Motor error cleared by homing, resuming");
-            is_e_stop = false;
-            return PlanishState::begin_homing; // this estop can only be recovered from if they press the home button
+          if (Head.is_fully_disengaged()) {
+            if (!HmiMessage.is_active()) {
+              combined_print("Motor error caused E-stop. Re-home motor to resume", 2000);
+            }
+            if ((ESTOP_SW.State() == ESTOP_SW_SAFE_STATE)
+                && (millis() - last_estop_millis > ESTOP_COOLDOWN_MS)
+                && (IS_MANDREL_SAFE)
+                && HmiAxisHomingButton.is_rising())
+            {
+              // if the latch was fixed and the button hasn't been pressed,
+              // and the estop was activated more than `ESTOP_COOLDOWN_MS` ago, AND the user is homing again
+              USB_PRINTLN("Motor error cleared by homing, resuming");
+              is_e_stop = false;
+              return PlanishState::begin_homing; // this estop can only be recovered from if they press the home button
+            }
+            return PlanishState::e_stop_wait;
+          } else if (!Head.get_commanded_state()) { // if the head is already raising
+            if (!HmiMessage.is_active()) {
+              combined_print("Estop caused by motor error. wait for head raise and then home", 2000);
+            }
+            return PlanishState::e_stop_wait;
+          } else {
+            // Head is fully engaged, so the motor can't start homing yet.
+            if (!HmiMessage.is_active()) {
+              combined_print("Estop caused by motor error. Raise head and then home", 2000);
+            }
+            if (HmiCommandedRollerUpButton.is_rising()) {
+              Head.set_commanded_state(true);
+              combined_print("Raising head", 1000);
+            }
+            return PlanishState::error;
           }
-          return PlanishState::e_stop_wait;
       }
       // should be unreachable
-      return PlanishState::e_stop_wait;
+      return PlanishState::error;
 
     case PlanishState::error:
       fault_code = FaultCodes::Error;
       check_modbus(); // last words, if able
       char message[64] = "Unrecoverable error.Restart machine.estop reason: ";
       strncpy(message + 50, get_estop_reason_name(estop_reason), 14); // 14 is max length for estop reason
-      combined_print(message, 1000);
+
       mb.Coil(CoilAddr::IS_FAULT, true);
       mb.Coil(CoilAddr::SHOW_MESSAGE, true);
       mb.Coil(CoilAddr::IS_E_STOP, true);
-      const auto values = HmiMessage.get_message_u16();
-      for (uint8_t i = 0; i < Message::MessageClass::message_u16_len_max; i++) {
-        mb.Hreg(i+HregAddr::MESSAGE_START, values[i]);
-      }
+
       while (true) {
+        const auto values = HmiMessage.get_message_u16();
+        for (uint8_t i = 0; i < Message::MessageClass::message_u16_len_max; i++) {
+          mb.Hreg(i+HregAddr::MESSAGE_START, values[i]);
+        }
+        if (!HmiMessage.is_active()) {
+          combined_print(message, 1000);
+        }
         USB_PRINTLN(message, 1000);
         mb.task();
         delay(100);
@@ -1118,6 +1149,7 @@ PlanishState job_pause_get_resume_state(const PlanishState state_before_pause) {
       return PlanishState::job_jog_to_park;
 
     default:
+      hmi_print("Paused from invalid state. ESTOP", 10000);
       USB_PRINTLN("Invalid state before pause. Job should only be paused from a job state that isnt pause or cancel");
       e_stop_handler(EstopReason::internal_error);
       return PlanishState::e_stop_begin;
@@ -1207,13 +1239,14 @@ bool wait_for_motion() {
   }
   if (MOTOR_HAS_ERRORS) {
     // motor has an error
-    USB_PRINTLN("Motor alert detected during homing.");
+    USB_PRINTLN("Motor alert detected.");
     print_motor_alerts();
     e_stop_handler(EstopReason::motor_error);
     return false;
   }
 
   if (!IS_MANDREL_SAFE) {
+    combined_print("mandrel limit precondition failed while carriage moving. ESTOP", 10000);
     e_stop_handler(EstopReason::mandrel_latch);
   }
   return false;
@@ -1252,6 +1285,7 @@ void iteration_time_check() {
     USB_PRINT(last_iteration_delta);
     USB_PRINT("ms. Engaging E-Stop and stopping execution. Last state: ");
     USB_PRINTLN(get_state_name(machine_state));
+    hmi_print("Watchdog error. loop likely reached dead end", 10000); // this probably will never be seen, but just in case
     fault_code = FaultCodes::SmTimeout;
     e_stop_handler(EstopReason::internal_error);
   } else if (last_iteration_delta >= ITERATION_TIME_WARNING_MS) {
@@ -1261,6 +1295,7 @@ void iteration_time_check() {
     USB_PRINT(last_iteration_delta);
     USB_PRINT("ms. Continuing execution. Last state: ");
     USB_PRINTLN(get_state_name(machine_state));
+    hmi_print("Watchdog warning. loop running dangerously slow", 10000);
   }
 }
 #endif
@@ -1392,7 +1427,7 @@ void print_motor_alerts(){
 #ifdef TEST_MODE_DISABLE_MOTOR
   USB_PRINTLN("print_motor_alerts()");
 #else
-  USB_PRINTLN("ClearPath Alerts present: ");
+  combined_print("ClearPath Alerts present: ", 4000);
   if(CARRIAGE_MOTOR.AlertReg().bit.MotionCanceledInAlert){
     USB_PRINTLN("    MotionCanceledInAlert "); }
   if(CARRIAGE_MOTOR.AlertReg().bit.MotionCanceledPositiveLimit){

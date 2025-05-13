@@ -23,6 +23,7 @@ const char* GetMessageText(Message::MessageId id) {
 using namespace Message;
 
 void MessageClass::set_message(const char* message) {
+    // TODO: if message does not fill the buffer, make sure it is null terminated. (might already be the case)
     strncpy(this->message, message, message_char_len_max);
     this->is_updated = true;
 }
@@ -60,4 +61,7 @@ void MessageClass::unlatch_updated() {
 }
 bool MessageClass::has_been_updated() const {
     return this->is_updated;
+}
+bool MessageClass::is_active() const {
+    return this->ms_remaining > 0;
 }

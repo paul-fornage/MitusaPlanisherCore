@@ -42,6 +42,7 @@ namespace Message {
         void tick() volatile;
         void unlatch_updated();
         bool has_been_updated() const;
+        bool is_active() const;
 
 
     private:
