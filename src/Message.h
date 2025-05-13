@@ -40,6 +40,8 @@ namespace Message {
         uint16_t* get_message_u16();
         char* get_message_char();
         void tick() volatile;
+        void unlatch_updated();
+        bool has_been_updated() const;
 
 
     private:
@@ -48,6 +50,7 @@ namespace Message {
             uint16_t message_as_uint16[message_u16_len_max];
         };
         volatile uint16_t ms_remaining = 0;
+        bool is_updated = true;
 
 
     };

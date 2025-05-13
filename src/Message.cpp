@@ -24,6 +24,7 @@ using namespace Message;
 
 void MessageClass::set_message(const char* message) {
     strncpy(this->message, message, message_char_len_max);
+    this->is_updated = true;
 }
 
 void MessageClass::set_message(const char* message, const uint16_t ms) {
@@ -53,4 +54,10 @@ void MessageClass::tick() volatile {
     if (this->ms_remaining > 0) {
         this->ms_remaining--;
     }
+}
+void MessageClass::unlatch_updated() {
+    this->is_updated = false;
+}
+bool MessageClass::has_been_updated() const {
+    return this->is_updated;
 }
