@@ -18,7 +18,7 @@
 #include <ModbusAPI.h>
 #include <ModbusTCPTemplate.h>
 #include <utility>
-
+#include "helpers.h"
 #include "MbButton.h"
 #include "RegisterDefinitions.h"
 #include "Message.h"
@@ -53,16 +53,19 @@ ModbusEthernet mb;  //ModbusTCP object
 
 Message::MessageClass HmiMessage;
 
-MbButton HmiIsAxisHomingButton(CoilAddr::IS_AXIS_HOMING_BUTTON_LATCHED);
-MbButton HmiIsSetJobStartButton(CoilAddr::IS_SET_JOB_START_BUTTON_LATCHED);
-MbButton HmiIsSetJobEndButton(CoilAddr::IS_SET_JOB_END_BUTTON_LATCHED);
-MbButton HmiIsSetJobParkButton(CoilAddr::IS_SET_JOB_PARK_BUTTON_LATCHED);
+MbButton HmiAxisHomingButton(CoilAddr::IS_AXIS_HOMING_BUTTON_LATCHED);
+MbButton HmiSetJobStartButton(CoilAddr::IS_SET_JOB_START_BUTTON_LATCHED);
+MbButton HmiSetJobEndButton(CoilAddr::IS_SET_JOB_END_BUTTON_LATCHED);
+MbButton HmiSetJobParkButton(CoilAddr::IS_SET_JOB_PARK_BUTTON_LATCHED);
 MbButton HmiCommitJobButton(CoilAddr::IS_COMMIT_JOB_BUTTON_LATCHED);
-MbButton HmiIsCommandedFingersUpButton(CoilAddr::IS_FINGER_UP_LATCHED);
-MbButton HmiIsCommandedFingersDownButton(CoilAddr::IS_FINGER_DOWN_LATCHED);
-MbButton HmiIsCommandedRollerUpButton(CoilAddr::IS_ROLLER_UP_LATCHED);
-MbButton HmiIsCommandedRollerDownButton(CoilAddr::IS_ROLLER_DOWN_LATCHED);
-MbButton HmiIsCommandedPosButton(CoilAddr::IS_COMMANDED_POS_LATCHED);
+MbButton HmiCommandedFingersUpButton(CoilAddr::IS_FINGER_UP_LATCHED);
+MbButton HmiCommandedFingersDownButton(CoilAddr::IS_FINGER_DOWN_LATCHED);
+MbButton HmiCommandedRollerUpButton(CoilAddr::IS_ROLLER_UP_LATCHED);
+MbButton HmiCommandedRollerDownButton(CoilAddr::IS_ROLLER_DOWN_LATCHED);
+MbButton HmiCommandedPosButton(CoilAddr::IS_COMMANDED_POS_LATCHED);
+MbButton HmiStartCycleButton(CoilAddr::IS_START_CYCLE_BUTTON_LATCHED);
+MbButton HmiCancelCycleButton(CoilAddr::IS_CANCEL_CYCLE_BUTTON_LATCHED);
+MbButton HmiPauseCycleButton(CoilAddr::IS_PAUSE_CYCLE_BUTTON_LATCHED);
 
 auto fault_code = FaultCodes::None;
 
@@ -75,8 +78,8 @@ bool is_mandrel_safe = false;
 uint32_t last_modbus_read = 0;
 uint32_t last_modbus_print = 0;
 
-int32_t current_jog_speed = 0;              // Current speed the motor should use for jogging. Steps/second
-int32_t current_planish_speed = 0;          // Current speed the motor should use for planishing. Steps/second
+int32_t current_jog_speed = 100;              // Current speed the motor should use for jogging. Steps/second
+int32_t current_planish_speed = 100;          // Current speed the motor should use for planishing. Steps/second
 
 uint32_t last_iteration_delta;          // Time spent on the last iteration of the main loop in millis
 uint32_t last_iteration_time;           // Time of the last iteration of the main loop in millis
@@ -137,21 +140,12 @@ enum class PlanishState {
   job_head_up_wait,           // Wait for head to be up
   job_jog_to_park,            // Move to park position
   job_jog_to_park_wait,       // Wait until carriage arrives at park position
-
-  learn_start_pos,            // Learn has been pressed, set start point
-  learn_jog_to_end_pos,       // Manually jogging to end position
-  learn_end_pos,              // Learn was pressed again, set end position
-  learn_jog_to_park_pos,      // Manually jogging to park position
-  learn_park_pos,             // Learn was pressed again, set park position
-  saving_job_to_nvram,        // Job is recorded and needs to be saved in NVRAM
+  job_paused,                 // The job is paused and not canceled. This needs a global variable for what state it was previously in
 };
 
 volatile PlanishState estop_last_state;  // When an estop is called, this gets set to whatever the current state was.
 volatile PlanishState estop_resume_state;      // When an estop is resolved, this stores where to resume
 volatile PlanishState machine_state;     // the current state of the machine. Volatile because it can be changed by estop ISR
-
-volatile IndicatorLight home_indicator_light;   /// Defined globally, but should not be accessed unless configure_IO has completed without errors
-volatile IndicatorLight learn_indicator_light;  /// Defined globally, but should not be accessed unless configure_IO has completed without errors
 
 volatile EstopReason estop_reason = EstopReason::NONE;
 
@@ -184,26 +178,15 @@ volatile EstopReason estop_reason = EstopReason::NONE;
 
 #define ESTOP_SW ConnectorA12
 #define FINGER_DOWN_LMT ConnectorA11
-#define LEARN_SW ConnectorA10
-#define SPEED_POT ConnectorA9
 #define MANDREL_LATCH_LMT ConnectorDI8
-#define HALF_CYCLE_SW ConnectorDI7
 #define HEAD_UP_LMT ConnectorDI6
-#define HOME_SW ConnectorIO0
-#define CYCLE_SW ConnectorIO1
-#define FINGER_SW ConnectorIO2
-#define JOG_FWD_SW ConnectorIO3
-#define JOG_REV_SW ConnectorIO4
-#define HEAD_SW ConnectorIO5
-
 
 
 // CCIO pin definitions. these are not interchangeable with native io ports.
 // please see `configure_io()` to change assignment between ccio and native pins
 #define FINGER_ACTUATION CCIOA6 // CCIO pin for finger actuation
 #define HEAD_ACTUATION CCIOA4
-#define HOME_SW_LIGHT CCIOA0
-#define LEARN_SW_LIGHT CCIOA3
+
 
 #define CCIO1 ConnectorCOM1
 #define EXPECTED_NUM_CCIO 1
@@ -216,7 +199,7 @@ volatile EstopReason estop_reason = EstopReason::NONE;
 #define CARRIAGE_MOTOR_MAX_POS 12000
 #define CARRIAGE_MOTOR_MAX_PLANISH_VEL 4000
 // not a safety limit, just what should the minimum position on the speed selector represent in planish mode
-#define CARRIAGE_MOTOR_MIN_PLANISH_VEL 50
+#define CARRIAGE_MOTOR_MIN_PLANISH_VEL 25
 
 #define ENABLE_ITERATION_TIME_CHECK
 #define ITERATION_TIME_WARNING_MS 500 // after this many milliseconds stuck on one iteration of the state machine, give a warning.
@@ -245,8 +228,8 @@ volatile EstopReason estop_reason = EstopReason::NONE;
 #define STATE_MACHINE_LOOPS_LOG_INTERVAL 1024 // number of loops of the main state machine between
 // logging from 'wait' states. Too low will flood the logs
 
-#define IS_JOG_FWD_ACTIVE ((JOG_FWD_SW.State() == JOG_FWD_SW_ACTIVE_STATE) || mb.Coil(CoilAddr::IS_JOG_POS_PRESSED))
-#define IS_JOG_REV_ACTIVE ((JOG_REV_SW.State() == JOG_REV_SW_ACTIVE_STATE) || mb.Coil(CoilAddr::IS_JOG_NEG_PRESSED))
+#define IS_JOG_FWD_ACTIVE (mb.Coil(CoilAddr::IS_JOG_POS_PRESSED))
+#define IS_JOG_REV_ACTIVE (mb.Coil(CoilAddr::IS_JOG_NEG_PRESSED))
 
 #define PERIODIC_PRINT(statements) if (loop_num%STATE_MACHINE_LOOPS_LOG_INTERVAL==0) { statements }
 
@@ -254,18 +237,7 @@ volatile EstopReason estop_reason = EstopReason::NONE;
 #define USB_PRINTLN(statements) ConnectorUsb.SendLine(statements);
 #define USB_PRINT_CHAR(statements) ConnectorUsb.SendChar(statements);
 
-// TODO: Verify this WAGNER
-#define STEPS_PER_REV 800
-#define GEARBOX_RATIO 100.0 // number of input revs for one output revs
-#define RACK_TEETH_PER_INCH 4.0
-#define PINION_TEETH_PER_REV 24 // teeth on the pinion gear that interfaces with the rack
 
-
-Button LearnButton;
-Button HomeButton;
-Button CycleButton;
-Button FingerButton;
-Button HeadButton;
 
 SensedActuator Fingers;
 SensedActuator Head;
@@ -277,8 +249,6 @@ void iteration_time_check();
 void config_ccio_pin(ClearCorePins target_pin, Connector::ConnectorModes mode, bool initial_state = false);
 void set_ccio_pin(ClearCorePins target_pin, bool state);
 void ConfigurePeriodicInterrupt(uint32_t frequencyHz);
-uint32_t bytes_to_u32(const uint8_t bytes[4], uint32_t offset = 0);
-void u32_to_bytes(uint32_t value, uint8_t bytes[4], uint32_t offset = 0);
 void read_job_from_nvram();
 void save_job_to_nvram();
 bool wait_for_motion();
@@ -286,7 +256,6 @@ bool move_motor_with_speed(int32_t position, int32_t speed);
 bool move_motor_auto_speed(int32_t position);
 void motor_jog(bool reverse);
 void update_buttons();
-void update_speed_pot();
 void e_stop_handler(EstopReason reason);
 PlanishState secure_system(PlanishState last_state);
 PlanishState state_machine(PlanishState state_in);
@@ -294,15 +263,9 @@ const char *get_estop_reason_name(EstopReason state);
 void check_modbus();
 std::pair<uint16_t, bool> job_progress(PlanishState state_to_check);
 void mb_read_unlatch_coil(MbButton *button);
-double steps_to_f64_inch(uint32_t steps);
-uint16_t steps_to_hundreths(uint32_t steps);
-uint16_t steps_per_sec_to_inches_per_minute(uint32_t steps_per_second);
 const char *get_state_name(PlanishState state);
 bool ethernet_setup();
 bool cbConn(IPAddress ip);
-uint16_t f64_inch_to_steps(double inches);
-uint16_t hundreths_to_steps(uint16_t hundreths);
-uint16_t inches_per_minute_to_steps_per_sec(uint16_t inches_per_minute);
 
 extern "C" void TCC2_0_Handler(void) __attribute__((
             alias("PeriodicInterrupt")));
@@ -397,9 +360,6 @@ void loop() {
 
   // both of these calls rely on io being configured but it
   update_buttons();
-  if (loop_num%STATE_MACHINE_LOOPS_POT_UPDATE_INTERVAL==0) {
-    update_speed_pot();
-  }
 
   if (mb.transactionsIsEmpty() && millis()-last_modbus_read > MODBUS_CHECK_INTERVAL_MS) {
     check_modbus();
@@ -489,6 +449,15 @@ void check_modbus() {
   mb.Hreg(HregAddr::FAULT_CODE_REG_ADDR, fault_code);
   mb.Hreg(HregAddr::CURRENT_STATE_REG_ADDR, static_cast<uint16_t>(machine_state));
 
+  current_planish_speed = constrain(
+    mb.Hreg(HregAddr::PLANISH_SPEED_REG_ADDR),
+    CARRIAGE_MOTOR_MIN_PLANISH_VEL,
+    CARRIAGE_MOTOR_MAX_PLANISH_VEL);
+
+  current_jog_speed = constrain(mb.Hreg(HregAddr::JOG_SPEED_REG_ADDR),
+    CARRIAGE_MOTOR_MIN_VEL,
+    CARRIAGE_MOTOR_MAX_VEL);
+
   const auto values = HmiMessage.get_message_u16();
   for (uint8_t i = 0; i < Message::MessageClass::message_u16_len_max; i++) {
     mb.Hreg(i+HregAddr::MESSAGE_START, values[i]);
@@ -576,7 +545,6 @@ PlanishState state_machine(const PlanishState state_in) {
     case PlanishState::homing_wait_for_disable:
       if (millis() - homing_disable_time > MOTOR_EN_DIS_DELAY_MS) {
         MOTOR_COMMAND(CARRIAGE_MOTOR.EnableRequest(true););
-        home_indicator_light.setPattern(LightPattern::BLINK);
         return PlanishState::wait_for_homing;
       }
       return PlanishState::homing_wait_for_disable;
@@ -595,7 +563,6 @@ PlanishState state_machine(const PlanishState state_in) {
         // can confirm they don't desync over the course of at least ~20,000 steps
         MOTOR_COMMAND(CARRIAGE_MOTOR.PositionRefSet(0););
         is_homed = true;
-        home_indicator_light.setPattern(LightPattern::ON);
         return PlanishState::idle;
       }
 
@@ -611,7 +578,7 @@ PlanishState state_machine(const PlanishState state_in) {
       return PlanishState::wait_for_homing;
 
     case PlanishState::idle:
-      if (HomeButton.is_rising() || HmiIsAxisHomingButton.is_rising()) {
+      if (HmiAxisHomingButton.is_rising()) {
         if (is_mandrel_safe) {
           if (Head.is_fully_disengaged()) {
             return PlanishState::begin_homing;
@@ -623,7 +590,7 @@ PlanishState state_machine(const PlanishState state_in) {
         }
       }
 
-      if (HmiIsCommandedPosButton.is_rising()) {
+      if (HmiCommandedPosButton.is_rising()) {
         if (is_mandrel_safe) {
           if (is_homed) {
             move_motor_auto_speed(hundreths_to_steps(mb.Hreg(HregAddr::HMI_COMMANDED_POSITION_REG_ADDR)));
@@ -636,17 +603,14 @@ PlanishState state_machine(const PlanishState state_in) {
         }
       }
 
-      if (FingerButton.is_rising()
-          || HmiIsCommandedFingersUpButton.is_rising()
-          || HmiIsCommandedFingersDownButton.is_rising())
+      if (HmiCommandedFingersUpButton.is_rising()
+          || HmiCommandedFingersDownButton.is_rising())
         {
         bool new_finger_state; // < doesn't necessarily get acted on or set.
-        if(HmiIsCommandedFingersUpButton.is_rising()) {
+        if(HmiCommandedFingersUpButton.is_rising()) {
           new_finger_state = false;
-        } else if (HmiIsCommandedFingersDownButton.is_rising()) {
+        } else { // if (HmiIsCommandedFingersDownButton.is_rising())
           new_finger_state = true;
-        } else {
-          new_finger_state = !Fingers.get_commanded_state();
         }
         if (is_mandrel_safe) {
           if(Head.is_fully_disengaged() || new_finger_state) {
@@ -665,20 +629,14 @@ PlanishState state_machine(const PlanishState state_in) {
         }
       }
 
-      if (HeadButton.is_changing()
-          || HmiIsCommandedRollerUpButton.is_rising()
-          || HmiIsCommandedRollerDownButton.is_rising())
+      if (HmiCommandedRollerUpButton.is_rising()
+          || HmiCommandedRollerDownButton.is_rising())
         {
-        // Although the head switch is not momentary, changes should only be made when the user commands it, to avoid
-        // unexpected moves when relinquishing head control to user after a job
-
         bool new_head_state; // < doesn't necessarily get acted on or set.
-        if (HmiIsCommandedRollerUpButton.is_rising()) {
+        if (HmiCommandedRollerUpButton.is_rising()) {
           new_head_state = false;
-        } else if (HmiIsCommandedRollerDownButton.is_rising()) {
+        } else { // if (HmiIsCommandedRollerDownButton.is_rising())
           new_head_state = true;
-        } else {
-          new_head_state = HeadButton.get_current_state();
         }
 
         if((is_mandrel_safe && Fingers.is_fully_engaged()) || !new_head_state) {
@@ -693,22 +651,6 @@ PlanishState state_machine(const PlanishState state_in) {
           HmiMessage.set_message("Tried to lower head while fingers not down", 1000);
         }
         return PlanishState::idle;
-      }
-
-      if (LearnButton.is_rising()) {
-        if (is_mandrel_safe) {
-          if (Head.is_fully_disengaged()) {
-            if (is_homed) {
-              return PlanishState::learn_start_pos;
-            } else {
-              USB_PRINTLN("Tried to start learn without homed");
-            }
-          } else {
-            USB_PRINTLN("Tried to learn job while the head was not fully down");
-          }
-        } else {
-          USB_PRINTLN("Tried to learn job without mandrel being in safe position");
-        }
       }
 
       if (IS_JOG_FWD_ACTIVE || IS_JOG_REV_ACTIVE) {
@@ -729,7 +671,7 @@ PlanishState state_machine(const PlanishState state_in) {
         }
       }
 
-      if (HmiIsSetJobStartButton.is_rising()) {
+      if (HmiSetJobStartButton.is_rising()) {
         if (MOTOR_ASSERTED && MOTOR_STEPS_COMPLETE) {
           temp_job_start_pos = CARRIAGE_MOTOR.PositionRefCommanded();
           USB_PRINTLN("saved start position");
@@ -737,7 +679,7 @@ PlanishState state_machine(const PlanishState state_in) {
           USB_PRINTLN("HMI tried to save current position as job start, but the carriage is still in motion!");
         }
       }
-      if (HmiIsSetJobEndButton.is_rising()) {
+      if (HmiSetJobEndButton.is_rising()) {
         if (MOTOR_ASSERTED && MOTOR_STEPS_COMPLETE) {
           temp_job_end_pos = CARRIAGE_MOTOR.PositionRefCommanded();
           USB_PRINTLN("saved end position");
@@ -745,7 +687,7 @@ PlanishState state_machine(const PlanishState state_in) {
           USB_PRINTLN("HMI tried to save current position as job end, but the carriage is still in motion!");
         }
       }
-      if (HmiIsSetJobParkButton.is_rising()) {
+      if (HmiSetJobParkButton.is_rising()) {
         if (MOTOR_ASSERTED && MOTOR_STEPS_COMPLETE) {
           temp_job_park_pos = CARRIAGE_MOTOR.PositionRefCommanded();
           USB_PRINTLN("saved park position");
@@ -758,7 +700,7 @@ PlanishState state_machine(const PlanishState state_in) {
         USB_PRINTLN("Saved job to NVRAM and memory");
       }
 
-      if (CycleButton.is_rising()) {
+      if (HmiStartCycleButton.is_rising()) {
         if (Fingers.is_fully_engaged() && is_homed && is_mandrel_safe) {
           return PlanishState::job_begin;
         } else if (!Fingers.is_fully_engaged()) {
@@ -782,9 +724,17 @@ PlanishState state_machine(const PlanishState state_in) {
         return PlanishState::e_stop_begin;
       }
 
-      // if head was changed from manual control, they should be able to 'undo' it without waiting for completion
-      if (HeadButton.is_changing()) {
-        const bool new_head_state = HeadButton.get_current_state(); // < doesn't necessarily get acted on or set.
+      // if head was changed from manual control (only way to reach this state),
+      // they should be able to 'undo' it without waiting for completion
+      if (HmiCommandedRollerUpButton.is_rising()
+          || HmiCommandedRollerDownButton.is_rising())
+      {
+        bool new_head_state; // < doesn't necessarily get acted on or set.
+        if (HmiCommandedRollerUpButton.is_rising()) {
+          new_head_state = false;
+        } else { // if (HmiIsCommandedRollerDownButton.is_rising())
+          new_head_state = true;
+        }
         if(Fingers.is_fully_engaged() || !new_head_state) {
           // Make sure the fingers are down or the user is trying to raise the head.
           // Basically don't let them lower it without fingers engaged
@@ -811,8 +761,15 @@ PlanishState state_machine(const PlanishState state_in) {
         return PlanishState::e_stop_begin;
       }
 
-      if (FingerButton.is_rising()) { // still let the user change the finger state even if in motion
-        const bool new_finger_state = !Fingers.get_commanded_state(); // < doesn't necessarily get acted on or set.
+      if (HmiCommandedFingersUpButton.is_rising()
+        || HmiCommandedFingersDownButton.is_rising())
+      {
+        bool new_finger_state; // < doesn't necessarily get acted on or set.
+        if(HmiCommandedFingersUpButton.is_rising()) {
+          new_finger_state = false;
+        } else { // if (HmiIsCommandedFingersDownButton.is_rising())
+          new_finger_state = true;
+        }
         USB_PRINTLN(new_finger_state ? "Engaging fingers" : "Disengaging fingers");
         Fingers.set_commanded_state(new_finger_state);
         return PlanishState::wait_for_fingers;
@@ -884,24 +841,19 @@ PlanishState state_machine(const PlanishState state_in) {
           }
           return PlanishState::e_stop_wait;
         case EstopReason::internal_error:
-          // unrecoverable by design
-          home_indicator_light.setPattern(LightPattern::STROBE);
-          learn_indicator_light.setPattern(LightPattern::STROBE);
           return PlanishState::error;
         case EstopReason::motor_error:
           if ((ESTOP_SW.State() == ESTOP_SW_SAFE_STATE)
               && (millis() - last_estop_millis > ESTOP_COOLDOWN_MS)
               && (is_mandrel_safe)
-              && HomeButton.is_rising())
+              && HmiAxisHomingButton.is_rising())
           {
             // if the latch was fixed and the button hasn't been pressed,
             // and the estop was activated more than `ESTOP_COOLDOWN_MS` ago, AND the user is homing again
             USB_PRINTLN("Motor error cleared by homing, resuming");
-            home_indicator_light.setPattern(LightPattern::OFF);
             is_e_stop = false;
             return PlanishState::begin_homing; // this estop can only be recovered from if they press the home button
           }
-          home_indicator_light.setPattern(LightPattern::STROBE);
           return PlanishState::e_stop_wait;
       }
       // should be unreachable
@@ -909,8 +861,6 @@ PlanishState state_machine(const PlanishState state_in) {
 
     case PlanishState::error:
       fault_code = FaultCodes::Error;
-      home_indicator_light.setPattern(LightPattern::STROBE);
-      learn_indicator_light.setPattern(LightPattern::STROBE);
       check_modbus(); // last words, if able
       while (true) {
         USB_PRINTLN("reached error state.");
@@ -1049,69 +999,6 @@ PlanishState state_machine(const PlanishState state_in) {
         USB_PRINTLN("Jogging to park position");
       }
       return PlanishState::job_jog_to_park_wait;
-
-    case PlanishState::learn_start_pos:
-      learn_indicator_light.setPattern(LightPattern::FLASH1);
-      USB_PRINTLN("learn start pos");
-      temp_job_start_pos = MOTOR_COMMANDED_POSITION;
-      return PlanishState::learn_jog_to_end_pos;
-
-    case PlanishState::learn_jog_to_end_pos:
-      if (!is_mandrel_safe) {
-        e_stop_handler(EstopReason::mandrel_latch);
-        return PlanishState::e_stop_begin;
-      }
-      if (LearnButton.is_rising()) {
-        return PlanishState::learn_end_pos;
-      }
-      if (IS_JOG_FWD_ACTIVE) {
-        motor_jog(false);
-      } else if (IS_JOG_REV_ACTIVE) {
-        motor_jog(true);
-      } else {
-        MOTOR_COMMAND(CARRIAGE_MOTOR.MoveStopDecel(););
-      }
-      return PlanishState::learn_jog_to_end_pos;
-
-    case PlanishState::learn_end_pos:
-      learn_indicator_light.setPattern(LightPattern::FLASH2);
-      USB_PRINTLN("learn end pos");
-      temp_job_end_pos = MOTOR_COMMANDED_POSITION;
-      return PlanishState::learn_jog_to_park_pos;
-
-    case PlanishState::learn_jog_to_park_pos:
-      if (!is_mandrel_safe) {
-        e_stop_handler(EstopReason::mandrel_latch);
-        return PlanishState::e_stop_begin;
-      }
-      if (LearnButton.is_rising()) {
-        return PlanishState::learn_park_pos;
-      }
-      if (IS_JOG_FWD_ACTIVE) {
-        motor_jog(false);
-      } else if (IS_JOG_REV_ACTIVE) {
-        motor_jog(true);
-      } else {
-        MOTOR_COMMAND(CARRIAGE_MOTOR.MoveStopDecel(););
-      }
-      return PlanishState::learn_jog_to_park_pos;
-
-    case PlanishState::learn_park_pos:
-      learn_indicator_light.setPattern(LightPattern::FLASH3);
-      USB_PRINTLN("learn park pos");
-      temp_job_park_pos = MOTOR_COMMANDED_POSITION;
-      return PlanishState::saving_job_to_nvram;
-
-    case PlanishState::saving_job_to_nvram:
-      USB_PRINTLN("saving job to nvram");
-      USB_PRINTLN(temp_job_start_pos);
-      USB_PRINTLN(temp_job_end_pos);
-      USB_PRINTLN(temp_job_park_pos);
-      save_job_to_nvram();
-      learn_indicator_light.setPattern(LightPattern::OFF);
-      return PlanishState::idle;
-
-
   }
   // this means the state machine did not already give a state
   USB_PRINTLN("State machine iteration executed without explicitly returning the next state");
@@ -1128,17 +1015,9 @@ PlanishState state_machine(const PlanishState state_in) {
 bool configure_io() {
 
   FINGER_DOWN_LMT.Mode(Connector::INPUT_DIGITAL);
-  LEARN_SW.Mode(Connector::INPUT_DIGITAL);
-  SPEED_POT.Mode(Connector::INPUT_ANALOG);
   MANDREL_LATCH_LMT.Mode(Connector::INPUT_DIGITAL);
-  HALF_CYCLE_SW.Mode(Connector::INPUT_DIGITAL);
   HEAD_UP_LMT.Mode(Connector::INPUT_DIGITAL);
-  HOME_SW.Mode(Connector::INPUT_DIGITAL);
-  CYCLE_SW.Mode(Connector::INPUT_DIGITAL);
-  FINGER_SW.Mode(Connector::INPUT_DIGITAL);
-  JOG_FWD_SW.Mode(Connector::INPUT_DIGITAL);
-  JOG_REV_SW.Mode(Connector::INPUT_DIGITAL);
-  HEAD_SW.Mode(Connector::INPUT_DIGITAL);
+
 
   AdcMgr.AdcResolution(ADC_RES_BITS);
 
@@ -1170,8 +1049,7 @@ bool configure_io() {
 
   config_ccio_pin(FINGER_ACTUATION, Connector::OUTPUT_DIGITAL);
   config_ccio_pin(HEAD_ACTUATION, Connector::OUTPUT_DIGITAL);
-  config_ccio_pin(HOME_SW_LIGHT, Connector::OUTPUT_DIGITAL);
-  config_ccio_pin(LEARN_SW_LIGHT, Connector::OUTPUT_DIGITAL);
+
 
   Fingers.set_actuator_pin(CcioMgr.PinByIndex(FINGER_ACTUATION));
   Fingers.set_sense_pin(&FINGER_DOWN_LMT);
@@ -1183,14 +1061,6 @@ bool configure_io() {
 //  Head.set_commanded_state(Head.get_measured_state());
   Head.set_commanded_state(false);
 
-  home_indicator_light.setPin(CcioMgr.PinByIndex(HOME_SW_LIGHT));
-  home_indicator_light.setPeriod(50);
-  home_indicator_light.setPattern(LightPattern::OFF);
-  home_indicator_light.setInverted(true);
-  learn_indicator_light.setPin(CcioMgr.PinByIndex(LEARN_SW_LIGHT));
-  learn_indicator_light.setPeriod(50);
-  learn_indicator_light.setPattern(LightPattern::OFF);
-  learn_indicator_light.setInverted(true);
 
   MOTOR_COMMAND(MotorMgr.MotorInputClocking(MotorManager::CLOCK_RATE_NORMAL););
   MOTOR_COMMAND(MotorMgr.MotorModeSet(MotorManager::MOTOR_ALL, Connector::CPM_MODE_STEP_AND_DIR););
@@ -1198,7 +1068,6 @@ bool configure_io() {
   MOTOR_COMMAND(CARRIAGE_MOTOR.HlfbMode(MotorDriver::HLFB_MODE_HAS_BIPOLAR_PWM););
   MOTOR_COMMAND(CARRIAGE_MOTOR.HlfbCarrier(MotorDriver::HLFB_CARRIER_482_HZ););
 
-  update_speed_pot();
   MOTOR_COMMAND(CARRIAGE_MOTOR.VelMax(current_jog_speed););
   MOTOR_COMMAND(CARRIAGE_MOTOR.AccelMax(CARRIAGE_MOTOR_MAX_ACCEL););
 
@@ -1238,11 +1107,6 @@ bool wait_for_motion() {
  * Interrupt handler gets automatically called every ms
  */
 extern "C" void PeriodicInterrupt(void) {
-  // These calls just update the indicator light
-  // logic so they can check if they need to be changed
-  home_indicator_light.tick();
-  learn_indicator_light.tick();
-
   HmiMessage.tick();
 
   // Check the time since the last loop was run.
@@ -1265,7 +1129,6 @@ void iteration_time_check() {
     // error is intentionally a dead end
     return;
   }
-
   if (last_iteration_delta >= ITERATION_TIME_ERROR_MS) {
     USB_PRINT("Last iteration of the state machine took more than `ITERATION_TIME_ERROR_MS` (");
     USB_PRINT(ITERATION_TIME_ERROR_MS);
@@ -1430,40 +1293,6 @@ void print_motor_alerts(){
 #endif
 }
 
-/**
- * Convert bytes to u32. Big endian, little endian?
- * I don't know, but it works with `u32_to_bytes()`
- *
- * @warning `bytes[offset+3]` needs to be a valid address
- *
- * @param bytes Const; The bytes to turn into a u32
- * @param offset Offset for accessing array
- * @return the u32
- */
-uint32_t bytes_to_u32(const uint8_t *bytes, const uint32_t offset) {
-  return
-      bytes[offset] << 24 |
-      bytes[offset + 1] << 16 |
-      bytes[offset + 2] << 8 |
-      bytes[offset + 3];
-}
-
-/**
- * Convert uint32_t into bytes. Big endian, little endian?
- * I don't know, but it works with `bytes_to_u32()`
- *
- * @warning `bytes[offset+3]` needs to be a valid address
- *
- * @param value The u32 to convert
- * @param bytes Where that converted u32 should go
- * @param offset Offset for writing to array
- */
-void u32_to_bytes(const uint32_t value, uint8_t *bytes, const uint32_t offset) {
-  bytes[offset] = (value >> 24) & 0xFF;
-  bytes[offset+1] = (value >> 16) & 0xFF;
-  bytes[offset+2] = (value >> 8) & 0xFF;
-  bytes[offset+3] = value & 0xFF;
-}
 
 /**
  * Takes the job from NVRAM and puts it into `saved_job_start_pos`, `saved_job_end_pos`, and `saved_job_park_pos`
@@ -1550,45 +1379,15 @@ void motor_jog(const bool reverse) {
  * @pre IO has been configured
  */
 void update_buttons() {
-  LearnButton.new_reading(LEARN_SW.State());
-  HomeButton.new_reading(HOME_SW.State());
-  CycleButton.new_reading(CYCLE_SW.State());
-  FingerButton.new_reading(FINGER_SW.State());
-  HeadButton.new_reading(HEAD_SW.State());
-
-  mb_read_unlatch_coil(&HmiIsAxisHomingButton);
-  mb_read_unlatch_coil(&HmiIsSetJobStartButton);
-  mb_read_unlatch_coil(&HmiIsSetJobEndButton);
-  mb_read_unlatch_coil(&HmiIsSetJobParkButton);
+  mb_read_unlatch_coil(&HmiAxisHomingButton);
+  mb_read_unlatch_coil(&HmiSetJobStartButton);
+  mb_read_unlatch_coil(&HmiSetJobEndButton);
+  mb_read_unlatch_coil(&HmiSetJobParkButton);
   mb_read_unlatch_coil(&HmiCommitJobButton);
-  mb_read_unlatch_coil(&HmiIsCommandedFingersUpButton);
-  mb_read_unlatch_coil(&HmiIsCommandedFingersDownButton);
-  mb_read_unlatch_coil(&HmiIsCommandedRollerUpButton);
-  mb_read_unlatch_coil(&HmiIsCommandedRollerDownButton);
-}
-
-/**
- * Takes reading from speed pot and sets `current_planish_speed` and `current_jog_speed` to values
- * scaled from their max by the pot
- *
- * @pre IO is configured
- */
-void update_speed_pot() {
-  const int16_t analog_reading = SPEED_POT.State();
-  const float pot_percent = static_cast<float>(analog_reading) / ADC_MAX_VALUE;
-
-  float temp_jog_speed = (pot_percent * CARRIAGE_MOTOR_MAX_VEL) + CARRIAGE_MOTOR_MIN_VEL;
-  float temp_planish_speed = (pot_percent * CARRIAGE_MOTOR_MAX_PLANISH_VEL) + CARRIAGE_MOTOR_MIN_PLANISH_VEL;
-
-  if (temp_jog_speed > CARRIAGE_MOTOR_MAX_VEL) {
-    temp_jog_speed = CARRIAGE_MOTOR_MAX_VEL;
-  }
-  if (temp_planish_speed > CARRIAGE_MOTOR_MAX_PLANISH_VEL) {
-    temp_planish_speed = CARRIAGE_MOTOR_MAX_PLANISH_VEL;
-  }
-
-  current_planish_speed = static_cast<int32_t>(temp_planish_speed);
-  current_jog_speed = static_cast<int32_t>(temp_jog_speed);
+  mb_read_unlatch_coil(&HmiCommandedFingersUpButton);
+  mb_read_unlatch_coil(&HmiCommandedFingersDownButton);
+  mb_read_unlatch_coil(&HmiCommandedRollerUpButton);
+  mb_read_unlatch_coil(&HmiCommandedRollerDownButton);
 }
 
 
@@ -1609,7 +1408,6 @@ PlanishState secure_system(const PlanishState last_state) {
     case PlanishState::homing_wait_for_disable:
     case PlanishState::wait_for_homing:
       // special case where telling the motor to stop won't stop it. it needs to be disabled.
-      home_indicator_light.setPattern(LightPattern::OFF);
       MOTOR_COMMAND(CARRIAGE_MOTOR.EnableRequest(false););
       is_homed = false;
       return PlanishState::idle;
@@ -1682,18 +1480,6 @@ PlanishState secure_system(const PlanishState last_state) {
     case PlanishState::job_jog_to_park:
     case PlanishState::job_jog_to_park_wait:
       return PlanishState::job_jog_to_park;
-
-    case PlanishState::learn_start_pos:
-    case PlanishState::learn_jog_to_end_pos:
-    case PlanishState::learn_end_pos:
-    case PlanishState::learn_jog_to_park_pos:
-    case PlanishState::learn_park_pos:
-      // An estop here will cancel the learn operation
-      learn_indicator_light.setPattern(LightPattern::OFF);
-      return PlanishState::idle;
-
-    case PlanishState::saving_job_to_nvram:
-      return PlanishState::saving_job_to_nvram;
   }
   return PlanishState::error;
 }
@@ -1733,12 +1519,6 @@ const char *get_state_name(const PlanishState state) {
     STATE_NAME(job_head_up_wait);
     STATE_NAME(job_jog_to_park);
     STATE_NAME(job_jog_to_park_wait);
-    STATE_NAME(learn_start_pos);
-    STATE_NAME(learn_jog_to_end_pos);
-    STATE_NAME(learn_end_pos);
-    STATE_NAME(learn_jog_to_park_pos);
-    STATE_NAME(learn_park_pos);
-    STATE_NAME(saving_job_to_nvram);
   }
   return "INVALID_STATE";
 }
@@ -1760,41 +1540,3 @@ const char *get_estop_reason_name(const EstopReason state) {
   return "INVALID_STATE";
 }
 
-double steps_to_f64_inch(const uint32_t steps) {
-  const double motor_revs = static_cast<double>(steps)/STEPS_PER_REV;
-  const double pinion_revs = motor_revs * GEARBOX_RATIO;
-  const double teeth = pinion_revs * PINION_TEETH_PER_REV;
-  const double inches = teeth / RACK_TEETH_PER_INCH;
-  return inches;
-}
-
-uint16_t steps_to_hundreths(const uint32_t steps) {
-  const double hundreths = steps_to_f64_inch(steps) * 100;
-
-  return static_cast<uint16_t>(hundreths);
-}
-
-uint16_t steps_per_sec_to_inches_per_minute(const uint32_t steps_per_second) {
-  const double inches_per_second = steps_to_f64_inch(steps_per_second);
-  const double inches_per_minute = inches_per_second * 60;
-
-  return static_cast<uint16_t>(inches_per_minute);
-}
-
-uint16_t f64_inch_to_steps(const double inches) {
-  const double teeth = inches * RACK_TEETH_PER_INCH;
-  const double pinion_revs = teeth / PINION_TEETH_PER_REV;
-  const double motor_revs = pinion_revs / GEARBOX_RATIO;
-  const double steps = (motor_revs * STEPS_PER_REV);
-  return static_cast<uint16_t>(steps);
-}
-
-uint16_t hundreths_to_steps(const uint16_t hundreths) {
-  const double inches = static_cast<double>(hundreths) / 100.0;
-  return f64_inch_to_steps(inches);
-}
-
-uint16_t inches_per_minute_to_steps_per_sec(const uint16_t inches_per_minute) {
-  const double inches_per_second = static_cast<double>(inches_per_minute) / 60.0;
-  return f64_inch_to_steps(inches_per_second);
-}
