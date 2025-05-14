@@ -37,6 +37,8 @@
 
 // TODO: Job progress percent based on steps/total steps
 
+// TODO: Estop button during job should also pause the job
+
 
 // ModBus TCP stuff
 uint8_t mac[6] = {0x24, 0x15, 0x10, 0xB0, 0x45, 0xA4}; // MAC address is ignored but because of C++ types, you still need to give it garbage
@@ -400,8 +402,12 @@ void printIp(IPAddress ip) {
 
 bool ethernet_setup() {
   if (Ethernet.linkStatus() == EthernetLinkStatus::LinkOFF) {
-    USB_PRINTLN("Ethernet has no link, `ethernet_setup()` fails")
-    return false;
+    USB_PRINTLN("Ethernet has no link, `ethernet_setup()` fails. Trying again")
+    delay(500); // TODO: fix this
+    if (Ethernet.linkStatus() == EthernetLinkStatus::LinkOFF) {
+      USB_PRINTLN("Ethernet has no link, `ethernet_setup()` fails")
+      return false;
+    }
   }
 
   while (use_dhcp && dhcp_attempts > 0) {
