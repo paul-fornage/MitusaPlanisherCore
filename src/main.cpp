@@ -46,7 +46,7 @@ uint8_t mac[6] = {0x24, 0x15, 0x10, 0xB0, 0x45, 0xA4}; // MAC address is ignored
 EthernetTcpClient client;
 
 bool use_dhcp = true; // this will get disabled at runtime if DHCP fails `dhcp_attempts` times
-#define MAX_DHCP_ATTEMPTS 5 // how many times to try DHCP in a row before going static
+#define MAX_DHCP_ATTEMPTS 1 // how many times to try DHCP in a row before going static
 uint8_t dhcp_attempts = MAX_DHCP_ATTEMPTS; // this gets reset when DHCP is successful
 
 // not used in DHCP
