@@ -33,12 +33,9 @@
 
 // TODO: read status reg: https://teknic-inc.github.io/ClearCore-library/_clear_core_status_register_8cpp-example.html
 
-// TODO: HMI reset temp job reg to saved value. (discard/reset button)
-
-// TODO: Better indication of unsaved job changes in HMI
-
 // TODO: Job progress percent based on steps/total steps
 
+// TODO: Job struct
 
 
 
@@ -50,6 +47,7 @@ EthernetTcpClient client;
 bool use_dhcp = true; // this will get disabled at runtime if DHCP fails `dhcp_attempts` times
 #define MAX_DHCP_ATTEMPTS 1 // how many times to try DHCP in a row before going static
 uint8_t dhcp_attempts = MAX_DHCP_ATTEMPTS; // this gets reset when DHCP is successful
+#define MAX_ETHERNET_SETUP_ATTEMPTS 10 // how many times to try to setup ethernet before giving up
 
 // not used in DHCP
 const IPAddress local_ip(192, 168, 1, 17); // Local IP for non DHCP mode
@@ -74,7 +72,6 @@ MbButton HmiCommandedPosButton(CoilAddr::IS_COMMANDED_POS_LATCHED);
 MbButton HmiStartCycleButton(CoilAddr::IS_START_CYCLE_BUTTON_LATCHED);
 MbButton HmiCancelCycleButton(CoilAddr::IS_CANCEL_CYCLE_BUTTON_LATCHED);
 MbButton HmiPauseCycleButton(CoilAddr::IS_PAUSE_CYCLE_BUTTON_LATCHED);
-MbButton HmiIsResetTempJobButton(CoilAddr::IS_RESET_TEMP_JOB_LATCHED);
 
 auto fault_code = FaultCodes::None;
 
@@ -313,8 +310,18 @@ void setup() {
   // Debug delay to be able to restart motor before program starts
 //  delay(2000);
 
-  const bool eth_setup_succeed = ethernet_setup();
+  bool eth_setup_succeed = ethernet_setup();
+  uint8_t eth_attempts_remaining = MAX_ETHERNET_SETUP_ATTEMPTS;
+  while (!eth_setup_succeed && eth_attempts_remaining > 0) {
+    eth_attempts_remaining--;
+    USB_PRINT("Ethernet setup failed. ");
+    USB_PRINT(eth_attempts_remaining);
+    USB_PRINTLN(" attempts remaining");
+    delay(1);
+    eth_setup_succeed = ethernet_setup();
+  }
   USB_PRINTLN(eth_setup_succeed?"ethernet set up correctly":"ethernet link failed")
+
 
   mb.server();
   mb.onConnect(cbConn);
@@ -414,12 +421,8 @@ void printIp(IPAddress ip) {
 
 bool ethernet_setup() {
   if (Ethernet.linkStatus() == EthernetLinkStatus::LinkOFF) {
-    USB_PRINTLN("Ethernet has no link, `ethernet_setup()` fails. Trying again")
-    delay(500); // TODO: fix this
-    if (Ethernet.linkStatus() == EthernetLinkStatus::LinkOFF) {
-      USB_PRINTLN("Ethernet has no link, `ethernet_setup()` fails")
-      return false;
-    }
+    USB_PRINTLN("Ethernet has no link, `ethernet_setup()` fails")
+    return false;
   }
 
   while (use_dhcp && dhcp_attempts > 0) {
@@ -481,6 +484,13 @@ void check_modbus() {
                           || steps_to_hundreths(saved_job_park_pos) != temp_job_park_pos_hundreths);
 
   mb.Coil(CoilAddr::IS_TEMP_JOB_UNSAVED, unsaved_changes);
+
+  if (mb.Coil(CoilAddr::IS_RESET_TEMP_JOB_LATCHED)) {
+    mb.Coil(CoilAddr::IS_RESET_TEMP_JOB_LATCHED, false);
+    mb.Hreg(HregAddr::HMI_JOB_START_POS_REG_ADDR, steps_to_hundreths(saved_job_start_pos));
+    mb.Hreg(HregAddr::HMI_JOB_END_POS_REG_ADDR, steps_to_hundreths(saved_job_end_pos));
+    mb.Hreg(HregAddr::HMI_JOB_PARK_POS_REG_ADDR, steps_to_hundreths(saved_job_park_pos));
+  }
 
   mb.Hreg(HregAddr::CC_COMMANDED_POSITION_REG_ADDR, steps_to_hundreths(MOTOR_COMMANDED_POSITION));
 
@@ -1641,7 +1651,6 @@ void update_buttons() {
   mb_read_unlatch_coil(&HmiStartCycleButton);
   mb_read_unlatch_coil(&HmiCancelCycleButton);
   mb_read_unlatch_coil(&HmiPauseCycleButton);
-  mb_read_unlatch_coil(&HmiIsResetTempJobButton);
 }
 
 
