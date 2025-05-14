@@ -40,8 +40,6 @@
 
 // ModBus TCP stuff
 uint8_t mac[6] = {0x24, 0x15, 0x10, 0xB0, 0x45, 0xA4}; // MAC address is ignored but because of C++ types, you still need to give it garbage
-const IPAddress remote_ip(192, 168, 1, 100);  // Address of Modbus Slave device
-
 
 EthernetTcpClient client;
 
@@ -52,7 +50,8 @@ uint8_t dhcp_attempts = MAX_DHCP_ATTEMPTS; // this gets reset when DHCP is succe
 // not used in DHCP
 const IPAddress ip(192, 168, 1, 17); // Local IP for non DHCP mode
 
-
+// Instance will not be deleted, disabling warning
+// ReSharper disable once CppPolymorphicClassWithNonVirtualPublicDestructor
 class ModbusEthernet : public ModbusAPI<ModbusTCPTemplate<EthernetServer, EthernetClient>> {};
 ModbusEthernet mb;  //ModbusTCP object
 
