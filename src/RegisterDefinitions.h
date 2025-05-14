@@ -42,6 +42,9 @@ namespace CoilAddr {
         IS_READY_TO_HOME                = 54,    // R    Is the system ready to home
         IS_DUAL_PASS_MODE               = 55,    // W    Is the operation in dual pass mode
         IS_JOB_PAUSED                   = 56,    // R    Is the job paused
+        IS_TEMP_JOB_UNSAVED             = 57,    // R    Does the temp job have unsaved changes? (is temp job != saved job)
+        IS_RESET_TEMP_JOB_LATCHED       = 58,    // R    Latch for button that resets the temp job back to saved job values
+        IS_IDLE_STATE                   = 59,    // R    Is the machine in the idle state? Used for enabling certain button that only have an effect in idle
         NULL_TERM                                //      Final register (not included)
     };
 }
@@ -52,9 +55,9 @@ namespace HregAddr {
         CC_COMMANDED_POSITION_REG_ADDR  = 2,     // R    Position of the axis commanded by the control core
         HMI_COMMANDED_POSITION_REG_ADDR = 3,     // W    Position commanded by the HMI
         JOB_PROGRESS_REG_ADDR           = 5,     // R    The progress of the current job as a percentage
-        JOB_START_POS_REG_ADDR          = 6,     // R    The saved start position of the job
-        JOB_END_POS_REG_ADDR            = 7,     // R    The saved end position of the job
-        JOB_PARK_POS_REG_ADDR           = 8,     // R    The saved park position of the job
+        JOB_START_POS_REG_ADDR          = 6,     // R    The saved start position of the job (Hundreths)
+        JOB_END_POS_REG_ADDR            = 7,     // R    The saved end position of the job (Hundreths)
+        JOB_PARK_POS_REG_ADDR           = 8,     // R    The saved park position of the job (Hundreths)
         MIN_POS_REG_ADDR                = 9,     // R    Minimum absolute axis position
         MAX_POS_REG_ADDR                = 10,    // R    Maximum absolute axis position
         JOG_SPEED_REG_ADDR              = 11,    // R/W  Target jogging speed (hundreths/minute)

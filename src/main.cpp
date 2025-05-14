@@ -35,9 +35,11 @@
 
 // TODO: HMI reset temp job reg to saved value. (discard/reset button)
 
+// TODO: Better indication of unsaved job changes in HMI
+
 // TODO: Job progress percent based on steps/total steps
 
-// TODO: Estop button during job should also pause the job
+
 
 
 // ModBus TCP stuff
@@ -72,6 +74,7 @@ MbButton HmiCommandedPosButton(CoilAddr::IS_COMMANDED_POS_LATCHED);
 MbButton HmiStartCycleButton(CoilAddr::IS_START_CYCLE_BUTTON_LATCHED);
 MbButton HmiCancelCycleButton(CoilAddr::IS_CANCEL_CYCLE_BUTTON_LATCHED);
 MbButton HmiPauseCycleButton(CoilAddr::IS_PAUSE_CYCLE_BUTTON_LATCHED);
+MbButton HmiIsResetTempJobButton(CoilAddr::IS_RESET_TEMP_JOB_LATCHED);
 
 auto fault_code = FaultCodes::None;
 
@@ -99,9 +102,9 @@ uint32_t last_estop_millis = 0;         // Millis() value at time the last e-sto
 uint32_t homing_disable_time = 0;        // Time the motor was disabled for homing in millis
 
 // saved job values these are retrieved from NVRAM on boot or over-ridden after a learn sequence
-uint32_t saved_job_start_pos = 0;           // Start position for learn mode
-uint32_t saved_job_end_pos = 0;             // End position for learn mode
-uint32_t saved_job_park_pos = 0;            // Park position for learn mode
+uint32_t saved_job_start_pos = 0;           // Start position for learn mode (Steps)
+uint32_t saved_job_end_pos = 0;             // End position for learn mode (Steps)
+uint32_t saved_job_park_pos = 0;            // Park position for learn mode (Steps)
 
 uint8_t NV_Ram[12];                    // NVram Max Available is `416 bytes of user data
 
@@ -199,11 +202,13 @@ volatile EstopReason estop_reason = EstopReason::NONE;
 #define CCIO_TIMEOUT_MS 10000 // Number of ms to wait for CCIO to connect before failing POST
 
 #define CARRIAGE_MOTOR_MAX_ACCEL 50000
-#define CARRIAGE_MOTOR_MAX_VEL 10000
+#define CARRIAGE_MOTOR_MAX_VEL 16000
+#define CARRIAGE_MOTOR_DEFAULT_VEL 2000
 // not a safety limit, just what should the minimum position on the speed selector represent in jog mode
 #define CARRIAGE_MOTOR_MIN_VEL 200
 #define CARRIAGE_MOTOR_MAX_POS 12000
-#define CARRIAGE_MOTOR_MAX_PLANISH_VEL 4000
+#define CARRIAGE_MOTOR_MAX_PLANISH_VEL 8000
+#define CARRIAGE_MOTOR_DEFAULT_PLANISH_VEL 1000
 // not a safety limit, just what should the minimum position on the speed selector represent in planish mode
 #define CARRIAGE_MOTOR_MIN_PLANISH_VEL 100
 
@@ -327,6 +332,13 @@ void setup() {
   USB_PRINTLN(saved_job_end_pos);
   USB_PRINTLN(saved_job_park_pos);
 
+  mb.Hreg(HregAddr::JOB_START_POS_REG_ADDR, steps_to_hundreths(saved_job_start_pos));
+  mb.Hreg(HregAddr::JOB_END_POS_REG_ADDR, steps_to_hundreths(saved_job_end_pos));
+  mb.Hreg(HregAddr::JOB_PARK_POS_REG_ADDR, steps_to_hundreths(saved_job_park_pos));
+
+  mb.Hreg(HregAddr::JOG_SPEED_REG_ADDR, CARRIAGE_MOTOR_DEFAULT_VEL);
+  mb.Hreg(HregAddr::PLANISH_SPEED_REG_ADDR, CARRIAGE_MOTOR_DEFAULT_PLANISH_VEL);
+
   io_configured = configure_io();
 
   if (!io_configured) {           // if the IO failed to configure properly
@@ -351,7 +363,7 @@ void loop() {
   timeout_warning_since_last_loop = false;
   timeout_error_since_last_loop = false;
   if (ESTOP_SW.State() != ESTOP_SW_SAFE_STATE) { // make sure e-stop wasn't already depressed before interrupt was registered
-    combined_print("E-Stop button pressed, entering e-stop mode. ", 10000);
+    combined_print("E-Stop button pressed\nEntering e-stop mode. ", 10000);
     e_stop_handler(EstopReason::button);
   }
 
@@ -458,6 +470,17 @@ void check_modbus() {
   mb.Coil(CoilAddr::CC_COMMANDED_ROLLER, Head.get_commanded_state());
   mb.Coil(CoilAddr::IS_JOB_PAUSED, machine_state==PlanishState::job_paused);
   mb.Coil(CoilAddr::SHOW_MESSAGE, HmiMessage.is_active());
+  mb.Coil(CoilAddr::IS_IDLE_STATE, machine_state==PlanishState::idle);
+
+  const uint16_t temp_job_start_pos_hundreths = mb.Hreg(HregAddr::HMI_JOB_START_POS_REG_ADDR);
+  const uint16_t temp_job_end_pos_hundreths = mb.Hreg(HregAddr::HMI_JOB_END_POS_REG_ADDR);
+  const uint16_t temp_job_park_pos_hundreths = mb.Hreg(HregAddr::HMI_JOB_PARK_POS_REG_ADDR);
+
+  const bool unsaved_changes = (steps_to_hundreths(saved_job_start_pos) != temp_job_start_pos_hundreths
+                          || steps_to_hundreths(saved_job_end_pos) != temp_job_end_pos_hundreths
+                          || steps_to_hundreths(saved_job_park_pos) != temp_job_park_pos_hundreths);
+
+  mb.Coil(CoilAddr::IS_TEMP_JOB_UNSAVED, unsaved_changes);
 
   mb.Hreg(HregAddr::CC_COMMANDED_POSITION_REG_ADDR, steps_to_hundreths(MOTOR_COMMANDED_POSITION));
 
@@ -606,14 +629,14 @@ PlanishState state_machine(const PlanishState state_in) {
 
     case PlanishState::wait_for_homing:
       if (!IS_MANDREL_SAFE) {
-        combined_print("Mandrel latch became unsafe since homing. ESTOP", 2000);
+        combined_print("Mandrel latch became unsafe since homing\nESTOP", 10000);
         e_stop_handler(EstopReason::mandrel_latch);
         return PlanishState::e_stop_begin;
       }
 
       if (MOTOR_ASSERTED) {
         // homing done no errors
-        combined_print("homing complete", 2000);
+        combined_print("Homing complete", 2000);
         // the position saved in the local motor instance is not neccesarily the same of the motor FW.
         // this line ensures they are set to the same thing, but when there seems to be a rounding error between the two
         // can confirm they don't desync over the course of at least ~20,000 steps
@@ -627,7 +650,7 @@ PlanishState state_machine(const PlanishState state_in) {
           USB_PRINTLN("Motor was commanded to move before enabling."
                                 "depending on how the code turns out this might not be problematic");
         }
-        combined_print("Motor alert detected during homing HOME again to clear ESTOP", 2000);
+        combined_print("Motor alert detected during homing\nHOME again to clear ESTOP", 10000);
         print_motor_alerts();
         e_stop_handler(EstopReason::motor_error);
       }
@@ -639,10 +662,10 @@ PlanishState state_machine(const PlanishState state_in) {
           if (Head.is_fully_disengaged()) {
             return PlanishState::begin_homing;
           } else {
-            combined_print("Tried to home while head engaged", 2000);
+            combined_print("Release head/roller before homing", 2000);
           }
         } else {
-          combined_print("Tried to home without mandrel latch engaged", 2000);
+          combined_print("Secure the mandrel latch before homing", 2000);
         }
       }
 
@@ -652,10 +675,10 @@ PlanishState state_machine(const PlanishState state_in) {
             move_motor_auto_speed(hundreths_to_steps(mb.Hreg(HregAddr::HMI_COMMANDED_POSITION_REG_ADDR)));
             return PlanishState::manual_jog_absolute;
           } else {
-            combined_print("Tried to jog to position without homed", 2000);
+            combined_print("Home the carriage before jogging", 2000);
           }
         } else {
-          combined_print("Tried to jog to position without mandrel latch engaged", 2000);
+          combined_print("Secure the mandrel latch before jogging", 2000);
         }
       }
 
@@ -676,10 +699,10 @@ PlanishState state_machine(const PlanishState state_in) {
             Fingers.set_commanded_state(new_finger_state);
             return PlanishState::wait_for_fingers;
           } else {
-            combined_print("Tried to disengage fingers while head was down or lowering", 2000);
+            combined_print("Make sure head is fully up\nbefore releasing fingers", 2000);
           }
         } else {
-          combined_print("tried to engage fingers without mandrel latch engaged", 2000);
+          combined_print("Secure the mandrel latch\nbefore engaging fingers", 2000);
         }
       }
 
@@ -698,9 +721,9 @@ PlanishState state_machine(const PlanishState state_in) {
           Head.set_commanded_state(new_head_state);
           return PlanishState::wait_for_head;
         } else if (!IS_MANDREL_SAFE) {
-          combined_print("Tried to lower head while mandrel latch not engaged", 2000);
+          combined_print("Secure the mandrel latch\nbefore engaging roller", 2000);
         } else {
-          combined_print("Tried to lower head while fingers not down", 2000);
+          combined_print("Make sure the fingers are\nfully engaged before lowering head", 2000);
         }
         return PlanishState::idle;
       }
@@ -714,10 +737,10 @@ PlanishState state_machine(const PlanishState state_in) {
             // because otherwise it will put the motor FW in an error state
             return PlanishState::manual_jog;
           } else {
-            combined_print("Home axis before jogging", 2000);
+            combined_print("Home the carriage before jogging", 2000);
           }
         } else {
-          combined_print("Secure mandrel latch before jogging", 2000);
+          combined_print("Secure the mandrel latch before jogging", 2000);
         }
       }
 
@@ -726,7 +749,7 @@ PlanishState state_machine(const PlanishState state_in) {
           mb.Hreg(HregAddr::HMI_JOB_START_POS_REG_ADDR, steps_to_hundreths(MOTOR_COMMANDED_POSITION));
           combined_print("Saved start position", 1000);
         } else {
-          combined_print("Carriage still in motion, can't record start position", 2000);
+          combined_print("Carriage still in motion.\nCan't record start position", 2000);
         }
       }
       if (HmiSetJobEndButton.is_rising()) {
@@ -734,7 +757,7 @@ PlanishState state_machine(const PlanishState state_in) {
           mb.Hreg(HregAddr::HMI_JOB_END_POS_REG_ADDR, steps_to_hundreths(MOTOR_COMMANDED_POSITION));
           combined_print("Saved end position", 1000);
         } else {
-          combined_print("Carriage still in motion, can't record end position", 2000);
+          combined_print("Carriage still in motion.\nCan't record end position", 2000);
         }
       }
       if (HmiSetJobParkButton.is_rising()) {
@@ -742,23 +765,23 @@ PlanishState state_machine(const PlanishState state_in) {
           mb.Hreg(HregAddr::HMI_JOB_PARK_POS_REG_ADDR, steps_to_hundreths(MOTOR_COMMANDED_POSITION));
           combined_print("Saved park position", 1000);
         } else {
-          combined_print("Carriage still in motion, can't record park position", 2000);
+          combined_print("Carriage still in motion.\nCan't record park position", 2000);
         }
       }
       if (HmiCommitJobButton.is_rising()) {
         save_job_to_nvram();
-        combined_print("Saved job to NVRAM and memory", 3000);
+        combined_print("Saved job", 3000);
       }
 
       if (HmiStartCycleButton.is_rising()) {
         if (Fingers.is_fully_engaged() && is_homed && IS_MANDREL_SAFE) {
           return PlanishState::job_begin;
         } else if (!Fingers.is_fully_engaged()) {
-          combined_print("Tried to start cycle without fingers engaged", 2000);
+          combined_print("Make sure fingers are fully\nengaged before starting cycle", 2000);
         } else if (!is_homed){
-          combined_print("Tried to start cycle without being homed", 2000);
+          combined_print("Home carriage before starting cycle", 2000);
         } else {
-          combined_print("Tried to start cycle without Mandrel latch being engaged", 2000);
+          combined_print("Secure mandrel latch\nbefore starting cycle", 2000);
         }
       }
       return PlanishState::idle;
@@ -771,7 +794,7 @@ PlanishState state_machine(const PlanishState state_in) {
       // }
       if (!IS_MANDREL_SAFE && Head.get_commanded_state()) {
         // if the mandrel latch is not engaged and the head is being lowered
-        combined_print("Mandrel latch disengaged while head was lowering. ESTOP", 10000);
+        combined_print("Mandrel latch disengaged\nwhile head was lowering\nESTOP", 10000);
         e_stop_handler(EstopReason::mandrel_latch);
         return PlanishState::e_stop_begin;
       }
@@ -793,7 +816,7 @@ PlanishState state_machine(const PlanishState state_in) {
           Head.set_commanded_state(new_head_state);
           return PlanishState::wait_for_head;
         } else {
-          combined_print("Tried to lower head while fingers not down", 2000);
+          combined_print("Make sure fingers are fully\nengaged before lowering head", 2000);
           return PlanishState::idle;
         }
       }
@@ -808,7 +831,7 @@ PlanishState state_machine(const PlanishState state_in) {
       //   USB_PRINTLN(Fingers.get_commanded_state() ? "down." : "up.");
       // }
       if (!IS_MANDREL_SAFE) {
-        combined_print("Mandrel became unsafe while fingers were moving. ESTOP", 10000);
+        combined_print("Mandrel became unsafe\nwhile fingers were moving\nESTOP", 10000);
         e_stop_handler(EstopReason::mandrel_latch);
         return PlanishState::e_stop_begin;
       }
@@ -846,12 +869,12 @@ PlanishState state_machine(const PlanishState state_in) {
         return PlanishState::idle;
       }
       if (!IS_MANDREL_SAFE) {
-        combined_print("Mandrel unsafe while jogging! ESTOP", 2000);
+        combined_print("Mandrel unsafe while jogging.\nESTOP", 2000);
         e_stop_handler(EstopReason::mandrel_latch);
         return PlanishState::e_stop_begin;
       }
       if (!is_homed) {
-        combined_print("home axis before jogging", 2000);
+        combined_print("Home the carriage before jogging", 2000);
       }
       return PlanishState::idle;
 
@@ -878,12 +901,12 @@ PlanishState state_machine(const PlanishState state_in) {
 
         case EstopReason::button:
           if (!HmiMessage.is_active()) {
-            combined_print("E-stopped by button. Release it to resume", 2000);
+            combined_print("E-stopped by button.\nRelease it to resume", 2000);
           }
           if ((ESTOP_SW.State() == ESTOP_SW_SAFE_STATE)
               && (millis() - last_estop_millis > ESTOP_COOLDOWN_MS))
           { // if the button was released and the estop has been active for over a second
-            USB_PRINTLN("Emergency Stop Released, resuming");
+            combined_print("Emergency Stop Released, resuming", 2000);
             is_e_stop = false;
             return estop_resume_state;
           }
@@ -891,7 +914,7 @@ PlanishState state_machine(const PlanishState state_in) {
 
         case EstopReason::mandrel_latch:
           if (!HmiMessage.is_active()) {
-            combined_print("E-stopped by mandrel latch unsafe. Make sure it is secure", 2000);
+            combined_print("E-stopped by mandrel latch unsafe.\nSecure it to resume", 2000);
           }
           if ((ESTOP_SW.State() == ESTOP_SW_SAFE_STATE)
               && (millis() - last_estop_millis > ESTOP_COOLDOWN_MS)
@@ -899,7 +922,7 @@ PlanishState state_machine(const PlanishState state_in) {
           {
             // if the latch was fixed and the button hasn't been pressed,
             // and the estop was activated more than `ESTOP_COOLDOWN_MS` ago
-            combined_print("Mandrel put back, resuming", 2000);
+            combined_print("Mandrel secured, resuming", 2000);
             is_e_stop = false;
             return estop_resume_state;
           }
@@ -908,7 +931,7 @@ PlanishState state_machine(const PlanishState state_in) {
         case EstopReason::motor_error:
           if (Head.is_fully_disengaged()) {
             if (!HmiMessage.is_active()) {
-              combined_print("Motor error caused E-stop. Re-home motor to resume", 2000);
+              combined_print("E-stop caused by motor error.\nRe-home motor to resume", 2000);
             }
             if ((ESTOP_SW.State() == ESTOP_SW_SAFE_STATE)
                 && (millis() - last_estop_millis > ESTOP_COOLDOWN_MS)
@@ -917,24 +940,23 @@ PlanishState state_machine(const PlanishState state_in) {
             {
               // if the latch was fixed and the button hasn't been pressed,
               // and the estop was activated more than `ESTOP_COOLDOWN_MS` ago, AND the user is homing again
-              USB_PRINTLN("Motor error cleared by homing, resuming");
+              combined_print("Motor error cleared by homing, resuming", 2000);
               is_e_stop = false;
               return PlanishState::begin_homing; // this estop can only be recovered from if they press the home button
             }
             return PlanishState::e_stop_wait;
           } else if (!Head.get_commanded_state()) { // if the head is already raising
             if (!HmiMessage.is_active()) {
-              combined_print("Estop caused by motor error. wait for head raise and then home", 2000);
+              combined_print("Estop caused by motor error.\nwait for head raise and then home", 2000);
             }
             return PlanishState::e_stop_wait;
           } else {
             // Head is fully engaged, so the motor can't start homing yet.
             if (!HmiMessage.is_active()) {
-              combined_print("Estop caused by motor error. Raise head and then home", 2000);
+              combined_print("Estop caused by motor error.\nRaise head and then home", 2000);
             }
             if (HmiCommandedRollerUpButton.is_rising()) {
               Head.set_commanded_state(true);
-              combined_print("Raising head", 1000);
             }
             return PlanishState::error;
           }
@@ -945,7 +967,7 @@ PlanishState state_machine(const PlanishState state_in) {
     case PlanishState::error:
       fault_code = FaultCodes::Error;
       check_modbus(); // last words, if able
-      strncpy(message_buffer, "Unrecoverable error.Restart machine.estop reason: ", 50);
+      strncpy(message_buffer, "Unrecoverable error.Restart machine\nestop reason: ", 50);
       strncpy(message_buffer + 50, get_estop_reason_name(estop_reason), 14); // 14 is max length for estop reason
 
       mb.Coil(CoilAddr::IS_FAULT, true);
@@ -974,13 +996,13 @@ PlanishState state_machine(const PlanishState state_in) {
         USB_PRINTLN("Job started head was already up");
         return PlanishState::job_jog_to_start;
       }
-      combined_print("Job was started but head was already down, raising it to begin", 4000);
+      combined_print("Job was started but head was\nalready down, raising it to begin", 4000);
       return PlanishState::job_begin_lifting_head;
 
     case PlanishState::job_begin_lifting_head:
       COMMON_JOB_TASKS();
       if (!IS_MANDREL_SAFE) {
-        combined_print("mandrel limit precondition failed since starting job. ESTOP", 10000);
+        combined_print("Mandrel limit precondition\nfailed since starting job\nESTOP", 10000);
         e_stop_handler(EstopReason::mandrel_latch);
         return PlanishState::e_stop_begin;
       }
@@ -1021,7 +1043,7 @@ PlanishState state_machine(const PlanishState state_in) {
     case PlanishState::job_head_down_wait:
       COMMON_JOB_TASKS();
       if (!IS_MANDREL_SAFE) {
-        combined_print("mandrel limit precondition failed since starting job. ESTOP", 10000);
+        combined_print("Mandrel limit precondition\nfailed since starting job\nESTOP", 10000);
         e_stop_handler(EstopReason::mandrel_latch);
         return PlanishState::e_stop_begin;
       }
@@ -1044,11 +1066,11 @@ PlanishState state_machine(const PlanishState state_in) {
       MOTOR_COMMAND(CARRIAGE_MOTOR.VelMax(current_planish_speed););
       if (wait_for_motion()) {
         if (mb.Coil(CoilAddr::IS_DUAL_PASS_MODE)) {
-          combined_print("full cycle detected, do second pass", 2000);
+          combined_print("Do second pass back to start", 2000);
           // otherwise do the other pass
           return PlanishState::job_planish_to_start;
         } else {
-          combined_print("half cycle detected, raise head and go to park", 2000);
+          combined_print("Raise head and go to park", 2000);
           // if only doing a half-cycle, the single pass thus far is sufficient. retract head and return to park
           return PlanishState::job_head_up;
         }
@@ -1084,7 +1106,7 @@ PlanishState state_machine(const PlanishState state_in) {
     case PlanishState::job_head_up_wait:
       COMMON_JOB_TASKS();
       if (!IS_MANDREL_SAFE) {
-        combined_print("mandrel limit precondition failed since starting job. ESTOP", 10000);
+        combined_print("Mandrel limit precondition\nfailed since starting job\nESTOP", 10000);
         e_stop_handler(EstopReason::mandrel_latch);
         return PlanishState::e_stop_begin;
       }
@@ -1116,24 +1138,35 @@ PlanishState state_machine(const PlanishState state_in) {
     case PlanishState::job_paused:
       COMMON_JOB_TASKS();
       if (HmiStartCycleButton.is_rising()) {
-        if (Fingers.is_fully_engaged() && IS_MANDREL_SAFE) {
+        if (!IS_MANDREL_SAFE) {
+          combined_print("Secure mandrel latch\nbefore resuming cycle", 2000);
+          return PlanishState::job_paused;
+        }
+        if (Fingers.is_fully_engaged()) {
           return job_resume_state;
-        } else if (!Fingers.is_fully_engaged()) {
-          combined_print("Tried to start cycle without fingers engaged", 2000);
         } else {
-          combined_print("Tried to start cycle without mandrel safe", 2000);
+          combined_print("Make sure fingers are fully\nengaged before starting cycle", 2000);
+        }
+      }
+      if (!Fingers.get_commanded_state()) {
+        if (HmiCommandedFingersDownButton.is_rising()) {
+          if (!IS_MANDREL_SAFE) {
+            combined_print("Secure mandrel latch\nbefore engaging fingers", 2000);
+            return PlanishState::job_paused;
+          } else {
+            Fingers.set_commanded_state(true);
+          }
         }
       }
       return PlanishState::job_paused;
 
     case PlanishState::job_cancel:
-      COMMON_JOB_TASKS();
       combined_print("Job cancelled", 2000);
       MOTOR_COMMAND(CARRIAGE_MOTOR.MoveStopDecel(););
       return PlanishState::idle;
   }
   // this means the state machine did not already give a state
-  combined_print("State machine executed without returning the next state", 10000);
+  combined_print("State machine executed\nwithout returning the next state\nE-stop", 10000);
   USB_PRINT("Previous state: ");
   USB_PRINTLN(get_state_name(state_in));
   e_stop_handler(EstopReason::internal_error);
@@ -1291,7 +1324,7 @@ bool wait_for_motion() {
   }
 
   if (!IS_MANDREL_SAFE) {
-    combined_print("mandrel limit precondition failed while carriage moving. ESTOP", 10000);
+    combined_print("Mandrel limit precondition\nfailed while carriage moving\nESTOP", 10000);
     e_stop_handler(EstopReason::mandrel_latch);
   }
   return false;
@@ -1478,7 +1511,7 @@ void print_motor_alerts(){
 #ifdef TEST_MODE_DISABLE_MOTOR
   USB_PRINTLN("print_motor_alerts()");
 #else
-  combined_print("ClearPath Alerts present: ", 4000);
+  combined_print("ClearPath motor alerts present.", 4000);
   if(CARRIAGE_MOTOR.AlertReg().bit.MotionCanceledInAlert){
     USB_PRINTLN("    MotionCanceledInAlert "); }
   if(CARRIAGE_MOTOR.AlertReg().bit.MotionCanceledPositiveLimit){
@@ -1608,6 +1641,7 @@ void update_buttons() {
   mb_read_unlatch_coil(&HmiStartCycleButton);
   mb_read_unlatch_coil(&HmiCancelCycleButton);
   mb_read_unlatch_coil(&HmiPauseCycleButton);
+  mb_read_unlatch_coil(&HmiIsResetTempJobButton);
 }
 
 
@@ -1662,44 +1696,49 @@ PlanishState secure_system(const PlanishState last_state) {
       return PlanishState::idle;
 
     case PlanishState::job_begin:
-      return PlanishState::job_begin;
+      pause_job(PlanishState::job_begin);
+      return PlanishState::job_paused;
 
     case PlanishState::job_begin_lifting_head:
       // this is safe to resume, stateless
-      return PlanishState::job_begin_lifting_head;
+      pause_job(PlanishState::job_begin_lifting_head);
+      return PlanishState::job_paused;
 
     case PlanishState::job_jog_to_start:
     case PlanishState::job_jog_to_start_wait:
-      return PlanishState::job_jog_to_start;
+      pause_job(PlanishState::job_jog_to_start);
+      return PlanishState::job_paused;
 
     case PlanishState::job_head_down:
-      return PlanishState::job_head_down;
-
     case PlanishState::job_head_down_wait:
       if (Head.is_mismatch()) {
         // if there is a mismatch between the commanded state and the measured state
         Head.set_commanded_state(false); // if the head was in motion, raise it
       } // if the head was not in motion, then it's fine to keep where it is
       // resume by lowering the head again
-      return PlanishState::job_head_down;
+      pause_job(PlanishState::job_head_down);
+      return PlanishState::job_paused;
 
     case PlanishState::job_planish_to_end:
     case PlanishState::job_planish_to_end_wait:
-      return PlanishState::job_planish_to_end;
+      pause_job(PlanishState::job_planish_to_end);
+      return PlanishState::job_paused;
 
     case PlanishState::job_planish_to_start:
     case PlanishState::job_planish_to_start_wait:
-      return PlanishState::job_planish_to_start;
+      pause_job(PlanishState::job_planish_to_start);
+      return PlanishState::job_paused;
 
     case PlanishState::job_head_up:
-      return PlanishState::job_head_up;
-
     case PlanishState::job_head_up_wait:
-      return PlanishState::job_head_up_wait;
+      pause_job(PlanishState::job_head_up);
+      return PlanishState::job_paused;
 
     case PlanishState::job_jog_to_park:
     case PlanishState::job_jog_to_park_wait:
-      return PlanishState::job_jog_to_park;
+      pause_job(PlanishState::job_jog_to_park);
+      return PlanishState::job_paused;
+
     case PlanishState::job_paused:
       return PlanishState::job_paused;
     case PlanishState::job_cancel:

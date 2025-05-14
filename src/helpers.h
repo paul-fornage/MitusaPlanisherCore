@@ -9,7 +9,7 @@
 #define STEPS_PER_REV 800.0
 #define GEARBOX_RATIO 100.0 // number of input revs for one output revs
 #define RACK_TEETH_PER_INCH 4.0
-#define PINION_TEETH_PER_REV 24.0 // teeth on the pinion gear that interfaces with the rack
+#define PINION_TEETH_PER_REV 32.0 // teeth on the pinion gear that interfaces with the rack
 
 #include <cstdint>
 
