@@ -57,8 +57,8 @@ namespace HregAddr {
         JOB_PARK_POS_REG_ADDR           = 8,     // R    The saved park position of the job
         MIN_POS_REG_ADDR                = 9,     // R    Minimum absolute axis position
         MAX_POS_REG_ADDR                = 10,    // R    Maximum absolute axis position
-        JOG_SPEED_REG_ADDR              = 11,    // R/W  Target jogging speed
-        PLANISH_SPEED_REG_ADDR          = 12,    // R/W  Target planishing speed
+        JOG_SPEED_REG_ADDR              = 11,    // R/W  Target jogging speed (hundreths/minute)
+        PLANISH_SPEED_REG_ADDR          = 12,    // R/W  Target planishing speed (hundreths/minute)
         FAULT_CODE_REG_ADDR             = 13,    // R    Fault code (0 means no fault)
         HEARTBEAT_IN_REG_ADDR           = 14,    // W    Heartbeat input from HMI
         HEARTBEAT_OUT_REG_ADDR          = 15,    // R    Heartbeat output to HMI

@@ -29,9 +29,11 @@
 
 // TODO: Save translation function with register. (EG steps to inches)
 
-// TODO Register sync dev tool
+// TODO: Register sync dev tool
 
 // TODO: read status reg: https://teknic-inc.github.io/ClearCore-library/_clear_core_status_register_8cpp-example.html
+
+// TODO: HMI reset temp job reg to saved value. (discard/reset button)
 
 
 // ModBus TCP stuff
@@ -196,11 +198,11 @@ volatile EstopReason estop_reason = EstopReason::NONE;
 #define CARRIAGE_MOTOR_MAX_ACCEL 50000
 #define CARRIAGE_MOTOR_MAX_VEL 10000
 // not a safety limit, just what should the minimum position on the speed selector represent in jog mode
-#define CARRIAGE_MOTOR_MIN_VEL 100
+#define CARRIAGE_MOTOR_MIN_VEL 200
 #define CARRIAGE_MOTOR_MAX_POS 12000
 #define CARRIAGE_MOTOR_MAX_PLANISH_VEL 4000
 // not a safety limit, just what should the minimum position on the speed selector represent in planish mode
-#define CARRIAGE_MOTOR_MIN_PLANISH_VEL 25
+#define CARRIAGE_MOTOR_MIN_PLANISH_VEL 100
 
 #define ENABLE_ITERATION_TIME_CHECK
 #define ITERATION_TIME_WARNING_MS 500 // after this many milliseconds stuck on one iteration of the state machine, give a warning.
@@ -333,6 +335,7 @@ void setup() {
   update_buttons();
   update_buttons();
 
+
   last_iteration_time = millis();
   last_modbus_read = millis();
   machine_state = PlanishState::post;
@@ -457,16 +460,33 @@ void check_modbus() {
   mb.Hreg(HregAddr::FAULT_CODE_REG_ADDR, static_cast<uint16_t>(fault_code));
   mb.Hreg(HregAddr::CURRENT_STATE_REG_ADDR, static_cast<uint16_t>(machine_state));
 
-  const uint16_t planish_speed_temp = mb.Hreg(HregAddr::PLANISH_SPEED_REG_ADDR);
-  const uint16_t jog_speed_temp = mb.Hreg(HregAddr::JOG_SPEED_REG_ADDR);
-  current_planish_speed = constrain(
-    inches_per_minute_to_steps_per_sec(planish_speed_temp),
-    CARRIAGE_MOTOR_MIN_PLANISH_VEL,
-    CARRIAGE_MOTOR_MAX_PLANISH_VEL);
-  current_jog_speed = constrain(
-    inches_per_minute_to_steps_per_sec(jog_speed_temp),
-    CARRIAGE_MOTOR_MIN_VEL,
-    CARRIAGE_MOTOR_MAX_VEL);
+  const uint16_t planish_speed_temp = hundreths_per_minute_to_steps_per_sec(
+    mb.Hreg(HregAddr::PLANISH_SPEED_REG_ADDR));
+  if (planish_speed_temp < CARRIAGE_MOTOR_MIN_PLANISH_VEL) {
+    current_planish_speed = CARRIAGE_MOTOR_MIN_PLANISH_VEL;
+    mb.Hreg(HregAddr::PLANISH_SPEED_REG_ADDR,
+      steps_per_sec_to_hundreths_per_minute(CARRIAGE_MOTOR_MIN_PLANISH_VEL));
+  } else if (planish_speed_temp > CARRIAGE_MOTOR_MAX_PLANISH_VEL) {
+    current_planish_speed = CARRIAGE_MOTOR_MAX_PLANISH_VEL;
+    mb.Hreg(HregAddr::PLANISH_SPEED_REG_ADDR,
+      steps_per_sec_to_hundreths_per_minute(CARRIAGE_MOTOR_MAX_PLANISH_VEL));
+  } else {
+    mb.Hreg(HregAddr::PLANISH_SPEED_REG_ADDR, planish_speed_temp);
+  }
+
+  const uint16_t jog_speed_temp = hundreths_per_minute_to_steps_per_sec(
+    mb.Hreg(HregAddr::JOG_SPEED_REG_ADDR));
+  if (jog_speed_temp < CARRIAGE_MOTOR_MIN_VEL) {
+    current_jog_speed = CARRIAGE_MOTOR_MIN_VEL;
+    mb.Hreg(HregAddr::JOG_SPEED_REG_ADDR,
+      steps_per_sec_to_hundreths_per_minute(CARRIAGE_MOTOR_MIN_VEL));
+  } else if (jog_speed_temp > CARRIAGE_MOTOR_MAX_VEL) {
+    current_jog_speed = CARRIAGE_MOTOR_MAX_VEL;
+    mb.Hreg(HregAddr::JOG_SPEED_REG_ADDR,
+      steps_per_sec_to_hundreths_per_minute(CARRIAGE_MOTOR_MAX_VEL));
+  } else {
+    mb.Hreg(HregAddr::JOG_SPEED_REG_ADDR, jog_speed_temp);
+  }
 
   if (HmiMessage.is_active() && HmiMessage.has_been_updated()) {
     const auto values = HmiMessage.get_message_u16();

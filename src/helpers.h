@@ -19,11 +19,15 @@ uint16_t steps_to_hundreths(uint32_t steps);
 
 uint16_t steps_per_sec_to_inches_per_minute(uint32_t steps_per_second);
 
+uint16_t steps_per_sec_to_hundreths_per_minute(uint32_t steps_per_second);
+
 uint32_t f64_inch_to_steps(double inches);
 
 uint32_t hundreths_to_steps(uint16_t hundreths);
 
 uint32_t inches_per_minute_to_steps_per_sec(uint16_t inches_per_minute);
+
+uint32_t hundreths_per_minute_to_steps_per_sec(uint16_t hundreths_per_minute);
 
 void u32_to_bytes(uint32_t value, uint8_t *bytes, uint32_t offset = 0);
 
