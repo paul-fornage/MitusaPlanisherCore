@@ -43,18 +43,18 @@ uint32_t f64_inch_to_steps(const double inches) {
 
 uint32_t hundreths_to_steps(const uint16_t hundreths) {
     const double inches = (static_cast<double>(hundreths)) / 100.0;
-    return f64_inch_to_steps(round(inches));
+    return f64_inch_to_steps(inches);
 }
 
 uint32_t inches_per_minute_to_steps_per_sec(const uint16_t inches_per_minute) {
     const double inches_per_second = static_cast<double>(inches_per_minute) / 60.0;
-    return f64_inch_to_steps(round(inches_per_second));
+    return f64_inch_to_steps(inches_per_second);
 }
 
 uint32_t hundreths_per_minute_to_steps_per_sec(const uint16_t hundreths_per_minute) {
     const double inches_per_minute = static_cast<double>(hundreths_per_minute) / 100.0;
     const double inches_per_second = inches_per_minute / 60.0;
-    return f64_inch_to_steps(round(inches_per_second));
+    return f64_inch_to_steps(inches_per_second);
 }
 
 /**

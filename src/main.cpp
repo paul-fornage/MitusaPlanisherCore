@@ -27,13 +27,15 @@
 
 // TODO: logger
 
-// TODO: Save translation function with register. (EG steps to inches)
+// TODO: Save translation function with register. (EG steps to inches). Maybe even types with units? Rust momen
 
 // TODO: Register sync dev tool
 
 // TODO: read status reg: https://teknic-inc.github.io/ClearCore-library/_clear_core_status_register_8cpp-example.html
 
 // TODO: HMI reset temp job reg to saved value. (discard/reset button)
+
+// TODO: Job progress percent based on steps/total steps
 
 
 // ModBus TCP stuff
@@ -48,7 +50,7 @@ bool use_dhcp = true; // this will get disabled at runtime if DHCP fails `dhcp_a
 uint8_t dhcp_attempts = MAX_DHCP_ATTEMPTS; // this gets reset when DHCP is successful
 
 // not used in DHCP
-const IPAddress ip(192, 168, 1, 128); // Local IP for non DHCP mode
+const IPAddress ip(192, 168, 1, 17); // Local IP for non DHCP mode
 
 
 class ModbusEthernet : public ModbusAPI<ModbusTCPTemplate<EthernetServer, EthernetClient>> {};
@@ -445,7 +447,7 @@ void check_modbus() {
   mb.Coil(CoilAddr::IS_FAULT, machine_state==PlanishState::error);
 
   mb.Coil(CoilAddr::IS_E_STOP, is_e_stop);
-  mb.Coil(CoilAddr::IS_JOB_ACTIVE, job_progress(machine_state).first);
+  mb.Coil(CoilAddr::IS_JOB_ACTIVE, job_progress(machine_state).second || machine_state==PlanishState::job_paused);
 
   mb.Coil(CoilAddr::CC_COMMANDED_FINGERS, Fingers.get_commanded_state());
   mb.Coil(CoilAddr::CC_COMMANDED_ROLLER, Head.get_commanded_state());
@@ -453,39 +455,45 @@ void check_modbus() {
   mb.Coil(CoilAddr::SHOW_MESSAGE, HmiMessage.is_active());
 
   mb.Hreg(HregAddr::CC_COMMANDED_POSITION_REG_ADDR, steps_to_hundreths(MOTOR_COMMANDED_POSITION));
-  mb.Hreg(HregAddr::JOB_PROGRESS_REG_ADDR, job_progress(machine_state).second);
+
+  if (machine_state == PlanishState::job_paused) {
+    mb.Hreg(HregAddr::JOB_PROGRESS_REG_ADDR, job_progress(job_resume_state).first);
+  } else {
+    mb.Hreg(HregAddr::JOB_PROGRESS_REG_ADDR, job_progress(machine_state).first);
+  }
+
   mb.Hreg(HregAddr::JOB_START_POS_REG_ADDR, steps_to_hundreths(saved_job_start_pos));
   mb.Hreg(HregAddr::JOB_END_POS_REG_ADDR, steps_to_hundreths(saved_job_end_pos));
   mb.Hreg(HregAddr::JOB_PARK_POS_REG_ADDR, steps_to_hundreths(saved_job_park_pos));
   mb.Hreg(HregAddr::FAULT_CODE_REG_ADDR, static_cast<uint16_t>(fault_code));
   mb.Hreg(HregAddr::CURRENT_STATE_REG_ADDR, static_cast<uint16_t>(machine_state));
 
-  const uint16_t planish_speed_temp = hundreths_per_minute_to_steps_per_sec(
-    mb.Hreg(HregAddr::PLANISH_SPEED_REG_ADDR));
-  if (planish_speed_temp < CARRIAGE_MOTOR_MIN_PLANISH_VEL) {
+
+  const uint16_t planish_speed_temp_hpm /*Hundreths per minute*/ = mb.Hreg(HregAddr::PLANISH_SPEED_REG_ADDR);
+  const uint16_t planish_speed_temp_sps /*Steps per second*/ = hundreths_per_minute_to_steps_per_sec(planish_speed_temp_hpm);
+  if (planish_speed_temp_sps < CARRIAGE_MOTOR_MIN_PLANISH_VEL) {
     current_planish_speed = CARRIAGE_MOTOR_MIN_PLANISH_VEL;
     mb.Hreg(HregAddr::PLANISH_SPEED_REG_ADDR,
       steps_per_sec_to_hundreths_per_minute(CARRIAGE_MOTOR_MIN_PLANISH_VEL));
-  } else if (planish_speed_temp > CARRIAGE_MOTOR_MAX_PLANISH_VEL) {
+  } else if (planish_speed_temp_sps > CARRIAGE_MOTOR_MAX_PLANISH_VEL) {
     current_planish_speed = CARRIAGE_MOTOR_MAX_PLANISH_VEL;
     mb.Hreg(HregAddr::PLANISH_SPEED_REG_ADDR,
       steps_per_sec_to_hundreths_per_minute(CARRIAGE_MOTOR_MAX_PLANISH_VEL));
   } else {
-    mb.Hreg(HregAddr::PLANISH_SPEED_REG_ADDR, planish_speed_temp);
+    current_planish_speed = planish_speed_temp_sps;
   }
-
-  const uint16_t jog_speed_temp = hundreths_per_minute_to_steps_per_sec(
-    mb.Hreg(HregAddr::JOG_SPEED_REG_ADDR));
-  if (jog_speed_temp < CARRIAGE_MOTOR_MIN_VEL) {
+  const uint16_t jog_speed_temp_hpm /*Hundreths per minute*/ = mb.Hreg(HregAddr::JOG_SPEED_REG_ADDR);
+  const uint16_t jog_speed_temp_sps /*Steps per second*/ = hundreths_per_minute_to_steps_per_sec(jog_speed_temp_hpm);
+  if (jog_speed_temp_sps < CARRIAGE_MOTOR_MIN_VEL) {
     current_jog_speed = CARRIAGE_MOTOR_MIN_VEL;
     mb.Hreg(HregAddr::JOG_SPEED_REG_ADDR,
       steps_per_sec_to_hundreths_per_minute(CARRIAGE_MOTOR_MIN_VEL));
-  } else if (jog_speed_temp > CARRIAGE_MOTOR_MAX_VEL) {
+  } else if (jog_speed_temp_sps > CARRIAGE_MOTOR_MAX_VEL) {
     current_jog_speed = CARRIAGE_MOTOR_MAX_VEL;
     mb.Hreg(HregAddr::JOG_SPEED_REG_ADDR,
       steps_per_sec_to_hundreths_per_minute(CARRIAGE_MOTOR_MAX_VEL));
   } else {
-    mb.Hreg(HregAddr::JOG_SPEED_REG_ADDR, jog_speed_temp);
+    current_jog_speed = jog_speed_temp_sps;
   }
 
   if (HmiMessage.is_active() && HmiMessage.has_been_updated()) {
@@ -530,43 +538,43 @@ inline void combined_print(const char* message, const uint16_t time_to_print) {
 /**
  * Get the progress of the current job, if there is one
  * @param state_to_check current machine state
- * @return Pair(progress 0..2^16, is there even a job going on)
+ * @return Pair(progress 0..99, is there even a job going on)
  */
 std::pair<uint16_t, bool> job_progress(const PlanishState state_to_check) {
   uint16_t progress = 0;
   switch (state_to_check) {
     case PlanishState::job_begin:
     case PlanishState::job_begin_lifting_head:
-      progress = 2;
+      progress = 10;
       break;
     case PlanishState::job_jog_to_start:
     case PlanishState::job_jog_to_start_wait:
-      progress = 4;
+      progress = 15;
       break;
     case PlanishState::job_head_down:
     case PlanishState::job_head_down_wait:
-      progress = 6;
+      progress = 18;
       break;
     case PlanishState::job_planish_to_end:
     case PlanishState::job_planish_to_end_wait:
-      progress = 8;
+      progress = 25;
       break;
     case PlanishState::job_planish_to_start:
     case PlanishState::job_planish_to_start_wait:
-      progress = 10;
+      progress = 60;
       break;
     case PlanishState::job_head_up:
     case PlanishState::job_head_up_wait:
-      progress = 12;
+      progress = 80;
       break;
     case PlanishState::job_jog_to_park:
     case PlanishState::job_jog_to_park_wait:
-      progress = 15;
+      progress = 90;
       break;
     default:
       return std::make_pair(0, false);
   }
-  return std::make_pair(progress << 12, true);
+  return std::make_pair(progress, true);
 }
 
 PlanishState state_machine(const PlanishState state_in) {
