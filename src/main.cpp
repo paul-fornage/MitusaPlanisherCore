@@ -50,7 +50,7 @@ bool use_dhcp = true; // this will get disabled at runtime if DHCP fails `dhcp_a
 uint8_t dhcp_attempts = MAX_DHCP_ATTEMPTS; // this gets reset when DHCP is successful
 
 // not used in DHCP
-const IPAddress ip(192, 168, 1, 17); // Local IP for non DHCP mode
+const IPAddress local_ip(192, 168, 1, 17); // Local IP for non DHCP mode
 
 // Instance will not be deleted, disabling warning
 // ReSharper disable once CppPolymorphicClassWithNonVirtualPublicDestructor
@@ -425,9 +425,9 @@ bool ethernet_setup() {
       return true;
     }
   }
-  Ethernet.begin(mac, ip);
+  Ethernet.begin(mac, local_ip);
   USB_PRINT("Ethernet set up static on ");
-  printIp(ip);
+  printIp(local_ip);
   USB_PRINTLN();
   return true;
 }
