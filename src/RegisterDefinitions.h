@@ -69,10 +69,10 @@ namespace HregAddr {
         HMI_JOB_START_POS_REG_ADDR      = 17,    // W    Job start position commanded by the HMI in hundredths of an inch
         HMI_JOB_END_POS_REG_ADDR        = 18,    // W    Job end position commanded by the HMI in hundredths of an inch
         HMI_JOB_PARK_POS_REG_ADDR       = 19,    // W    Job park position commanded by the HMI in hundredths of an inch
+        CC_ITERATION_TIME_REG_ADDR      = 20,    // R    The time it takes to execute 32 cycles in microseconds (there is one mb check every 32 cycles)
         MESSAGE_START                   = 32,    // R    32 registers of UTF-8 text displayed when `SHOW_MESSAGE` is true
         MESSAGE_END                     = 63,    //      End of message registers
         NULL_TERM                                //      Final register (not included)
-
     };
 }
 

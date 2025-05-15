@@ -86,8 +86,8 @@ char message_buffer[64] = "";
 volatile bool timeout_warning_since_last_loop = false; // has a warning been printed since the last loop?
 volatile bool timeout_error_since_last_loop = false; // has an error been printed since the last loop?
 
-uint32_t last_modbus_read = 0;
-uint32_t time_since_last_modbus_read = 0;
+uint32_t last_modbus_read = 0;            // micros
+uint32_t time_since_last_modbus_read = 0; // micros
 
 int32_t current_jog_speed = 100;              // Current speed the motor should use for jogging. Steps/second
 int32_t current_planish_speed = 100;          // Current speed the motor should use for planishing. Steps/second
@@ -216,7 +216,7 @@ volatile EstopReason estop_reason = EstopReason::NONE;
 #define ITERATION_TIME_ERROR_MS 1000  // after this many milliseconds stuck on one iteration of the state machine, declare an error
 #define SERIAL_ESTABLISH_TIMEOUT 5000 // Number of ms to wait for serial to establish before failing POST
 #define HMI_CONNECTION_TRIES_BEFORE_ERROR 5
-#define MODBUS_CHECK_INTERVAL_MS 100
+#define MODBUS_CHECK_INTERVAL_US 100000
 
 /// Interrupt priority for the periodic interrupt. 0 is highest priority, 7 is lowest.
 #define PERIODIC_INTERRUPT_PRIORITY 5
@@ -369,8 +369,7 @@ void setup() {
 
 
 void loop() {
-  timeout_warning_since_last_loop = false;
-  timeout_error_since_last_loop = false;
+
   if (ESTOP_SW.State() != ESTOP_SW_SAFE_STATE) { // make sure e-stop wasn't already depressed before interrupt was registered
     combined_print("E-Stop button pressed\nEntering e-stop mode. ", 10000);
     e_stop_handler(EstopReason::button);
@@ -388,8 +387,10 @@ void loop() {
   }
   loop_num++;
 
+  // watchdog stuff
   last_iteration_time = millis();
-
+  timeout_warning_since_last_loop = false;
+  timeout_error_since_last_loop = false;
 
   mb.task();
 
@@ -401,11 +402,11 @@ void loop() {
   update_buttons();
 
 
-  time_since_last_modbus_read = millis()-last_modbus_read;
-  if (time_since_last_modbus_read > MODBUS_CHECK_INTERVAL_MS) {
+  time_since_last_modbus_read = micros()-last_modbus_read;
+  if (time_since_last_modbus_read > MODBUS_CHECK_INTERVAL_US) {
+    last_modbus_read = micros();
     check_modbus();
-    last_modbus_read = millis();
-    if (time_since_last_modbus_read > MODBUS_CHECK_INTERVAL_MS + 100) {
+    if (time_since_last_modbus_read > 2*MODBUS_CHECK_INTERVAL_US) {
       USB_PRINTLN("Modbus check falling behind interval");
     }
   }
@@ -507,7 +508,11 @@ void check_modbus() {
   mb.Hreg(HregAddr::JOB_PARK_POS_REG_ADDR, steps_to_hundreths(saved_job_park_pos));
   mb.Hreg(HregAddr::FAULT_CODE_REG_ADDR, static_cast<uint16_t>(fault_code));
   mb.Hreg(HregAddr::CURRENT_STATE_REG_ADDR, static_cast<uint16_t>(machine_state));
-
+  if (time_since_last_modbus_read >= 65536) {
+    mb.Hreg(HregAddr::CC_ITERATION_TIME_REG_ADDR, 65536);
+  } else {
+    mb.Hreg(HregAddr::CC_ITERATION_TIME_REG_ADDR, static_cast<uint16_t>(time_since_last_modbus_read));
+  }
 
   const uint16_t planish_speed_temp_hpm /*Hundreths per minute*/ = mb.Hreg(HregAddr::PLANISH_SPEED_REG_ADDR);
   const uint16_t planish_speed_temp_sps /*Steps per second*/ = hundreths_per_minute_to_steps_per_sec(planish_speed_temp_hpm);
