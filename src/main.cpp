@@ -510,6 +510,7 @@ void check_modbus() {
   mb.Hreg(HregAddr::CURRENT_STATE_REG_ADDR, static_cast<uint16_t>(machine_state));
   if (time_since_last_modbus_read >= 65536) {
     mb.Hreg(HregAddr::CC_ITERATION_TIME_REG_ADDR, 65536);
+    USB_PRINTLN("time_since_last_modbus_read was more than 2^16, clipping to send on modbus")
   } else {
     mb.Hreg(HregAddr::CC_ITERATION_TIME_REG_ADDR, static_cast<uint16_t>(time_since_last_modbus_read));
   }
