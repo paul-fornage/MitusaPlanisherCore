@@ -37,6 +37,8 @@
 
 // TODO: Job struct
 
+// TODO: iteration time metrics on modbus
+
 
 
 // ModBus TCP stuff
