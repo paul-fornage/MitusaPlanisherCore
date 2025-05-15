@@ -216,7 +216,7 @@ volatile EstopReason estop_reason = EstopReason::NONE;
 #define ITERATION_TIME_ERROR_MS 1000  // after this many milliseconds stuck on one iteration of the state machine, declare an error
 #define SERIAL_ESTABLISH_TIMEOUT 5000 // Number of ms to wait for serial to establish before failing POST
 #define HMI_CONNECTION_TRIES_BEFORE_ERROR 5
-#define MODBUS_CHECK_INTERVAL_US 100000
+#define MODBUS_CHECK_INTERVAL_US 10000
 
 /// Interrupt priority for the periodic interrupt. 0 is highest priority, 7 is lowest.
 #define PERIODIC_INTERRUPT_PRIORITY 5
