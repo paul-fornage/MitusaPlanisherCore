@@ -39,6 +39,8 @@
 
 // TODO: iteration time metrics on modbus
 
+// TODO: heartbeat is just time in, and copied to output. easy to measure time since last 'handshake'
+
 
 
 // ModBus TCP stuff
