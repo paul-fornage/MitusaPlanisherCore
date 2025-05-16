@@ -457,6 +457,17 @@ bool cbConn(IPAddress ip) {
   return true;
 }
 
+bool is_state_homing(const PlanishState state) {
+  switch (state) {
+    case PlanishState::begin_homing:
+    case PlanishState::homing_wait_for_disable:
+    case PlanishState::wait_for_homing:
+      return true;
+    default:
+      return false;
+  }
+}
+
 /**
  * Checks modbus
  * Happens after reading state from hmi, and before writing
@@ -477,6 +488,7 @@ void check_modbus() {
   mb.Coil(CoilAddr::IS_JOB_PAUSED, machine_state==PlanishState::job_paused);
   mb.Coil(CoilAddr::SHOW_MESSAGE, HmiMessage.is_active());
   mb.Coil(CoilAddr::IS_IDLE_STATE, machine_state==PlanishState::idle);
+  mb.Coil(CoilAddr::IS_HOMING, is_state_homing(machine_state));
 
   const uint16_t temp_job_start_pos_hundreths = mb.Hreg(HregAddr::HMI_JOB_START_POS_REG_ADDR);
   const uint16_t temp_job_end_pos_hundreths = mb.Hreg(HregAddr::HMI_JOB_END_POS_REG_ADDR);

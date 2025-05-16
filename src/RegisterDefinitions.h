@@ -45,6 +45,7 @@ namespace CoilAddr {
         IS_TEMP_JOB_UNSAVED             = 57,    // R    Does the temp job have unsaved changes? (is temp job != saved job)
         IS_RESET_TEMP_JOB_LATCHED       = 58,    // R    Latch for button that resets the temp job back to saved job values
         IS_IDLE_STATE                   = 59,    // R    Is the machine in the idle state? Used for enabling certain button that only have an effect in idle
+        IS_HOMING                       = 60,    // R    Is the machine homing the carriage right now
         NULL_TERM                                //      Final register (not included)
     };
 }
