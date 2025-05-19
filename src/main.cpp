@@ -39,8 +39,6 @@
 
 // TODO: iteration time metrics on modbus
 
-// TODO: heartbeat is just time in, and copied to output. easy to measure time since last 'handshake'
-
 
 
 // ModBus TCP stuff
@@ -516,6 +514,10 @@ void check_modbus() {
   } else {
     mb.Hreg(HregAddr::JOB_PROGRESS_REG_ADDR, job_progress(machine_state).first);
   }
+
+  mb.Hreg(HregAddr::HEARTBEAT_OUT_REG_ADDR,
+    mb.Hreg(HregAddr::HEARTBEAT_IN_REG_ADDR)
+    );
 
   mb.Hreg(HregAddr::JOB_START_POS_REG_ADDR, steps_to_hundreths(saved_job_start_pos));
   mb.Hreg(HregAddr::JOB_END_POS_REG_ADDR, steps_to_hundreths(saved_job_end_pos));
