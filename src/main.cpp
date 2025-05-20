@@ -39,6 +39,8 @@
 
 // TODO: iteration time metrics on modbus
 
+// TODO: should be able to jog without mandrel latch
+
 
 
 // ModBus TCP stuff
