@@ -1019,7 +1019,7 @@ PlanishState state_machine(const PlanishState state_in) {
           combined_print(message_buffer, 1000);
         }
         mb.task();
-        delay(100);
+        delay(1);
       } // </ while(true) >
       // this should obviously never be reached
       return PlanishState::error;
