@@ -609,31 +609,31 @@ std::pair<uint16_t, bool> job_progress(const PlanishState state_to_check) {
   switch (state_to_check) {
     case PlanishState::job_begin:
     case PlanishState::job_begin_lifting_head:
-      progress = 10;
+      progress = 0;
       break;
     case PlanishState::job_jog_to_start:
     case PlanishState::job_jog_to_start_wait:
-      progress = 15;
+      progress = 1;
       break;
     case PlanishState::job_head_down:
     case PlanishState::job_head_down_wait:
-      progress = 18;
+      progress = 2;
       break;
     case PlanishState::job_planish_to_end:
     case PlanishState::job_planish_to_end_wait:
-      progress = 25;
+      progress = 3;
       break;
     case PlanishState::job_planish_to_start:
     case PlanishState::job_planish_to_start_wait:
-      progress = 60;
+      progress = 4;
       break;
     case PlanishState::job_head_up:
     case PlanishState::job_head_up_wait:
-      progress = 80;
+      progress = 5;
       break;
     case PlanishState::job_jog_to_park:
     case PlanishState::job_jog_to_park_wait:
-      progress = 90;
+      progress = 6;
       break;
     default:
       return std::make_pair(0, false);
