@@ -41,6 +41,8 @@
 
 // TODO: should be able to jog without mandrel latch
 
+// TODO: Hreg for position at time of job start
+
 
 
 // ModBus TCP stuff
