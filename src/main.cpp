@@ -813,6 +813,7 @@ PlanishState state_machine(const PlanishState state_in) {
 
       if (HmiStartCycleButton.is_rising()) {
         if (Fingers.is_fully_engaged() && is_homed && IS_MANDREL_SAFE) {
+          mb.Hreg(HregAddr::JOB_PRE_START_POS_REG_ADDR, steps_to_hundreths(MOTOR_COMMANDED_POSITION));
           return PlanishState::job_begin;
         } else if (!Fingers.is_fully_engaged()) {
           combined_print("Make sure fingers are fully\nengaged before starting cycle", 2000);
@@ -1028,7 +1029,6 @@ PlanishState state_machine(const PlanishState state_in) {
 
     case PlanishState::job_begin:
       COMMON_JOB_TASKS();
-      mb.Coil(HregAddr::JOB_PRE_START_POS_REG_ADDR, steps_to_hundreths(MOTOR_COMMANDED_POSITION));
       Head.set_commanded_state(false); // head is supposed to already be raised, but this needs to be called
       // despite the sensor check in case it was in the proccess of lowering already
       if (Head.is_fully_disengaged()) {
