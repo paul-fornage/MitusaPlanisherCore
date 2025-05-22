@@ -1028,6 +1028,7 @@ PlanishState state_machine(const PlanishState state_in) {
 
     case PlanishState::job_begin:
       COMMON_JOB_TASKS();
+      mb.Coil(HregAddr::JOB_PRE_START_POS_REG_ADDR, steps_to_hundreths(MOTOR_COMMANDED_POSITION));
       Head.set_commanded_state(false); // head is supposed to already be raised, but this needs to be called
       // despite the sensor check in case it was in the proccess of lowering already
       if (Head.is_fully_disengaged()) {
