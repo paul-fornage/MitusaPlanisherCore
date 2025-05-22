@@ -41,7 +41,7 @@
 
 // TODO: should be able to jog without mandrel latch
 
-// TODO: Hreg for position at time of job start
+// TODO: Change speeds during job
 
 
 
@@ -171,6 +171,7 @@ volatile EstopReason estop_reason = EstopReason::NONE;
 #ifdef TEST_MODE_DISABLE_MOTOR
 // Wrapper for commands to the motor that will print them instead if motor is disabled for test mode
 #define MOTOR_COMMAND(code) USB_PRINTLN(#code)
+#define MOTOR_SET_VEL_MAX(expr) USB_PRINTLN("MOTOR_SET_VEL_MAX(" #expr ")")"
 #define MOTOR_ASSERTED true
 #define MOTOR_HAS_ERRORS false
 #define MOTOR_ERROR_COMMANDED_WHEN_DISABLED false
@@ -178,14 +179,17 @@ volatile EstopReason estop_reason = EstopReason::NONE;
 #define MOTOR_COMMANDED_POSITION 0
 #else
 // Wrapper for commands to the motor that will print them instead if motor is disabled for test mode
+#define CARRIAGE_MOTOR ConnectorM0
+
 #define MOTOR_COMMAND(code) code
+#define MOTOR_SET_VEL_MAX(expr) CARRIAGE_MOTOR.VelMax(expr)
 #define MOTOR_ASSERTED (CARRIAGE_MOTOR.HlfbState() == MotorDriver::HLFB_ASSERTED)
 #define MOTOR_HAS_ERRORS (CARRIAGE_MOTOR.StatusReg().bit.AlertsPresent)
 #define MOTOR_ERROR_COMMANDED_WHEN_DISABLED (CARRIAGE_MOTOR.AlertReg().bit.MotionCanceledMotorDisabled)
 #define MOTOR_STEPS_COMPLETE CARRIAGE_MOTOR.StepsComplete()
 #define MOTOR_COMMANDED_POSITION CARRIAGE_MOTOR.PositionRefCommanded()
 
-#define CARRIAGE_MOTOR ConnectorM0
+
 #endif
 
 #define ESTOP_SW ConnectorA12
@@ -1064,7 +1068,7 @@ PlanishState state_machine(const PlanishState state_in) {
 
     case PlanishState::job_jog_to_start_wait:
       COMMON_JOB_TASKS();
-      MOTOR_COMMAND(CARRIAGE_MOTOR.VelMax(current_jog_speed););
+      MOTOR_SET_VEL_MAX(current_jog_speed);
       if (wait_for_motion()) {
         return PlanishState::job_head_down;
       }
@@ -1102,7 +1106,7 @@ PlanishState state_machine(const PlanishState state_in) {
 
     case PlanishState::job_planish_to_end_wait:
       COMMON_JOB_TASKS();
-      MOTOR_COMMAND(CARRIAGE_MOTOR.VelMax(current_planish_speed););
+      MOTOR_SET_VEL_MAX(current_planish_speed);
       if (wait_for_motion()) {
         if (mb.Coil(CoilAddr::IS_DUAL_PASS_MODE)) {
           combined_print("Do second pass back to start", 2000);
@@ -1127,7 +1131,7 @@ PlanishState state_machine(const PlanishState state_in) {
 
     case PlanishState::job_planish_to_start_wait:
       COMMON_JOB_TASKS();
-      MOTOR_COMMAND(CARRIAGE_MOTOR.VelMax(current_planish_speed););
+      MOTOR_SET_VEL_MAX(current_planish_speed);
       if (wait_for_motion()) {
         return PlanishState::job_head_up;
       }
@@ -1165,7 +1169,7 @@ PlanishState state_machine(const PlanishState state_in) {
 
     case PlanishState::job_jog_to_park_wait:
       COMMON_JOB_TASKS();
-      MOTOR_COMMAND(CARRIAGE_MOTOR.VelMax(current_jog_speed););
+      MOTOR_SET_VEL_MAX(current_jog_speed);
       if (wait_for_motion()) {
         return PlanishState::idle;
       }
@@ -1333,7 +1337,7 @@ bool configure_io() {
   MOTOR_COMMAND(CARRIAGE_MOTOR.HlfbMode(MotorDriver::HLFB_MODE_HAS_BIPOLAR_PWM););
   MOTOR_COMMAND(CARRIAGE_MOTOR.HlfbCarrier(MotorDriver::HLFB_CARRIER_482_HZ););
 
-  MOTOR_COMMAND(CARRIAGE_MOTOR.VelMax(current_jog_speed););
+  MOTOR_SET_VEL_MAX(current_jog_speed);
   MOTOR_COMMAND(CARRIAGE_MOTOR.AccelMax(CARRIAGE_MOTOR_MAX_ACCEL););
 
 
@@ -1621,7 +1625,7 @@ bool move_motor_with_speed(const int32_t position, const int32_t speed) {
   USB_PRINT(", ");
   USB_PRINT(speed);
   USB_PRINT(");");
-  MOTOR_COMMAND(CARRIAGE_MOTOR.VelMax(speed););
+  MOTOR_SET_VEL_MAX(speed);
   return MOTOR_COMMAND(CARRIAGE_MOTOR.Move(position, StepGenerator::MOVE_TARGET_ABSOLUTE););
 }
 
@@ -1635,7 +1639,7 @@ bool move_motor_auto_speed(const int32_t position) {
   USB_PRINT(position);
   USB_PRINT(");");
   const int32_t speed = Head.is_fully_disengaged() ? current_jog_speed : current_planish_speed;
-  MOTOR_COMMAND(CARRIAGE_MOTOR.VelMax(speed););
+  MOTOR_SET_VEL_MAX(speed);
   return MOTOR_COMMAND(CARRIAGE_MOTOR.Move(position, StepGenerator::MOVE_TARGET_ABSOLUTE););
 }
 
