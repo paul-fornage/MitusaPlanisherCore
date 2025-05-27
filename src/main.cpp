@@ -39,8 +39,6 @@
 
 // TODO: iteration time metrics on modbus
 
-// TODO: should be able to jog without mandrel latch
-
 // TODO: Change speeds during job
 
 
@@ -712,15 +710,11 @@ PlanishState state_machine(const PlanishState state_in) {
       }
 
       if (HmiCommandedPosButton.is_rising()) {
-        if (IS_MANDREL_SAFE) {
-          if (is_homed) {
-            move_motor_auto_speed(hundreths_to_steps(mb.Hreg(HregAddr::HMI_COMMANDED_POSITION_REG_ADDR)));
-            return PlanishState::manual_jog_absolute;
-          } else {
-            combined_print("Home the carriage before jogging", 2000);
-          }
+        if (is_homed) {
+          move_motor_auto_speed(hundreths_to_steps(mb.Hreg(HregAddr::HMI_COMMANDED_POSITION_REG_ADDR)));
+          return PlanishState::manual_jog_absolute;
         } else {
-          combined_print("Secure the mandrel latch before jogging", 2000);
+          combined_print("Home the carriage before jogging", 2000);
         }
       }
 
@@ -771,18 +765,14 @@ PlanishState state_machine(const PlanishState state_in) {
       }
 
       if (IS_JOG_FWD_ACTIVE || IS_JOG_REV_ACTIVE) {
-        if (IS_MANDREL_SAFE) {
-          if (is_homed) {
-            // This is weird, while there is nothing that depends on the motor's absolute position for this,
-            // it needs to be enabled, and enabling is what starts the homing process.
-            // in this sense, `is_homed` is just checking if the motor is enabled,
-            // because otherwise it will put the motor FW in an error state
-            return PlanishState::manual_jog;
-          } else {
-            combined_print("Home the carriage before jogging", 2000);
-          }
+        if (is_homed) {
+          // This is weird, while there is nothing that depends on the motor's absolute position for this,
+          // it needs to be enabled, and enabling is what starts the homing process.
+          // in this sense, `is_homed` is just checking if the motor is enabled,
+          // because otherwise it will put the motor FW in an error state
+          return PlanishState::manual_jog;
         } else {
-          combined_print("Secure the mandrel latch before jogging", 2000);
+          combined_print("Home the carriage before jogging", 2000);
         }
       }
 
@@ -899,7 +889,7 @@ PlanishState state_machine(const PlanishState state_in) {
       return PlanishState::wait_for_fingers;
 
     case PlanishState::manual_jog:
-      if (IS_MANDREL_SAFE && is_homed) {
+      if (is_homed) {
         if (IS_JOG_FWD_ACTIVE) {
           motor_jog(false);
           return PlanishState::manual_jog;
@@ -910,11 +900,6 @@ PlanishState state_machine(const PlanishState state_in) {
         }
         MOTOR_COMMAND(CARRIAGE_MOTOR.MoveStopDecel(););
         return PlanishState::idle;
-      }
-      if (!IS_MANDREL_SAFE) {
-        combined_print("Mandrel unsafe while jogging.\nESTOP", 2000);
-        e_stop_handler(EstopReason::mandrel_latch);
-        return PlanishState::e_stop_begin;
       }
       if (!is_homed) {
         combined_print("Home the carriage before jogging", 2000);
@@ -1364,11 +1349,6 @@ bool wait_for_motion() {
     print_motor_alerts();
     e_stop_handler(EstopReason::motor_error);
     return false;
-  }
-
-  if (!IS_MANDREL_SAFE) {
-    combined_print("Mandrel limit precondition\nfailed while carriage moving\nESTOP", 10000);
-    e_stop_handler(EstopReason::mandrel_latch);
   }
   return false;
 }
