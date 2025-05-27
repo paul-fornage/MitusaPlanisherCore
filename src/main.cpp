@@ -33,8 +33,6 @@
 
 // TODO: read status reg: https://teknic-inc.github.io/ClearCore-library/_clear_core_status_register_8cpp-example.html
 
-// TODO: Job progress percent based on steps/total steps
-
 // TODO: Job struct
 
 // TODO: iteration time metrics on modbus
