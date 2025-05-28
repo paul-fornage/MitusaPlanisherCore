@@ -61,3 +61,43 @@ bool SensedActuator::is_fully_engaged() const {
 bool SensedActuator::is_fully_disengaged() const {
     return !this->get_commanded_state() && !get_measured_state();
 }
+
+
+DelayedActuator::DelayedActuator(uint16_t rising_delay_ms, uint16_t falling_delay_ms)
+    : rising_delay_ms(rising_delay_ms), falling_delay_ms(falling_delay_ms) {
+}
+
+bool DelayedActuator::set_commanded_state(const bool new_state) {
+    if (commanded_state == new_state) {return true;}
+    if (actuator_pin == nullptr) {return false;}
+    commanded_state = new_state;
+    actuator_pin->State(new_state != actuator_inverted);
+    time_remaining_ms = new_state ? rising_delay_ms : falling_delay_ms;
+    return true;
+}
+
+bool DelayedActuator::get_measured_state() const {
+    const bool done_with_travel = (time_remaining_ms == 0);
+    return commanded_state ^ (!done_with_travel);
+}
+
+bool DelayedActuator::is_mismatch() const {
+    return time_remaining_ms == 0;
+}
+
+bool DelayedActuator::is_sensed() const {
+    return false;
+}
+
+bool DelayedActuator::is_fully_engaged() const {
+    return this->get_commanded_state() && get_measured_state();
+}
+bool DelayedActuator::is_fully_disengaged() const {
+    return !this->get_commanded_state() && !get_measured_state();
+}
+
+void DelayedActuator::tick() volatile {
+    if (time_remaining_ms > 0) {
+        time_remaining_ms--;
+    }
+}

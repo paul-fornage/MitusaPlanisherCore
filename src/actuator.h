@@ -14,7 +14,7 @@ public:
      * Sets the commanded state
      * @return True for success. Only failure mode is pins being uninitialized
      */
-    bool set_commanded_state(bool new_state);
+    virtual bool set_commanded_state(bool new_state);
 
     /**
      * Gets the last commanded state
@@ -69,6 +69,39 @@ public:
 private:
     Connector* sense_pin{nullptr};
     bool sensor_inverted{false};
+};
+
+class DelayedActuator final : public Actuator {
+public:
+    explicit DelayedActuator(uint16_t rising_delay_ms = 0, uint16_t falling_delay_ms = 0);
+
+    /**
+     * Gets the measured state. Returns false if the sense pin has not been initialized
+     * @return the measured state, or false if the sense pin has not been initialized
+     */
+    bool get_measured_state() const;
+
+    bool set_commanded_state(bool new_state) override;
+
+
+    /**
+     * checks if the commanded state does not equal the measured state
+     * @return get_commanded_state() != get_measured_state()
+     */
+    bool is_mismatch() const override;
+
+    bool is_sensed() const override;
+
+    bool is_fully_engaged() const override;
+
+    bool is_fully_disengaged() const override;
+
+    void tick() volatile;
+
+private:
+    volatile uint16_t time_remaining_ms{0};
+    uint16_t rising_delay_ms;
+    uint16_t falling_delay_ms;
 };
 
 #endif //ACTUATOR_H
