@@ -167,7 +167,7 @@ volatile EstopReason estop_reason = EstopReason::NONE;
 #ifdef TEST_MODE_DISABLE_MOTOR
 // Wrapper for commands to the motor that will print them instead if motor is disabled for test mode
 #define MOTOR_COMMAND(code) USB_PRINTLN(#code)
-#define MOTOR_SET_VEL_MAX(expr) USB_PRINTLN("MOTOR_SET_VEL_MAX(" #expr ")")"
+#define MOTOR_SET_VEL_MAX(expr) USB_PRINTLN("MOTOR_SET_VEL_MAX(" #expr ")")
 #define MOTOR_ASSERTED true
 #define MOTOR_HAS_ERRORS false
 #define MOTOR_ERROR_COMMANDED_WHEN_DISABLED false
@@ -528,7 +528,7 @@ void check_modbus() {
   mb.Hreg(HregAddr::FAULT_CODE_REG_ADDR, static_cast<uint16_t>(fault_code));
   mb.Hreg(HregAddr::CURRENT_STATE_REG_ADDR, static_cast<uint16_t>(machine_state));
   if (time_since_last_modbus_read >= 65536) {
-    mb.Hreg(HregAddr::CC_ITERATION_TIME_REG_ADDR, 65536);
+    mb.Hreg(HregAddr::CC_ITERATION_TIME_REG_ADDR, 65535);
     USB_PRINTLN("time_since_last_modbus_read was more than 2^16, clipping to send on modbus")
   } else {
     mb.Hreg(HregAddr::CC_ITERATION_TIME_REG_ADDR, static_cast<uint16_t>(time_since_last_modbus_read));
