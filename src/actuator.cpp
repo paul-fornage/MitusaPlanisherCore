@@ -103,7 +103,7 @@ void DelayedActuator::tick() volatile {
     }
 }
 
-// TODO: This is a copy paste of the prev impl. Add the 'sensed' part
+
 DelayedSensedActuator::DelayedSensedActuator(const uint16_t rising_delay_ms, const uint16_t falling_delay_ms)
     : rising_delay_ms(rising_delay_ms), falling_delay_ms(falling_delay_ms) {
 }
@@ -139,6 +139,8 @@ bool DelayedSensedActuator::is_fully_disengaged() const {
 
 void DelayedSensedActuator::tick() volatile {
     if (time_remaining_ms > 0) {
-        time_remaining_ms--;
+        if (sense_pin == nullptr || ((sense_pin->State() ^ sensor_inverted) == commanded_state)) {
+            time_remaining_ms--;
+        }
     }
 }
