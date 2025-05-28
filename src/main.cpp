@@ -46,7 +46,7 @@ uint8_t mac[6] = {0x24, 0x15, 0x10, 0xB0, 0x45, 0xA4}; // MAC address is ignored
 
 EthernetTcpClient client;
 
-bool use_dhcp = true; // this will get disabled at runtime if DHCP fails `dhcp_attempts` times
+bool use_dhcp = false; // this will get disabled at runtime if DHCP fails `dhcp_attempts` times
 #define MAX_DHCP_ATTEMPTS 1 // how many times to try DHCP in a row before going static
 uint8_t dhcp_attempts = MAX_DHCP_ATTEMPTS; // this gets reset when DHCP is successful
 #define MAX_ETHERNET_SETUP_ATTEMPTS 10 // how many times to try to setup ethernet before giving up
@@ -323,7 +323,7 @@ void setup() {
     USB_PRINT("Ethernet setup failed. ");
     USB_PRINT(eth_attempts_remaining);
     USB_PRINTLN(" attempts remaining");
-    delay(1);
+    delay(10);
     eth_setup_succeed = ethernet_setup();
   }
   USB_PRINTLN(eth_setup_succeed?"ethernet set up correctly":"ethernet link failed")
@@ -428,8 +428,7 @@ void printIp(IPAddress ip) {
 
 bool ethernet_setup() {
   if (Ethernet.linkStatus() == EthernetLinkStatus::LinkOFF) {
-    USB_PRINTLN("Ethernet has no link, `ethernet_setup()` fails")
-    return false;
+    USB_PRINTLN("Ethernet has no link, tentatively continuing")
   }
 
   while (use_dhcp && dhcp_attempts > 0) {
