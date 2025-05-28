@@ -48,7 +48,7 @@ uint8_t mac[6] = {0x24, 0x15, 0x10, 0xB0, 0x45, 0xA4}; // MAC address is ignored
 
 EthernetTcpClient client;
 
-bool use_dhcp = true; // this will get disabled at runtime if DHCP fails `dhcp_attempts` times
+bool use_dhcp = false; // this will get disabled at runtime if DHCP fails `dhcp_attempts` times
 #define MAX_DHCP_ATTEMPTS 1 // how many times to try DHCP in a row before going static
 uint8_t dhcp_attempts = MAX_DHCP_ATTEMPTS; // this gets reset when DHCP is successful
 #define MAX_ETHERNET_SETUP_ATTEMPTS 10 // how many times to try to setup ethernet before giving up
@@ -169,7 +169,7 @@ volatile EstopReason estop_reason = EstopReason::NONE;
 #ifdef TEST_MODE_DISABLE_MOTOR
 // Wrapper for commands to the motor that will print them instead if motor is disabled for test mode
 #define MOTOR_COMMAND(code) USB_PRINTLN(#code)
-#define MOTOR_SET_VEL_MAX(expr) USB_PRINTLN("MOTOR_SET_VEL_MAX(" #expr ")")"
+#define MOTOR_SET_VEL_MAX(expr) USB_PRINTLN("MOTOR_SET_VEL_MAX(" #expr ")")
 #define MOTOR_ASSERTED true
 #define MOTOR_HAS_ERRORS false
 #define MOTOR_ERROR_COMMANDED_WHEN_DISABLED false
@@ -325,7 +325,7 @@ void setup() {
     USB_PRINT("Ethernet setup failed. ");
     USB_PRINT(eth_attempts_remaining);
     USB_PRINTLN(" attempts remaining");
-    delay(1);
+    delay(10);
     eth_setup_succeed = ethernet_setup();
   }
   USB_PRINTLN(eth_setup_succeed?"ethernet set up correctly":"ethernet link failed")
@@ -430,8 +430,7 @@ void printIp(IPAddress ip) {
 
 bool ethernet_setup() {
   if (Ethernet.linkStatus() == EthernetLinkStatus::LinkOFF) {
-    USB_PRINTLN("Ethernet has no link, `ethernet_setup()` fails")
-    return false;
+    USB_PRINTLN("Ethernet has no link, tentatively continuing")
   }
 
   while (use_dhcp && dhcp_attempts > 0) {
@@ -531,7 +530,7 @@ void check_modbus() {
   mb.Hreg(HregAddr::FAULT_CODE_REG_ADDR, static_cast<uint16_t>(fault_code));
   mb.Hreg(HregAddr::CURRENT_STATE_REG_ADDR, static_cast<uint16_t>(machine_state));
   if (time_since_last_modbus_read >= 65536) {
-    mb.Hreg(HregAddr::CC_ITERATION_TIME_REG_ADDR, 65536);
+    mb.Hreg(HregAddr::CC_ITERATION_TIME_REG_ADDR, 65535);
     USB_PRINTLN("time_since_last_modbus_read was more than 2^16, clipping to send on modbus")
   } else {
     mb.Hreg(HregAddr::CC_ITERATION_TIME_REG_ADDR, static_cast<uint16_t>(time_since_last_modbus_read));
