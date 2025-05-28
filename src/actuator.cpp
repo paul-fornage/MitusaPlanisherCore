@@ -108,6 +108,15 @@ DelayedSensedActuator::DelayedSensedActuator(const uint16_t rising_delay_ms, con
     : rising_delay_ms(rising_delay_ms), falling_delay_ms(falling_delay_ms) {
 }
 
+DelayedSensedActuator::DelayedSensedActuator(const uint16_t delay_ms)
+    : rising_delay_ms(delay_ms), falling_delay_ms(delay_ms) {
+}
+
+void DelayedSensedActuator::set_sense_pin(Connector* sense_pin_in, const bool inverted) {
+    this->sensor_inverted = inverted;
+    this->sense_pin = sense_pin_in;
+}
+
 bool DelayedSensedActuator::set_commanded_state(const bool new_state) {
     if (commanded_state == new_state) {return true;}
     if (actuator_pin == nullptr) {return false;}

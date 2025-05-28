@@ -45,7 +45,7 @@ protected:
 class SensedActuator final : public Actuator {
 public:
     SensedActuator() = default;
-    void set_sense_pin(Connector* sense_pin, bool inverted = false);
+    void set_sense_pin(Connector* sense_pin_in, bool inverted = false);
 
     /**
      * Gets the measured state. Returns false if the sense pin has not been initialized
@@ -104,11 +104,18 @@ private:
     uint16_t falling_delay_ms;
 };
 
+/**
+ * Works like sensed actuator, but assumes it takes some amount of time after sensor changes to new commanded
+ * position for actuator to be fully engaged or disengaged.
+ *
+ * Like the head sensor will reach the 'engaged' sensor position before it is fully pressurized
+ */
 class DelayedSensedActuator final : public Actuator {
 public:
     explicit DelayedSensedActuator(uint16_t rising_delay_ms = 0, uint16_t falling_delay_ms = 0);
+    explicit DelayedSensedActuator(uint16_t delay_ms = 0);
 
-    void set_sense_pin(Connector* sense_pin, bool inverted = false);
+    void set_sense_pin(Connector* sense_pin_in, bool inverted = false);
 
     /**
      * Gets the measured state. Returns false if the sense pin has not been initialized
