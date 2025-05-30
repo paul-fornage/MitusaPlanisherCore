@@ -240,7 +240,11 @@ volatile EstopReason estop_reason = EstopReason::NONE;
 #define PERIODIC_INTERRUPT_PRIORITY 5
 
 #define ESTOP_COOLDOWN_MS 1000
-#define ESTOP_SW_SAFE_STATE 1
+#ifdef HEADLESS_TESTING
+  #define ESTOP_SW_SAFE_STATE 0
+#else
+  #define ESTOP_SW_SAFE_STATE 1
+#endif
 #define MANDREL_LATCH_LMT_SAFE_STATE 1 // MANDREL_LATCH_LMT.State() should return this when it's safe/down/engaged
 #define IS_MANDREL_SAFE (MANDREL_LATCH_LMT.State() == MANDREL_LATCH_LMT_SAFE_STATE)
 
