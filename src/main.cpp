@@ -168,7 +168,7 @@ volatile EstopReason estop_reason = EstopReason::NONE;
 /**
  * Enable this if CC has no IO attached. Used for at-home testing and disables all checks
  */
-#define HEADLESS_TESTING
+// #define HEADLESS_TESTING
 
 #ifdef HEADLESS_TESTING
   #ifndef TEST_MODE_DISABLE_MOTOR
