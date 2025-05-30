@@ -10,8 +10,6 @@
 #include "actuator.h"
 #include "FaultCodes.h"
 #include <Ethernet.h>       // Ethernet library v2 is required
-#define MODBUSIP_TIMEOUT 100
-#define MODBUSIP_MAX_READMS 50
 #include <ModbusAPI.h>
 #include <ModbusTCPTemplate.h>
 #include <utility>
@@ -52,7 +50,8 @@ bool use_dhcp = false; // this will get disabled at runtime if DHCP fails `dhcp_
 #define MAX_DHCP_ATTEMPTS 1 // how many times to try DHCP in a row before going static
 uint8_t dhcp_attempts = MAX_DHCP_ATTEMPTS; // this gets reset when DHCP is successful
 #define MAX_ETHERNET_SETUP_ATTEMPTS 10 // how many times to try to setup ethernet before giving up
-
+#define MODBUSIP_TIMEOUT 100
+#define MODBUSIP_MAX_READMS 50
 // not used in DHCP
 const IPAddress local_ip(192, 168, 1, 17); // Local IP for non DHCP mode
 
