@@ -165,6 +165,18 @@ volatile EstopReason estop_reason = EstopReason::NONE;
  */
 // #define TEST_MODE_DISABLE_MOTOR
 
+/**
+ * Enable this if CC has no IO attached. Used for at-home testing and disables all checks
+ */
+#define HEADLESS_TESTING
+
+#ifdef HEADLESS_TESTING
+  #ifndef TEST_MODE_DISABLE_MOTOR
+    #define TEST_MODE_DISABLE_MOTOR
+  #endif
+  #warning "HEADLESS MODE IS ON!! DO NOT USE WITH REAL IO!!"
+#endif
+
 
 #ifdef TEST_MODE_DISABLE_MOTOR
 // Wrapper for commands to the motor that will print them instead if motor is disabled for test mode
@@ -1274,6 +1286,7 @@ bool configure_io() {
 
   AdcMgr.AdcResolution(ADC_RES_BITS);
 
+#ifndef HEADLESS_TESTING
   CCIO1.Mode(Connector::CCIO);
   CCIO1.PortOpen();
 
@@ -1282,6 +1295,7 @@ bool configure_io() {
     USB_PRINTLN("The CCIO-8 link is broken!");
 
     while (CcioMgr.LinkBroken() && Milliseconds() - lastStatusTime < CCIO_TIMEOUT_MS) {
+      // TODO: Not a fan of halting main loop execution for this. Maybe just call an error state after 200ms
       if (Milliseconds() - lastStatusTime > 1000) {
         USB_PRINTLN("The CCIO-8 link is still broken!");
         lastStatusTime = Milliseconds();
@@ -1306,14 +1320,12 @@ bool configure_io() {
 
   Fingers.set_actuator_pin(CcioMgr.PinByIndex(FINGER_ACTUATION));
   Fingers.set_sense_pin(&FINGER_DOWN_LMT);
-  Fingers.set_commanded_state(false);
-//  Fingers.set_commanded_state(Fingers.get_measured_state());
-  // TODO: what is the desired behavior for finger and head state on boot
+  Fingers.set_commanded_state(false); // <- this is assuming we are recovering from a power loss,
+                                      // in which case it should match the solenoid's passive state
   Head.set_actuator_pin(CcioMgr.PinByIndex(HEAD_ACTUATION));
   Head.set_sense_pin(&HEAD_UP_LMT, true);
-//  Head.set_commanded_state(Head.get_measured_state());
   Head.set_commanded_state(false);
-
+#endif HEADLESS_TESTING
 
   MOTOR_COMMAND(MotorMgr.MotorInputClocking(MotorManager::CLOCK_RATE_NORMAL););
   MOTOR_COMMAND(MotorMgr.MotorModeSet(MotorManager::MOTOR_ALL, Connector::CPM_MODE_STEP_AND_DIR););
