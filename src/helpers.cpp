@@ -3,7 +3,7 @@
 //
 
 #include "helpers.h"
-#include "arduino.h"
+#include "Arduino.h"
 
 double steps_to_f64_inch(const uint32_t steps) {
     const double motor_revs = static_cast<double>(steps)/STEPS_PER_REV;
