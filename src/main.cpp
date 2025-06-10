@@ -37,8 +37,6 @@
 
 // TODO: Change speeds during job
 
-// TODO: unlatch vars set during estop so they aren't triggered on recover
-
 
 
 // ModBus TCP stuff

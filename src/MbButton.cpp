@@ -2,7 +2,7 @@
 // Created by paulw on 5/12/2025.
 //
 
-#include "mbButton.h"
+#include "MbButton.h"
 
 MbButton::MbButton(const uint16_t address)
     : last_state(false),
