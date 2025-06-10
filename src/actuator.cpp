@@ -12,10 +12,7 @@ bool Actuator::get_commanded_state() const {
     return commanded_state;
 }
 
-void Actuator::set_actuator_pin(Connector* actuator_pin_in) {
-    this->actuator_pin = actuator_pin_in;
-}
-
+// BlindActuator implementation
 void Actuator::set_actuator_pin(Connector* actuator_pin_in, const bool inverted) {
     this->actuator_inverted = inverted;
     this->actuator_pin = actuator_pin_in;
@@ -69,10 +66,6 @@ bool SensedActuator::is_fully_disengaged() const {
 
 DelayedActuator::DelayedActuator(const uint16_t rising_delay_ms, const uint16_t falling_delay_ms)
     : rising_delay_ms(rising_delay_ms), falling_delay_ms(falling_delay_ms) {
-}
-
-DelayedActuator::DelayedActuator(const uint16_t delay_ms)
-    : rising_delay_ms(delay_ms), falling_delay_ms(delay_ms) {
 }
 
 bool DelayedActuator::set_commanded_state(const bool new_state) {
@@ -154,70 +147,6 @@ bool DelayedSensedActuator::is_fully_disengaged() const {
 }
 
 void DelayedSensedActuator::tick() volatile {
-    if (time_remaining_ms > 0) {
-        if (sense_pin == nullptr || ((sense_pin->State() ^ sensor_inverted) == commanded_state)) {
-            time_remaining_ms--;
-        }
-    }
-}
-
-
-
-
-
-DelayedSensedPairActuator::DelayedSensedPairActuator(const uint16_t rising_delay_ms, const uint16_t falling_delay_ms)
-    : rising_delay_ms(rising_delay_ms), falling_delay_ms(falling_delay_ms) {
-}
-
-DelayedSensedPairActuator::DelayedSensedPairActuator(const uint16_t delay_ms)
-    : rising_delay_ms(delay_ms), falling_delay_ms(delay_ms) {
-}
-
-void DelayedSensedPairActuator::set_sense_pin(Connector* sense_pin_in, const bool inverted) {
-    this->sensor_inverted = inverted;
-    this->sense_pin = sense_pin_in;
-}
-
-void DelayedSensedPairActuator::set_deactuator_pin(Connector* deactuator_pin_in) {
-    this->deactuator_pin = deactuator_pin_in;
-}
-
-void DelayedSensedPairActuator::set_deactuator_pin(Connector* deactuator_pin_in, const bool inverted) {
-    this->deactuator_inverted = inverted;
-    this->deactuator_pin = deactuator_pin_in;
-}
-
-bool DelayedSensedPairActuator::set_commanded_state(const bool new_state) {
-    if (commanded_state == new_state) {return true;}
-    if (actuator_pin == nullptr || deactuator_pin == nullptr) {return false;}
-    commanded_state = new_state;
-    actuator_pin->State((new_state ^ actuator_inverted)?1:0);
-    deactuator_pin->State((new_state ^ !deactuator_inverted)?1:0);
-    time_remaining_ms = new_state ? rising_delay_ms : falling_delay_ms;
-    return true;
-}
-
-bool DelayedSensedPairActuator::get_measured_state() const {
-    const bool done_with_travel = (time_remaining_ms == 0);
-    return commanded_state ^ (!done_with_travel);
-}
-
-bool DelayedSensedPairActuator::is_mismatch() const {
-    return time_remaining_ms != 0;
-}
-
-bool DelayedSensedPairActuator::is_sensed() const {
-    return true;
-}
-
-bool DelayedSensedPairActuator::is_fully_engaged() const {
-    return this->get_commanded_state() && time_remaining_ms == 0;
-}
-bool DelayedSensedPairActuator::is_fully_disengaged() const {
-    return !this->get_commanded_state() && time_remaining_ms == 0;
-}
-
-void DelayedSensedPairActuator::tick() volatile {
     if (time_remaining_ms > 0) {
         if (sense_pin == nullptr || ((sense_pin->State() ^ sensor_inverted) == commanded_state)) {
             time_remaining_ms--;
